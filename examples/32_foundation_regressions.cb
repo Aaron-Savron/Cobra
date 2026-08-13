@@ -1,0 +1,13 @@
+def test_safe_arithmetic() -> i64 {
+    assert(2 + 3 * 4 == 14)
+    assert(8 / 2 / 2 == 2)
+    assert(-3 == -3)
+    return 0
+}
+
+def test_safe_strings() -> i64 {
+    let text: string = "Cobra"
+    assert(len(text) == 5)
+    assert(text == "Cobra")
+    return 0
+}

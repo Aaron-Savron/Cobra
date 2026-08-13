@@ -1,0 +1,875 @@
+# Cobra HTTP/1.1 foundation (lib/http.cb)
+# HTTP stays explicit: callers own every []u8 buffer and pass scalar metadata
+# outputs. The parser accepts one received byte range and never treats it as a
+# NUL-terminated string, so embedded zero bytes remain data.
+#
+# HTTP error codes:
+#   10 = invalid request line
+#   11 = header too large or too many headers
+#   12 = invalid header, argument, or response status
+#   13 = invalid or duplicate Content-Length
+#   14 = unsupported HTTP version
+#   15 = truncated request body
+#   16 = no progress while writing a response; socket errors keep NetError codes
+#   17 = response buffer too small
+
+# Convert ASCII uppercase to lowercase for case-insensitive field matching.
+def http_lower_ascii(value: i64) -> i64: {
+    if value >= 65: {
+        if value <= 90: {
+            return value + 32
+        }
+    }
+    return value
+}
+
+# Copy text bytes into a caller-owned byte buffer. The caller supplies the
+# destination capacity and must ensure the text fits.
+def http_copy_text(dst: []u8, offset: i64, text: string) -> i64: {
+    count = len(text)
+    if offset < 0: {
+        return -1
+    }
+    if offset + count > len(dst): {
+        return -1
+    }
+    i = 0
+    while i < count: {
+        dst[offset + i] = char_at(text, i)
+        i = i + 1
+    }
+    return offset + count
+}
+
+# Find CRLF from start, bounded by max_line bytes. The returned value is the
+# CR offset. Error 10 means the request line is malformed or incomplete.
+def http_find_crlf(buf: []u8, size: i64, start: i64, max_line: i64) -> Result[i64, i64]: {
+    if start < 0: {
+        return err(10)
+    }
+    if size < 0: {
+        return err(10)
+    }
+    if size > len(buf): {
+        return err(10)
+    }
+    i = start
+    while i + 1 < size: {
+        if i - start >= max_line: {
+            return err(10)
+        }
+        if buf[i] == 13: {
+            if buf[i + 1] == 10: {
+                return ok(i)
+            }
+            return err(10)
+        }
+        i = i + 1
+    }
+    return err(10)
+}
+
+# Compare one byte-buffer span with a normal Cobra string.
+def http_span_equals(buf: []u8, meta: []i64, text: string) -> i64 {
+    if len(meta) < 2: {
+        return 0
+    }
+    if meta[1] != len(text): {
+        return 0
+    }
+    i = 0
+    while i < meta[1]: {
+        if http_lower_ascii(buf[meta[0] + i]) != http_lower_ascii(char_at(text, i)) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+# Parse METHOD SP request-target SP HTTP/version CRLF. Output metadata arrays
+# contain [start, length]. The return value is the first byte after CRLF.
+def http_parse_request_line(buf: []u8, size: i64, method_meta: []i64, path_meta: []i64, version_meta: []i64) -> Result[i64, i64]: {
+    if len(method_meta) < 2: {
+        return err(10)
+    }
+    if len(path_meta) < 2: {
+        return err(10)
+    }
+    if len(version_meta) < 2: {
+        return err(10)
+    }
+    line_end = http_find_crlf(buf, size, 0, 8192)?
+    first_space = -1
+    second_space = -1
+    i = 0
+    while i < line_end: {
+        if buf[i] == 32: {
+            if first_space < 0: {
+                first_space = i
+            } else {
+                if second_space < 0: {
+                    second_space = i
+                } else {
+                    return err(10)
+                }
+            }
+        }
+        i = i + 1
+    }
+    if first_space <= 0: {
+        return err(10)
+    }
+    if second_space <= first_space + 1: {
+        return err(10)
+    }
+    if line_end <= second_space + 1: {
+        return err(10)
+    }
+    method_meta[0] = 0
+    method_meta[1] = first_space
+    path_meta[0] = first_space + 1
+    path_meta[1] = second_space - first_space - 1
+    version_meta[0] = second_space + 1
+    version_meta[1] = line_end - second_space - 1
+
+    i = method_meta[0]
+    while i < method_meta[0] + method_meta[1]: {
+        if buf[i] < 33: {
+            return err(10)
+        }
+        if buf[i] > 126: {
+            return err(10)
+        }
+        i = i + 1
+    }
+    i = path_meta[0]
+    while i < path_meta[0] + path_meta[1]: {
+        if buf[i] < 33: {
+            return err(10)
+        }
+        if buf[i] == 127: {
+            return err(10)
+        }
+        i = i + 1
+    }
+    if http_span_equals(buf, version_meta, "HTTP/1.1") == 0: {
+        return err(14)
+    }
+    return ok(line_end + 2)
+}
+
+# Parse one header at offset. Output arrays contain [start, length] for the
+# field name and trimmed field value. A blank CRLF returns zero name length.
+def http_parse_header(buf: []u8, size: i64, offset: i64, name_meta: []i64, value_meta: []i64) -> Result[i64, i64]: {
+    if len(name_meta) < 2: {
+        return err(12)
+    }
+    if len(value_meta) < 2: {
+        return err(12)
+    }
+    if offset < 0: {
+        return err(12)
+    }
+    if size < 0: {
+        return err(11)
+    }
+    if size > len(buf): {
+        return err(11)
+    }
+    if offset + 1 >= size: {
+        return err(11)
+    }
+    if buf[offset] == 13: {
+        if buf[offset + 1] == 10: {
+            name_meta[0] = 0
+            name_meta[1] = 0
+            value_meta[0] = 0
+            value_meta[1] = 0
+            return ok(offset + 2)
+        }
+        return err(12)
+    }
+
+    line_end = -1
+    colon = -1
+    i = offset
+    while i + 1 < size: {
+        if buf[i] == 13: {
+            if buf[i + 1] != 10: {
+                return err(12)
+            }
+            line_end = i
+            i = size
+        } else {
+            if colon < 0: {
+                if buf[i] == 58: {
+                    colon = i
+                }
+            }
+            i = i + 1
+        }
+    }
+    if line_end < 0: {
+        return err(11)
+    }
+    if line_end - offset > 4096: {
+        return err(11)
+    }
+    if colon <= offset: {
+        return err(12)
+    }
+
+    i = offset
+    while i < colon: {
+        if buf[i] < 33: {
+            return err(12)
+        }
+        if buf[i] > 126: {
+            return err(12)
+        }
+        if buf[i] == 58: {
+            return err(12)
+        }
+        i = i + 1
+    }
+
+    value_start = colon + 1
+    scan = value_start
+    skipping = 1
+    while scan < line_end: {
+        if skipping == 1: {
+            if buf[scan] == 32: {
+                scan = scan + 1
+            } else {
+                if buf[scan] == 9: {
+                    scan = scan + 1
+                } else {
+                    value_start = scan
+                    skipping = 0
+                    scan = line_end
+                }
+            }
+        } else {
+            scan = line_end
+        }
+    }
+    if skipping == 1: {
+        value_start = line_end
+    }
+    value_end = line_end
+    scan = line_end
+    trimming = 1
+    while scan > colon + 1: {
+        if trimming == 1: {
+            if buf[scan - 1] == 32: {
+                scan = scan - 1
+            } else {
+                if buf[scan - 1] == 9: {
+                    scan = scan - 1
+                } else {
+                    value_end = scan
+                    trimming = 0
+                    scan = colon + 1
+                }
+            }
+        } else {
+            scan = colon + 1
+        }
+    }
+    if trimming == 1: {
+        value_end = scan
+    }
+    if value_end < value_start: {
+        value_end = value_start
+    }
+    i = value_start
+    while i < value_end: {
+        if buf[i] == 0: {
+            return err(12)
+        }
+        if buf[i] < 32: {
+            if buf[i] != 9: {
+                return err(12)
+            }
+        }
+        if buf[i] == 127: {
+            return err(12)
+        }
+        i = i + 1
+    }
+    name_meta[0] = offset
+    name_meta[1] = colon - offset
+    value_meta[0] = value_start
+    value_meta[1] = value_end - value_start
+    return ok(line_end + 2)
+}
+
+# Case-insensitive header name lookup against one parsed name span.
+def http_header_name_is(buf: []u8, name_meta: []i64, wanted: string) -> i64 {
+    return http_span_equals(buf, name_meta, wanted)
+}
+
+# Parse a decimal Content-Length value from a parsed header value span.
+def http_parse_content_length(buf: []u8, value_meta: []i64) -> Result[i64, i64]: {
+    if len(value_meta) < 2: {
+        return err(13)
+    }
+    if value_meta[1] <= 0: {
+        return err(13)
+    }
+    value = 0
+    i = 0
+    while i < value_meta[1]: {
+        digit = buf[value_meta[0] + i]
+        if digit < 48: {
+            return err(13)
+        }
+        if digit > 57: {
+            return err(13)
+        }
+        if value > 214748364: {
+            return err(13)
+        }
+        value = value * 10 + digit - 48
+        i = i + 1
+    }
+    return ok(value)
+}
+
+# Parse all headers until the empty line. Outputs content length and header
+# count through caller-owned one-element buffers. Duplicate Content-Length is
+# rejected even when the values are identical.
+def http_parse_headers(buf: []u8, size: i64, start: i64, content_length_out: []i64, header_count_out: []i64, name_meta: []i64, value_meta: []i64) -> Result[i64, i64]: {
+    if len(content_length_out) < 1: {
+        return err(12)
+    }
+    if len(header_count_out) < 1: {
+        return err(12)
+    }
+    if size < 0: {
+        return err(11)
+    }
+    if size > len(buf): {
+        return err(11)
+    }
+    if start < 0: {
+        return err(11)
+    }
+    offset = start
+    count = 0
+    content_length = 0
+    content_seen = 0
+    while offset < size: {
+        if count >= 64: {
+            return err(11)
+        }
+        next = http_parse_header(buf, size, offset, name_meta, value_meta)
+        if is_ok(next) == 0: {
+            return err(unwrap_err(next))
+        }
+        offset = unwrap_ok(next)
+        if offset - start > 16384: {
+            return err(11)
+        }
+        if name_meta[1] == 0: {
+            content_length_out[0] = content_length
+            header_count_out[0] = count
+            return ok(offset)
+        }
+        count = count + 1
+        if http_header_name_is(buf, name_meta, "Transfer-Encoding") == 1: {
+            return err(12)
+        }
+        if http_header_name_is(buf, name_meta, "Content-Length") == 1: {
+            if content_seen == 1: {
+                return err(13)
+            }
+            parsed = http_parse_content_length(buf, value_meta)
+            if is_ok(parsed) == 0: {
+                return err(unwrap_err(parsed))
+            }
+            content_length = unwrap_ok(parsed)
+            content_seen = 1
+        }
+    }
+    return err(11)
+}
+
+# Compare byte spans without treating zero as a terminator.
+def http_bytes_equal(left: []u8, right: []u8, count: i64) -> i64 {
+    if count < 0: {
+        return 0
+    }
+    if count > len(left): {
+        return 0
+    }
+    if count > len(right): {
+        return 0
+    }
+    i = 0
+    while i < count: {
+        if left[i] != right[i]: {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+# Typed single-request metadata record. The caller owns this []i64 record and
+# the source []u8 bytes. Layout:
+#   [0..1] method start/length
+#   [2..3] target start/length
+#   [4..5] version start/length
+#   [6] header start, [7] header count
+#   [8] body start, [9] currently available body length
+#   [10] declared body length, [11] connection-close flag (always 1)
+# The available length never exceeds the declared length. Callers that receive
+# headers and body separately can use http_request_body_expected before filling
+# the remaining bytes with http_read_body.
+# Parsing returns Result[i64, i64]: ok(1) means a request was parsed and the
+# error value is one of the HTTP codes documented above. No request object or
+# body buffer is allocated.
+def http_request_parse(buf: []u8, size: i64, request_meta: []i64, name_meta: []i64, value_meta: []i64) -> Result[i64, i64]: {
+    if len(request_meta) < 12: {
+        return err(12)
+    }
+    if len(name_meta) < 2: {
+        return err(12)
+    }
+    if len(value_meta) < 2: {
+        return err(12)
+    }
+    line_end = http_find_crlf(buf, size, 0, 8192)?
+    first_space = -1
+    second_space = -1
+    i = 0
+    while i < line_end: {
+        if buf[i] == 32: {
+            if first_space < 0: {
+                first_space = i
+            } else {
+                if second_space < 0: {
+                    second_space = i
+                } else {
+                    return err(10)
+                }
+            }
+        }
+        i = i + 1
+    }
+    if first_space <= 0: {
+        return err(10)
+    }
+    if second_space <= first_space + 1: {
+        return err(10)
+    }
+    if line_end <= second_space + 1: {
+        return err(10)
+    }
+    request_meta[0] = 0
+    request_meta[1] = first_space
+    request_meta[2] = first_space + 1
+    request_meta[3] = second_space - first_space - 1
+    request_meta[4] = second_space + 1
+    request_meta[5] = line_end - second_space - 1
+    i = request_meta[0]
+    while i < request_meta[0] + request_meta[1]: {
+        if buf[i] < 33: {
+            return err(10)
+        }
+        if buf[i] > 126: {
+            return err(10)
+        }
+        i = i + 1
+    }
+    i = request_meta[2]
+    while i < request_meta[2] + request_meta[3]: {
+        if buf[i] < 33: {
+            return err(10)
+        }
+        if buf[i] == 127: {
+            return err(10)
+        }
+        i = i + 1
+    }
+    # The version span starts at slot 4, while http_span_equals reads slots 0/1.
+    if request_meta[5] != 8: {
+        return err(14)
+    }
+    version_ok = 1
+    i = 0
+    while i < 8: {
+        if buf[request_meta[4] + i] != char_at("HTTP/1.1", i): {
+            version_ok = 0
+        }
+        i = i + 1
+    }
+    if version_ok == 0: {
+        return err(14)
+    }
+    request_meta[6] = line_end + 2
+    request_meta[7] = 0
+    request_meta[8] = 0
+    request_meta[9] = 0
+    request_meta[10] = 0
+    request_meta[11] = 1
+    offset = request_meta[6]
+    count = 0
+    content_length = 0
+    content_seen = 0
+    while offset < size: {
+        if count >= 64: {
+            return err(11)
+        }
+        next = http_parse_header(buf, size, offset, name_meta, value_meta)
+        if is_ok(next) == 0: {
+            return err(unwrap_err(next))
+        }
+        offset = unwrap_ok(next)
+        if offset - request_meta[6] > 16384: {
+            return err(11)
+        }
+        if name_meta[1] == 0: {
+            request_meta[7] = count
+            request_meta[8] = offset
+            available = size - offset
+            if available < 0: {
+                available = 0
+            }
+            if available > content_length: {
+                available = content_length
+            }
+            request_meta[9] = available
+            request_meta[10] = content_length
+            return ok(1)
+        }
+        count = count + 1
+        if http_header_name_is(buf, name_meta, "Transfer-Encoding") == 1: {
+            return err(12)
+        }
+        if http_header_name_is(buf, name_meta, "Content-Length") == 1: {
+            if content_seen == 1: {
+                return err(13)
+            }
+            parsed = http_parse_content_length(buf, value_meta)
+            if is_ok(parsed) == 0: {
+                return err(unwrap_err(parsed))
+            }
+            content_length = unwrap_ok(parsed)
+            content_seen = 1
+            # The parser may receive headers before the body. Keep the
+            # declared length independent from the bytes currently buffered;
+            # http_read_body performs the bounded receive phase. Reject only
+            # lengths above the single-request safety limit.
+            if content_length > 16777216: {
+                return err(11)
+            }
+        }
+    }
+    return err(11)
+}
+
+# Return the currently available body range from a parsed request. The caller
+# can create a view with slice_u8(source, body_meta[0], body_meta[1]). The view
+# is safe even when the declared body arrived in multiple receives.
+def http_request_body_meta(request_meta: []i64, body_meta: []i64) -> Result[i64, i64]: {
+    if len(request_meta) < 12: {
+        return err(12)
+    }
+    if len(body_meta) < 2: {
+        return err(12)
+    }
+    body_meta[0] = request_meta[8]
+    body_meta[1] = request_meta[9]
+    return ok(1)
+}
+
+# Return the body length promised by Content-Length. It may exceed the current
+# body view until http_read_body completes the receive phase.
+def http_request_body_expected(request_meta: []i64) -> Result[i64, i64]: {
+    if len(request_meta) < 12: {
+        return err(12)
+    }
+    return ok(request_meta[10])
+}
+
+# Header lookup scans the parsed header range without allocating. value_meta
+# receives [start, length], and name_meta is caller-owned scratch metadata.
+def http_request_header(buf: []u8, size: i64, request_meta: []i64, wanted: string, name_meta: []i64, value_meta: []i64) -> Result[i64, i64]: {
+    if len(request_meta) < 12: {
+        return err(12)
+    }
+    if len(name_meta) < 2: {
+        return err(12)
+    }
+    if len(value_meta) < 2: {
+        return err(12)
+    }
+    offset = request_meta[6]
+    index = 0
+    while index < request_meta[7]: {
+        parsed = http_parse_header(buf, size, offset, name_meta, value_meta)
+        if is_ok(parsed) == 0: {
+            return err(unwrap_err(parsed))
+        }
+        if http_header_name_is(buf, name_meta, wanted) == 1: {
+            return ok(1)
+        }
+        offset = unwrap_ok(parsed)
+        index = index + 1
+    }
+    return ok(0)
+}
+
+# Method matching compares the request method span directly with a string.
+def http_request_method_is(buf: []u8, request_meta: []i64, wanted: string) -> i64 {
+    if len(request_meta) < 2: {
+        return 0
+    }
+    if request_meta[1] != len(wanted): {
+        return 0
+    }
+    i = 0
+    while i < request_meta[1]: {
+        if buf[request_meta[0] + i] != char_at(wanted, i): {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+# Route matching compares the request target span directly with a string.
+def http_route_matches(buf: []u8, request_meta: []i64, route: string) -> i64 {
+    if len(request_meta) < 4: {
+        return 0
+    }
+    if request_meta[3] != len(route): {
+        return 0
+    }
+    i = 0
+    while i < request_meta[3]: {
+        if buf[request_meta[2] + i] != char_at(route, i): {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+# Single-request mode always writes an explicit close response. Keep-alive is
+# deliberately deferred until a connection state object exists.
+def http_request_should_close(request_meta: []i64) -> i64 {
+    if len(request_meta) < 12: {
+        return 1
+    }
+    return request_meta[11]
+}
+
+def http_status_ok() -> i64 {
+    return 200
+}
+
+def http_status_bad_request() -> i64 {
+    return 400
+}
+
+def http_status_not_found() -> i64 {
+    return 404
+}
+
+# Build and fully write one response. Both the builder and writer use typed
+# Result propagation, so partial-send progress remains visible to the caller.
+def http_response_send(fd: i64, status: i64, headers: []u8, body: []u8, output: []u8, progress_out: []i64) -> Result[i64, i64]: {
+    response_size = http_build_response(status, headers, body, output)?
+    sent = http_write_response(fd, output, response_size, progress_out)?
+    return ok(sent)
+}
+
+# One body receive against a zero-copy byte window.
+def http_read_body_step(fd: i64, body: []u8, offset: i64, amount: i64) -> Result[i64, i64]: {
+    let window: []u8 = slice_u8(body, offset, amount)
+    return net_recv_bytes_checked(fd, window, amount)
+}
+
+# Read exactly content_length bytes. Partial receives are retried into byte
+# windows, and progress_out[0] is preserved on every failure path.
+def http_read_body(fd: i64, body: []u8, content_length: i64, progress_out: []i64) -> Result[i64, i64]: {
+    if len(progress_out) < 1: {
+        return err(12)
+    }
+    progress_out[0] = 0
+    if content_length < 0: {
+        return err(13)
+    }
+    if content_length > len(body): {
+        return err(13)
+    }
+    received = 0
+    while received < content_length: {
+        chunk = http_read_body_step(fd, body, received, content_length - received)
+        if is_ok(chunk) == 0: {
+            progress_out[0] = received
+            return err(unwrap_err(chunk))
+        }
+        count = unwrap_ok(chunk)
+        if count == 0: {
+            progress_out[0] = received
+            return err(15)
+        }
+        received = received + count
+        progress_out[0] = received
+    }
+    return ok(received)
+}
+
+# One response send against a zero-copy byte window.
+def http_write_response_step(fd: i64, response: []u8, offset: i64, amount: i64) -> Result[i64, i64]: {
+    let window: []u8 = slice_u8(response, offset, amount)
+    return net_send_bytes_checked(fd, window, amount)
+}
+
+# Send all response bytes while preserving the number already accepted by the
+# kernel. A zero-byte send is treated as a socket failure to avoid spinning.
+def http_write_response(fd: i64, response: []u8, bytes: i64, progress_out: []i64) -> Result[i64, i64]: {
+    if len(progress_out) < 1: {
+        return err(12)
+    }
+    progress_out[0] = 0
+    if bytes < 0: {
+        return err(12)
+    }
+    if bytes > len(response): {
+        return err(12)
+    }
+    sent_total = 0
+    while sent_total < bytes: {
+        chunk = http_write_response_step(fd, response, sent_total, bytes - sent_total)
+        if is_ok(chunk) == 0: {
+            progress_out[0] = sent_total
+            # Preserve the stable NetError from the socket layer.
+            return err(unwrap_err(chunk))
+        }
+        count = unwrap_ok(chunk)
+        if count == 0: {
+            progress_out[0] = sent_total
+            return err(16)
+        }
+        sent_total = sent_total + count
+        progress_out[0] = sent_total
+    }
+    return ok(sent_total)
+}
+
+# Build an HTTP/1.1 response into a caller-owned buffer. Headers must already
+# contain complete CRLF-terminated field lines. Content-Length is generated
+# from the caller-owned body length; no chunked encoding is implied.
+def http_build_response(status: i64, headers: []u8, body: []u8, output: []u8) -> Result[i64, i64]: {
+    if status < 100: {
+        return err(12)
+    }
+    if status > 999: {
+        return err(12)
+    }
+    pos = 0
+    pos = http_copy_text(output, pos, "HTTP/1.1 ")
+    if pos < 0: {
+        return err(17)
+    }
+    output[pos] = 48 + status / 100
+    pos = pos + 1
+    tens = (status / 10) - (status / 100) * 10
+    output[pos] = 48 + tens
+    pos = pos + 1
+    ones = status - (status / 10) * 10
+    output[pos] = 48 + ones
+    pos = pos + 1
+    pos = http_copy_text(output, pos, " OK\r\nContent-Length: ")
+    if pos < 0: {
+        return err(17)
+    }
+    divisor = 1
+    body_length = len(body)
+    while body_length / divisor >= 10: {
+        if divisor > 214748364: {
+            return err(17)
+        }
+        divisor = divisor * 10
+    }
+    while divisor > 0: {
+        digit = body_length / divisor
+        output[pos] = 48 + digit
+        pos = pos + 1
+        body_length = body_length - digit * divisor
+        divisor = divisor / 10
+    }
+    pos = http_copy_text(output, pos, "\r\n")
+    if pos < 0: {
+        return err(17)
+    }
+    if len(headers) > 0: {
+        if len(headers) < 2: {
+            return err(12)
+        }
+        if headers[len(headers) - 2] != 13: {
+            return err(12)
+        }
+        if headers[len(headers) - 1] != 10: {
+            return err(12)
+        }
+    }
+    i = 0
+    while i < len(headers): {
+        if headers[i] == 0: {
+            return err(12)
+        }
+        if headers[i] < 32: {
+            if headers[i] == 10: {
+                if i == 0: {
+                    return err(12)
+                }
+                if headers[i - 1] != 13: {
+                    return err(12)
+                }
+            } else {
+                if headers[i] != 9: {
+                    if headers[i] != 13: {
+                        return err(12)
+                    }
+                }
+            }
+        }
+        if headers[i] == 127: {
+            return err(12)
+        }
+        if headers[i] == 13: {
+            if i + 1 >= len(headers): {
+                return err(12)
+            }
+            if headers[i + 1] != 10: {
+                return err(12)
+            }
+        }
+        i = i + 1
+    }
+    if pos + len(headers) + len(body) + 2 > len(output): {
+        return err(17)
+    }
+    i = 0
+    while i < len(headers): {
+        output[pos + i] = headers[i]
+        i = i + 1
+    }
+    pos = pos + len(headers)
+    output[pos] = 13
+    output[pos + 1] = 10
+    pos = pos + 2
+    i = 0
+    while i < len(body): {
+        output[pos + i] = body[i]
+        i = i + 1
+    }
+    return ok(pos + len(body))
+}

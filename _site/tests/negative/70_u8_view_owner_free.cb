@@ -1,0 +1,6 @@
+def invalid_u8_view_lifetime(): {
+    owner = alloc_u8(16)
+    let view: []u8 = slice_u8(owner, 0, 8)
+    free(owner)
+    return 0
+}

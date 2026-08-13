@@ -1,0 +1,36 @@
+# Python comfort edge coverage: direct loops with no iterator objects.
+
+def main(): {
+    descending = 0
+    for value in range(5, 0, -2): {
+        descending = descending + value
+    }
+    assert(descending == 9)
+
+    empty_range = 0
+    for value in range(0, 5, -1): {
+        empty_range = empty_range + 1
+    }
+    assert(empty_range == 0)
+
+    scores = [1.0, 2.0]
+    for index, value in enumerate(scores): {
+        scores[index] = value * 2.0
+    }
+    assert(scores[0] == 2.0)
+    assert(scores[1] == 4.0)
+
+    values = [4, 5, 6]
+    assert(sum(values) == 15)
+    assert(min(values) == 4)
+    assert(max(values) == 6)
+    assert(any(values))
+    assert(all(values))
+
+    empty = []
+    assert(any(empty) == 0)
+    assert(all(empty) == 1)
+
+    print("Python comfort edge coverage passed")
+    return 0
+}

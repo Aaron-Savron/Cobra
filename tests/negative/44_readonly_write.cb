@@ -1,0 +1,6 @@
+# A readonly buffer is a no-write contract; the IR must reject this.
+
+def bad(v: readonly []f32) -> i64: {
+    v[0] = 1.0
+    return 0
+}

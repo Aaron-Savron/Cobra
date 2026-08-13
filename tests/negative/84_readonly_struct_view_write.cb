@@ -1,0 +1,8 @@
+struct RequestView: {
+    body: readonly []u8,
+}
+
+def invalid_readonly_write(request: RequestView) -> i64: {
+    request.body[0] = 9
+    return 0
+}

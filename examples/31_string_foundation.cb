@@ -1,0 +1,28 @@
+# Example 31: Native String Foundation
+# Strings are immutable char pointers; concat creates owned storage.
+
+def identity_text(value: string) -> string: {
+    return value
+}
+
+def test_string_values() -> i64: {
+    let prefix: string = "cobra"
+    let suffix: string = " systems"
+    let combined: string = prefix + suffix
+
+    assert(combined == "cobra systems")
+    assert(starts_with(combined, "cobra"))
+    assert(ends_with(combined, "systems"))
+    assert(contains(combined, "ra sy"))
+    assert(char_at(combined, 0) == 99)
+    assert(len(combined) == 13)
+
+    let forwarded: string = identity_text(combined)
+    assert(forwarded == combined)
+
+    let escaped: string = "line 1\nline 2\t\\ok\""
+    assert(len(escaped) == 18)
+
+    # combined is reclaimed automatically at function exit.
+    return 0
+}

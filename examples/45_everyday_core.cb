@@ -1,0 +1,33 @@
+# Everyday Core: familiar values clean up at function exit.
+# Lists, dictionaries, and concatenated strings are automatic by default.
+# Raw alloc_i64/alloc_f32 buffers remain explicit for zero-copy model code.
+
+def make_label(name: string) -> string: {
+    return "cobra: " + name
+}
+
+def test_everyday_core(): {
+    let values: list[i64] = [1, 2]
+    append(values, 3)
+
+    let metrics: dict[string]i64 = {"step": 2, "loss": 7}
+    metrics["step"] = 3
+
+    let label: string = make_label("core")
+
+    assert(len(values) == 3)
+    assert(values[2] == 3)
+    assert(get(metrics, "step", 0) == 3)
+    assert(label == "cobra: core")
+    return 0
+}
+
+def test_owned_string_return(): {
+    let label: string = make_label("return")
+    assert(label == "cobra: return")
+    return 0
+}
+
+def main(): {
+    return test_everyday_core()
+}

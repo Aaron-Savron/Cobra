@@ -1,0 +1,25 @@
+# Structured status propagation: explicit integer result, no exception runtime.
+
+def fail_with_code() -> i64: {
+    return 7
+}
+
+def succeed() -> i64: {
+    return 0
+}
+
+def propagate_failure() -> i64: {
+    fail_with_code()?
+    return 99
+}
+
+def propagate_success() -> i64: {
+    succeed()?
+    return 42
+}
+
+def test_structured_status(): {
+    assert(propagate_failure() == 7)
+    assert(propagate_success() == 42)
+    return 0
+}

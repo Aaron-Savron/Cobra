@@ -1,0 +1,5 @@
+import "modules/visibility.cb" as api
+
+def invalid_private_access() -> i64: {
+    return api.hidden_value()
+}

@@ -1,0 +1,9 @@
+def mutate(values: out []f32) -> i64 {
+    values[0] = 9.0
+    return 0
+}
+
+def test_mutable_array_coercion(): {
+    let values = [1.0, 2.0]
+    return mutate(values)
+}

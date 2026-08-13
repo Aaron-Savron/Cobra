@@ -1,0 +1,7 @@
+def accepts_option(value: Option[i64]) -> i64: {
+    return 0
+}
+
+def main(): {
+    return accepts_option(none)
+}

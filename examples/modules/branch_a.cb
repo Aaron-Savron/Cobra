@@ -1,0 +1,5 @@
+import "shared.cb"
+
+def branch_a() -> i64: {
+    return shared_value()
+}

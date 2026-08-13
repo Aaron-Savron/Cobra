@@ -1,0 +1,10 @@
+# Portable mode must reject this reachable lib/nn wrapper because it lowers
+# through AVX2-backed tensor math.
+def main(): {
+    input = alloc_f32(4)
+    weights = alloc_f32(4)
+    bias = alloc_f32(1)
+    output = alloc_f32(1)
+    dense_relu_f32(input, weights, bias, output, 1, 1, 4)
+    return 0
+}

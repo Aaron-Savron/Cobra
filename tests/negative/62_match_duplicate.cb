@@ -1,0 +1,19 @@
+enum Mode: {
+    Cold,
+    Hot,
+}
+
+def test_duplicate(value: Mode) -> i64: {
+    match value: {
+        case Mode.Cold: {
+            return 0
+        }
+        case Mode.Cold: {
+            return 1
+        }
+        else: {
+            return 2
+        }
+    }
+    return 3
+}

@@ -1,0 +1,23 @@
+enum Left: {
+    One,
+}
+
+enum Right: {
+    One,
+}
+
+def bad_return() -> Left: {
+    return Right.One
+}
+
+def bad_assignment(): {
+    let value: Left = Left.One
+    value = Right.One
+    return 0
+}
+
+def bad_implicit_assignment(): {
+    inferred = Left.One
+    inferred = Right.One
+    return 0
+}

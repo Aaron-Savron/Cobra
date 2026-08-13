@@ -1,0 +1,8 @@
+# The region releases its backing store; libc free must never touch it.
+def broken(): {
+    with region scratch: {
+        a = scratch.alloc_f32(16)
+        free(a)
+    }
+    return 0
+}

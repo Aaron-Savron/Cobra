@@ -1,0 +1,4 @@
+private def test_private_entry() -> i64: {
+    assert(40 + 2 == 42)
+    return 0
+}

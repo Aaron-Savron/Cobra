@@ -1,0 +1,4 @@
+# Generic functions are intentionally not part of the current sum ABI.
+def unwrap_or[T](value: Option[T], fallback: T) -> T: {
+    return fallback
+}

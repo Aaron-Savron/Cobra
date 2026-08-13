@@ -1,0 +1,5 @@
+import "../../examples/modules/math.cb" as math
+
+def test_unknown_alias() -> i64: {
+    return other.module_add(1, 2)
+}

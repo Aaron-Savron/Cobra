@@ -1,0 +1,6 @@
+# GEMM output buffers must be disjoint from their input buffers.
+def main(): {
+    values = alloc_f32(8)
+    matmul_f32(values, values, values, 1, 8, 1)
+    return 0
+}

@@ -1,0 +1,18 @@
+# Example 6: Cobra Phase 2  Headerless C Interop! 
+# Direct binding to C standard library functions without ANY header files or wrappers!
+
+import c "libc.so.6" (abs)
+
+def main(): {
+    print("=== Cobra Phase 2: Headerless C Interop ===")
+    
+    # Call native C library 'abs' function directly!
+    negative_val = 0 - 42
+    negative_val?
+    
+    positive_val = abs(negative_val)
+    positive_val?
+    
+    print("Direct C function call successful with zero header files!")
+    return positive_val
+}

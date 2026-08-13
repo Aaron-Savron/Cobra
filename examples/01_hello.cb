@@ -1,0 +1,8 @@
+# First Cobra Program: Pure Assembly + Pythonic Syntax!
+
+def main() -> i64 {
+    let a: i64 = 15
+    let b: i64 = 27
+    let result: i64 = a + b
+    return result
+}

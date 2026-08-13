@@ -1,0 +1,16 @@
+enum Mode: {
+    Cold,
+    Hot,
+}
+
+def test_unknown(value: Mode) -> i64: {
+    match value: {
+        case Mode.Warm: {
+            return 0
+        }
+        else: {
+            return 1
+        }
+    }
+    return 2
+}

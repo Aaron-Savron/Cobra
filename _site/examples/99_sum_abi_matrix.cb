@@ -1,0 +1,97 @@
+# Scalar sum ABI matrix.
+# This suite exercises the boundaries that are easy to miss when each type
+# works in isolation.
+
+import "modules/sum_params.cb" as sums
+
+struct Point: {
+    x: i64,
+    y: i64,
+}
+
+def make_mixed_result(value: i64) -> Result[i32, f32]: {
+    if value >= 0: {
+        return ok(7)
+    }
+    return err(1.5)
+}
+
+def make_unsigned(value: i64) -> Option[u64]: {
+    if value >= 0: {
+        return some(9)
+    }
+    return none
+}
+
+# Six sums fit in SysV integer registers. The seventh and eighth arrive on
+# the stack and must still be copied into private callee storage.
+def consume_many(a: Option[i64], b: Result[i64, i64], c: Option[i64], d: Result[i64, i64],
+                 e: Option[i64], f: Result[i64, i64], g: Option[i64], h: Result[i64, i64]) -> i64 {
+    return unwrap(a) + unwrap_ok(b) + unwrap(c) + unwrap_ok(d) + unwrap(e) + unwrap_ok(f) + unwrap(g) + unwrap_ok(h)
+}
+
+# Different ABI classes can share one call: XMM f32, pointer+length slice,
+# struct pointer, then two scalar sum pointers.
+def consume_mixed(scale: f32, values: []f32, point: Point,
+                  checked: Result[i32, f32], optional: Option[u64]) -> f32 {
+    let total: f32 = scale + sum_f32(values) + point.x + point.y
+    if is_ok(checked): {
+        return total + unwrap_ok(checked) + unwrap(optional)
+    }
+    return total + unwrap_err(checked)
+}
+
+def produce(value: i64) -> Result[i64, i64]: {
+    if value >= 0: {
+        return ok(value + 1)
+    }
+    return err(13)
+}
+
+def forward(value: Result[i64, i64]) -> Result[i64, i64]: {
+    if is_ok(value): {
+        return ok(unwrap_ok(value) + 1)
+    }
+    return err(unwrap_err(value))
+}
+
+# Both the caller and callee return sums. The intermediate remains named so
+# the ownership boundary is explicit and the parameter ABI stays zero-copy.
+def nested(value: i64) -> Result[i64, i64]: {
+    let first: Result[i64, i64] = produce(value)
+    return forward(first)?
+}
+
+def test_sum_abi_matrix(): {
+    let a: Option[i64] = some(1)
+    let b: Result[i64, i64] = ok(2)
+    let c: Option[i64] = some(3)
+    let d: Result[i64, i64] = ok(4)
+    let e: Option[i64] = some(5)
+    let f: Result[i64, i64] = ok(6)
+    let g: Option[i64] = some(7)
+    let h: Result[i64, i64] = ok(8)
+    assert(consume_many(a, b, c, d, e, f, g, h) == 36)
+
+    let values: []f32 = alloc_f32(2)
+    values[0] = 1.0
+    values[1] = 2.0
+    let point: Point
+    point.x = 3
+    point.y = 4
+    let checked: Result[i32, f32] = make_mixed_result(1)
+    let optional: Option[u64] = make_unsigned(1)
+    assert(consume_mixed(0.5, values, point, checked, optional) == 26.5)
+    free(values)
+
+    let module_result: Result[i32, f32] = make_mixed_result(1)
+    assert(sums.module_sum_value(module_result, optional) == 7)
+
+    let nested_ok = nested(10)
+    let nested_err = nested(-1)
+    assert(is_ok(nested_ok))
+    assert(unwrap_ok(nested_ok) == 12)
+    assert(is_ok(nested_err) == 0)
+    assert(unwrap_err(nested_err) == 13)
+    return 0
+}

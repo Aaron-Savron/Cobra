@@ -1,0 +1,85 @@
+# Typed HTTP-style views stay caller-owned and allocation-free.
+
+import "modules/http_view_handler.cb"
+
+struct HttpRequestView: {
+    body: readonly []u8,
+}
+
+struct HttpResponseMeta: {
+    status: i64,
+    body_len: i64,
+}
+
+struct WritableRequestView: {
+    body: out []u8,
+}
+
+def forward_http_view(request: HttpRequestView) -> Result[HttpResponseMeta, i64]: {
+    return module_http_view_handler(request)?
+}
+
+def mutate_http_view(request: WritableRequestView) -> i64: {
+    request.body[0] = 65
+    return request.body[0]
+}
+
+def test_http_borrowed_view(): {
+    body = alloc_u8(4)
+    let request: HttpRequestView
+    request.body = body
+
+    result = forward_http_view(request)
+    assert(is_ok(result))
+    let response: HttpResponseMeta = unwrap_ok(result)
+    assert(response.status == 200)
+    assert(response.body_len == 4)
+    assert(body[0] == 0)
+    return 0
+}
+
+def test_http_writable_view(): {
+    body = alloc_u8(1)
+    let request: WritableRequestView
+    request.body = body
+    assert(mutate_http_view(request) == 65)
+    assert(body[0] == 65)
+    return 0
+}
+
+def test_http_malformed_request_view(): {
+    with region request_region(256): {
+        request = request_region.alloc_u8(128)
+        meta = alloc_i64(12)
+        names = alloc_i64(2)
+        values = alloc_i64(2)
+
+        bad_spacing = http_copy_text(request, 0, "GET  /health HTTP/1.1\r\n\r\n")
+        parsed = http_request_parse(request, bad_spacing, meta, names, values)
+        assert(is_ok(parsed) == 0)
+        assert(unwrap_err(parsed) == 10)
+
+        duplicate_length = http_copy_text(request, 0, "POST /upload HTTP/1.1\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\n")
+        parsed = http_request_parse(request, duplicate_length, meta, names, values)
+        assert(is_ok(parsed) == 0)
+        assert(unwrap_err(parsed) == 13)
+
+        free(values)
+        free(names)
+        free(meta)
+    }
+    return 0
+}
+
+def test_http_region_view(): {
+    with region scratch(64): {
+        raw = scratch.alloc_u8(8)
+        let request: HttpRequestView
+        request.body = raw
+        result = forward_http_view(request)
+        assert(is_ok(result))
+        let response: HttpResponseMeta = unwrap_ok(result)
+        assert(response.body_len == 8)
+    }
+    return 0
+}

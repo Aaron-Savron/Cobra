@@ -1,0 +1,93 @@
+# Region arenas: `with region NAME(capacity):` bumps allocations out of one
+# backing store and releases it exactly once at scope exit. scratch.alloc_f32
+# returns a plain []f32 backed by the arena, so model scratch buffers never
+# touch the general allocator.
+
+def test_region_bump(): {
+    with region scratch: {
+        a = scratch.alloc_f32(64)
+        b = scratch.alloc_f32(128)
+        fill_f32(a, 1.0)
+        fill_f32(b, 2.0)
+        assert(a[0] == 1.0)
+        assert(a[63] == 1.0)
+        assert(b[0] == 2.0)
+        assert(b[127] == 2.0)
+    }
+    return 0
+}
+
+def test_region_capacity(): {
+    # Explicit capacity the allocations fit in exactly.
+    with region tight(64): {
+        a = tight.alloc_f32(16)
+        fill_f32(a, 3.0)
+        assert(a[15] == 3.0)
+    }
+    return 0
+}
+
+def test_region_nested(): {
+    with region outer: {
+        a = outer.alloc_f32(8)
+        fill_f32(a, 1.0)
+        with region inner: {
+            b = inner.alloc_f32(8)
+            fill_f32(b, 2.0)
+            assert(b[7] == 2.0)
+        }
+        assert(a[0] == 1.0)
+    }
+    return 0
+}
+
+def test_region_loop_reuse(): {
+    # A region inside a loop is created and released per iteration.
+    iterations = 0
+    while iterations < 3: {
+        with region per_iter: {
+            v = per_iter.alloc_f32(1024)
+            fill_f32(v, 1.0)
+            assert(v[1023] == 1.0)
+        }
+        iterations = iterations + 1
+    }
+    return 0
+}
+
+def test_region_dense_scratch(): {
+    # The payoff: model scratch buffers bumped from a region instead of malloc.
+    with region scratch: {
+        a = scratch.alloc_f32(4)
+        w = scratch.alloc_f32(32)
+        b = scratch.alloc_f32(8)
+        out = scratch.alloc_f32(8)
+        fill_f32(a, 1.0)
+        fill_f32(w, 1.0)
+        fill_f32(b, 0.5)
+        dense_f32(a, w, b, out, @comptime(1), @comptime(8), @comptime(4))
+        assert(out[0] == 4.5)
+        assert(out[7] == 4.5)
+    }
+    return 0
+}
+
+def early_exit(n: i64) -> i64: {
+    # An early return inside the region must release the backing store on the
+    # way out; otherwise every call leaks the arena.
+    with region scratch: {
+        v = scratch.alloc_f32(512)
+        fill_f32(v, 1.0)
+        if n < 2: {
+            return 7
+        }
+        assert(v[511] == 1.0)
+    }
+    return 3
+}
+
+def test_region_early_return(): {
+    assert(early_exit(1) == 7)
+    assert(early_exit(5) == 3)
+    return 0
+}

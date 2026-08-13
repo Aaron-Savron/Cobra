@@ -1,0 +1,14 @@
+# Example 7: Cobra Phase 3  @comptime Meta-Programming! 
+# Computes math expressions at compile-time and bakes raw static values into assembly!
+
+def main(): {
+    print("=== Cobra Phase 3: @comptime Meta-Programming ===")
+    
+    # Executed by the Cobra AST Interpreter during compilation!
+    # Zero runtime calculation overhead on the CPU!
+    compiled_constant = @comptime (100 * 5 + 25)
+    compiled_constant?
+    
+    print("Value was pre-calculated at compile time and baked into assembly!")
+    return compiled_constant
+}

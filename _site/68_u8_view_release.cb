@@ -1,0 +1,9 @@
+# A byte view borrows heap storage. Releasing the view must not release the owner.
+
+def test_u8_view_release(): {
+    owner = alloc_u8(8)
+    let view: []u8 = slice_u8(owner, 0, 4)
+    free(view)
+    free(owner)
+    return 0
+}

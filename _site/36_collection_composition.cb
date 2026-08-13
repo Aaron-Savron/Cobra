@@ -1,0 +1,37 @@
+# Collection composition: user functions receive borrowed native handles.
+
+def sum_ids(values: list[i64]) -> i64: {
+    let total: i64 = 0
+    for value in values: {
+        total = total + value
+    }
+    return total
+}
+
+def scale_scores(values: list[f32]): {
+    for value in values: {
+        value = value * 2.0
+    }
+    return 0
+}
+
+def lookup_metric(metrics: dict[string]i64) -> i64: {
+    return metrics["step"]
+}
+
+def test_collection_composition(): {
+    let ids: list[i64] = [2, 3, 4]
+    let scores: list[f32] = [1.0, 2.0, 3.0]
+    let metrics: dict[string]i64 = {"step": 11}
+
+    assert(sum_ids(ids) == 9)
+    assert(lookup_metric(metrics) == 11)
+    scale_scores(scores)
+    assert(scores[0] == 2.0)
+    assert(scores[2] == 6.0)
+
+    free(ids)
+    free(scores)
+    free(metrics)
+    return 0
+}

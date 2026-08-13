@@ -1,0 +1,283 @@
+# Cobra File System Library (lib/fs.cb)
+# The checked lane uses POSIX file descriptors so handles remain scalar i64
+# values and binary I/O has direct partial-read and partial-write semantics.
+# There is no Cobra runtime or hidden file object.
+#
+# Checked error codes:
+#   1 = system I/O failure
+#   2 = invalid argument, including a negative handle or byte count
+#
+# Read and write success returns the number of bytes processed. A short
+# positive write is still success and the caller may retry the remainder.
+# Read returning 0 is successful EOF, never an error.
+
+import c "libc.so.6" (open, read, write, close, fopen, fclose, fputs, fread, fseek, ftell, remove, rename, memcmp)
+
+# Open a path with Linux open(2) flags. The mode is 0666 for create flags;
+# callers can use the named helpers below instead of memorizing flag values.
+def fs_open(path: string, flags: i64) -> Result[i64, i64]: {
+    fd = open(path, flags, 438)
+    if fd < 0: {
+        return err(1)
+    }
+    return ok(fd)
+}
+
+# O_RDONLY, O_WRONLY|O_CREAT|O_TRUNC, and O_WRONLY|O_CREAT|O_APPEND.
+def fs_open_read(path: string) -> Result[i64, i64]: {
+    return fs_open(path, 0)?
+}
+
+def fs_open_write(path: string) -> Result[i64, i64]: {
+    return fs_open(path, 577)?
+}
+
+def fs_open_append(path: string) -> Result[i64, i64]: {
+    return fs_open(path, 1089)?
+}
+
+# Read up to max_bytes from an open descriptor into raw []i64 storage.
+# The request is capped at the buffer capacity. EOF is ok(0).
+def fs_read_fd(fd: i64, buf: []i64, max_bytes: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    if max_bytes < 0: {
+        return err(2)
+    }
+    cap = len(buf) * 8
+    if max_bytes > cap: {
+        max_bytes = cap
+    }
+    n = read(fd, buf, max_bytes)
+    if n < 0: {
+        return err(1)
+    }
+    return ok(n)
+}
+
+# Write raw bytes from []i64 storage to an open descriptor.
+# A short positive write is returned as successful progress.
+def fs_write_fd(fd: i64, buf: []i64, bytes: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    if bytes < 0: {
+        return err(2)
+    }
+    cap = len(buf) * 8
+    if bytes > cap: {
+        bytes = cap
+    }
+    n = write(fd, buf, bytes)
+    if n < 0: {
+        return err(1)
+    }
+    return ok(n)
+}
+
+# Write a NUL-terminated Cobra string to an open descriptor.
+def fs_write_string(fd: i64, content: string) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    n = write(fd, content, len(content))
+    if n < 0: {
+        return err(1)
+    }
+    return ok(n)
+}
+
+# Close an open descriptor. A second close reports error 1 rather than
+# dereferencing a stale FILE* object.
+def fs_close(fd: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    status = close(fd)
+    if status != 0: {
+        return err(1)
+    }
+    return ok(0)
+}
+
+# Checked path-level text write. The descriptor is closed on both write paths.
+def fs_write_file_checked(path: string, content: string) -> Result[i64, i64]: {
+    let fd: i64 = fs_open_write(path)?
+    written = fs_write_string(fd, content)
+    if is_ok(written) == 0: {
+        fs_close(fd)
+        let error_code: i64 = unwrap_err(written)
+        return err(error_code)
+    }
+    closed = fs_close(fd)
+    if is_ok(closed) == 0: {
+        let error_code: i64 = unwrap_err(closed)
+        return err(error_code)
+    }
+    let count: i64 = unwrap_ok(written)
+    return ok(count)
+}
+
+# Checked path-level binary write. The input buffer remains caller-owned.
+def fs_write_file_bytes_checked(path: string, buf: []i64, bytes: i64) -> Result[i64, i64]: {
+    let fd: i64 = fs_open_write(path)?
+    written = fs_write_fd(fd, buf, bytes)
+    if is_ok(written) == 0: {
+        fs_close(fd)
+        let error_code: i64 = unwrap_err(written)
+        return err(error_code)
+    }
+    closed = fs_close(fd)
+    if is_ok(closed) == 0: {
+        let error_code: i64 = unwrap_err(closed)
+        return err(error_code)
+    }
+    let count: i64 = unwrap_ok(written)
+    return ok(count)
+}
+
+# Checked path-level binary read. EOF is returned as ok(0), and the descriptor
+# is closed before either the read error or the successful count is returned.
+def fs_read_file_checked(path: string, buf: []i64, max_bytes: i64) -> Result[i64, i64]: {
+    let fd: i64 = fs_open_read(path)?
+    received = fs_read_fd(fd, buf, max_bytes)
+    if is_ok(received) == 0: {
+        fs_close(fd)
+        let error_code: i64 = unwrap_err(received)
+        return err(error_code)
+    }
+    closed = fs_close(fd)
+    if is_ok(closed) == 0: {
+        let error_code: i64 = unwrap_err(closed)
+        return err(error_code)
+    }
+    let count: i64 = unwrap_ok(received)
+    return ok(count)
+}
+
+# The same checked read contract for f32-backed temporary storage. This keeps
+# region scratch buffers usable without adding a new region allocation kind.
+def fs_read_file_f32_checked(path: string, buf: []f32, max_bytes: i64) -> Result[i64, i64]: {
+    let fd: i64 = fs_open_read(path)?
+    if max_bytes < 0: {
+        fs_close(fd)
+        return err(2)
+    }
+    cap = len(buf) * 4
+    if max_bytes > cap: {
+        max_bytes = cap
+    }
+    received = read(fd, buf, max_bytes)
+    if received < 0: {
+        fs_close(fd)
+        return err(1)
+    }
+    closed = fs_close(fd)
+    if is_ok(closed) == 0: {
+        return err(1)
+    }
+    return ok(received)
+}
+
+# Append text to a path using the raw stream compatibility API.
+def fs_append(path: string, content: string) -> i64: {
+    f = fopen(path, "a")
+    if f == 0: {
+        return -1
+    }
+    n = fputs(content, f)
+    fclose(f)
+    return n
+}
+
+# Size of a path in bytes, or -1 when it cannot be opened.
+def fs_size(path: string) -> i64: {
+    f = fopen(path, "rb")
+    if f == 0: {
+        return -1
+    }
+    fseek(f, 0, 2)
+    n = ftell(f)
+    fclose(f)
+    if n < 0: {
+        return -1
+    }
+    return n
+}
+
+# 1 when a path exists and opens for reading, else 0.
+def fs_exists(path: string) -> i64: {
+    f = fopen(path, "rb")
+    if f == 0: {
+        return 0
+    }
+    fclose(f)
+    return 1
+}
+
+# Delete a path. Returns 0 on success, -1 on error.
+def fs_remove(path: string) -> i64: {
+    return remove(path)
+}
+
+# Rename old_path to new_path. Returns 0 on success, -1 on error.
+def fs_rename(old_path: string, new_path: string) -> i64: {
+    return rename(old_path, new_path)
+}
+
+# Original raw path-based compatibility helper. New code should use the
+# checked descriptor API.
+def fs_write(path: string, content: string) -> i64: {
+    f = fopen(path, "w")
+    if f == 0: {
+        return -1
+    }
+    n = fputs(content, f)
+    fclose(f)
+    return n
+}
+
+# Original raw path-based compatibility helper. New code should use the
+# checked descriptor API.
+def fs_read(path: string, buf: []i64, max_bytes: i64) -> i64: {
+    if max_bytes < 0: {
+        return -1
+    }
+    f = fopen(path, "rb")
+    if f == 0: {
+        return -1
+    }
+    cap = len(buf) * 8
+    if max_bytes > cap: {
+        max_bytes = cap
+    }
+    n = fread(buf, 1, max_bytes, f)
+    fclose(f)
+    return n
+}
+
+# Byte-exact comparison of buffer contents against text. 1 when the first n
+# bytes match, else 0.
+def fs_bytes_equal(buf: []i64, text: string, n: i64) -> i64 {
+    if n < 0: {
+        return 0
+    }
+    r = memcmp(text, buf, n)
+    if r == 0: {
+        return 1
+    }
+    return 0
+}
+
+# Byte-exact comparison of two raw buffers, including embedded zero bytes.
+def fs_buffers_equal(left: []i64, right: []i64, n: i64) -> i64 {
+    if n < 0: {
+        return 0
+    }
+    r = memcmp(left, right, n)
+    if r == 0: {
+        return 1
+    }
+    return 0
+}

@@ -1,0 +1,89 @@
+# Struct layout contracts: nested, enum-promoted, borrowed-view, and
+# mixed-size structs must emit the canonical field offsets. Each shape below
+# pins a different access pattern in the native assembly, so a wrong offset
+# fails at runtime instead of silently reading neighbor bytes.
+
+enum Phase: {
+    Idle,
+    Active,
+    Done,
+}
+
+struct Mixed: {
+    head: i64,
+    mid: f32,
+    tail: i64,
+}
+
+struct Inner: {
+    x: i64,
+    y: i64,
+}
+
+struct Outer: {
+    inner: Inner,
+    tag: i64,
+}
+
+struct State: {
+    phase: Phase,
+    level: i64,
+}
+
+struct RequestView: {
+    body: readonly []u8,
+}
+
+def mixed_sum(m: Mixed) -> i64: {
+    return m.head + m.tail
+}
+
+def outer_sum(o: Outer) -> i64: {
+    return o.inner.x * 10 + o.inner.y + o.tag
+}
+
+def state_level(s: State) -> i64: {
+    if s.phase == Phase.Active: {
+        return s.level + 1
+    }
+    return s.level
+}
+
+def view_len(v: RequestView) -> i64: {
+    return len(v.body)
+}
+
+def test_mixed_layout(): {
+    let m: Mixed
+    m.head = 10
+    m.mid = 2.5
+    m.tail = 32
+    assert(mixed_sum(m) == 42)
+    assert(m.mid == 2.5)
+    return 0
+}
+
+def test_nested_layout(): {
+    let o: Outer
+    o.inner.x = 3
+    o.inner.y = 4
+    o.tag = 2
+    assert(outer_sum(o) == 36)
+    return 0
+}
+
+def test_enum_field_layout(): {
+    let s: State
+    s.phase = Phase.Active
+    s.level = 41
+    assert(state_level(s) == 42)
+    return 0
+}
+
+def test_borrowed_view_layout(): {
+    body = alloc_u8(8)
+    let v: RequestView
+    v.body = body
+    assert(view_len(v) == 8)
+    return 0
+}

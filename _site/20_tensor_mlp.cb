@@ -1,0 +1,45 @@
+# Native f32 tensor primitives: an MLP-shaped inference step
+# Buffers are explicit pointer + element-count views.
+
+def test_tensor_mlp_primitives(): {
+    input = alloc_f32(4)
+    weights = alloc_f32(32)
+    output = alloc_f32(8)
+
+    # Fractional constants are lowered directly into native f32 buffers.
+    fill_f32(input, 1.5)
+    fill_f32(weights, 2.5)
+    matmul_f32(input, weights, output, 1, 8, 4)
+    relu_f32(output)
+
+    # Each of the eight output columns is 4 * (1.5 * 2.5) = 15.
+    # N=8 also exercises the AVX2/FMA eight-column tile.
+    assert(sum_f32(output) == 120)
+
+    free(input)
+    free(weights)
+    free(output)
+    return 0
+}
+
+def test_matmul_mixed_tile_and_odd_k(): {
+    input = alloc_f32(3)
+    weights = alloc_f32(27)
+    output = alloc_f32(9)
+
+    fill_f32(input, 2.0)
+    fill_f32(weights, 3.0)
+    # N=9 executes one AVX2 tile plus a scalar tail; K=3 is not unrolled.
+    matmul_f32(input, weights, output, 1, 9, 3)
+    assert(sum_f32(output) == 162)
+
+    free(input)
+    free(weights)
+    free(output)
+    return 0
+}
+
+def main(): {
+    test_tensor_mlp_primitives()
+    return test_matmul_mixed_tile_and_odd_k()
+}

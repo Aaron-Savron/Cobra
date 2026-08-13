@@ -1,0 +1,11 @@
+# A readonly contract survives aliasing: once a local points at a readonly
+# buffer, writing through any alias of it must be rejected, whether the
+# alias was first bound to a region allocation or to an owned buffer.
+def broken(x: readonly []f32) -> i64: {
+    with region scratch: {
+        t = scratch.alloc_f32(8)
+        t = x
+        t[0] = 5.0
+    }
+    return 0
+}

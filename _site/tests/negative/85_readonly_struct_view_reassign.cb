@@ -1,0 +1,12 @@
+struct RequestView: {
+    body: readonly []u8,
+}
+
+def invalid_readonly_reassign(): {
+    first = alloc_u8(4)
+    second = alloc_u8(4)
+    let request: RequestView
+    request.body = first
+    request.body = second
+    return 0
+}

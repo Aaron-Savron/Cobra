@@ -1,0 +1,85 @@
+# Native @parallel keeps Cobra model kernels expressive while splitting a
+# proven element-wise []f32 range into contiguous worker chunks. Small buffers
+# deliberately use the scalar fast path; large buffers exercise pthreads.
+
+def parallel_affine(values: []f32): {
+    @parallel: {
+        for i in len(values): {
+            values[i] = values[i] * 2.0 + 1.0
+        }
+    }
+    return 0
+}
+
+def parallel_relu(values: []f32): {
+    @parallel: {
+        for i in len(values): {
+            if values[i] < 0.0: {
+                values[i] = 0.0
+            }
+        }
+    }
+    return 0
+}
+
+def parallel_scale(values: []f32, k: f32): {
+    @parallel: {
+        for i in len(values): {
+            values[i] = values[i] * k
+        }
+    }
+    return 0
+}
+
+def test_parallel_small_fallback(): {
+    values = alloc_f32(8)
+    fill_f32(values, 1.0)
+    parallel_affine(values)
+    assert(sum_f32(values) == 24)
+    free(values)
+    return 0
+}
+
+def test_parallel_large_workers(): {
+    values = alloc_f32(4096)
+    fill_f32(values, 1.0)
+    parallel_affine(values)
+    assert(sum_f32(values) == 12288)
+    free(values)
+    return 0
+}
+
+def test_parallel_clamp(): {
+    values = alloc_f32(2048)
+    fill_f32(values, -1.0)
+    parallel_relu(values)
+    assert(sum_f32(values) == 0)
+    free(values)
+    return 0
+}
+
+def test_parallel_scalar_capture(): {
+    values = alloc_f32(4096)
+    fill_f32(values, 2.0)
+    parallel_scale(values, 3.0)
+    assert(sum_f32(values) == 24576)
+    free(values)
+    return 0
+}
+
+def test_parallel_pool_reuse(): {
+    values = alloc_f32(8192)
+    fill_f32(values, 1.0)
+    for r in range(50): {
+        parallel_scale(values, 2.0)
+    }
+    for i in range(8192): {
+        assert(values[i] == 1125899906842624.0)
+    }
+    free(values)
+    return 0
+}
+
+def main(): {
+    return 0
+}

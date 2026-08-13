@@ -1,0 +1,32 @@
+def fill(values: []f32): {
+    for i in len(values) {
+        values[i] = i + 1.0
+    }
+}
+
+def scale_in_parallel(values: []f32, factor: f32): {
+    @parallel: {
+    for i in len(values) {
+        values[i] = values[i] * factor
+    }
+    }
+}
+
+def test_pipeline(): {
+    with region scratch(4096): {
+        let left: []f32 = scratch.alloc_f32(8)
+        let right: []f32 = scratch.alloc_f32(8)
+        let output: []f32 = scratch.alloc_f32(4)
+        fill(left)
+        fill(right)
+        scale_in_parallel(left, 2.0)
+        matmul_f32(left, right, output, 2, 2, 4)
+        assert(output[0] > 0.0)
+        assert(output[3] > 0.0)
+    }
+}
+
+def main(): {
+    test_pipeline()
+    print("pipeline ok")
+}

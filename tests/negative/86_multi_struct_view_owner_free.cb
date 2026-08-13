@@ -1,0 +1,14 @@
+struct RequestViews: {
+    body: readonly []u8,
+    trailer: readonly []u8,
+}
+
+def invalid_multi_view_owner_free(): {
+    body = alloc_u8(4)
+    trailer = alloc_u8(4)
+    let request: RequestViews
+    request.body = body
+    request.trailer = trailer
+    free(body)
+    return 0
+}

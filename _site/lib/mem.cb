@@ -1,0 +1,361 @@
+# Cobra Memory Library (lib/mem.cb)
+# Arena, pool, and aligned allocation as userland Cobra on the libc ABI
+# bridge. All backing storage comes from mmap, so blocks are page-aligned
+# and every release is a single munmap. State is stored in caller-owned scalar
+# structs. `out` passes their frame address directly, so there is no allocator
+# object, heap wrapper, or hidden copy.
+#
+# Conventions:
+#   - ArenaState and PoolState contain pointer-sized i64 fields by design.
+#   - Pool free indices live in a separate caller-owned []i64 buffer.
+#   - Raw byte helpers operate on buffer storage or arena pointers for C interop.
+#   - Invalid requests and allocation failures return 0 or -1 as documented.
+
+import c "libc.so.6" (mmap, munmap, memcpy, memset, memcmp)
+
+struct ArenaState: {
+    base: i64,
+    cursor: i64,
+    capacity: i64,
+}
+
+struct PoolState: {
+    base: i64,
+    block_size: i64,
+    count: i64,
+    free_top: i64,
+}
+
+# --- Raw byte helpers ------------------------------------------------------
+
+def mem_copy(dst: []i64, src: []i64, n: i64) -> i64: {
+    return memcpy(dst, src, n)
+}
+
+def mem_set(ptr: []i64, value: i64, n: i64) -> i64: {
+    return memset(ptr, value, n)
+}
+
+def mem_equal(a: []i64, b: []i64, n: i64) -> i64: {
+    return memcmp(a, b, n)
+}
+
+# --- Aligned allocation ----------------------------------------------------
+
+# mmap-backed allocation. Pages are 4096-aligned, so align <= 4096 is
+# satisfied by construction. Free with mem_aligned_free(ptr, size).
+def mem_aligned_alloc(size: i64, align: i64) -> i64: {
+    const prot_read: i64 = 1
+    const prot_write: i64 = 2
+    const map_private: i64 = 2
+    const map_anonymous: i64 = 32
+    const prot_read_write: i64 = prot_read + prot_write
+    const map_private_anonymous: i64 = map_private + map_anonymous
+    if size <= 0: {
+        return 0
+    }
+    if align <= 0: {
+        return 0
+    }
+    if align > 4096: {
+        return 0
+    }
+    power = 1
+    while power < align: {
+        power = power * 2
+    }
+    if power != align: {
+        return 0
+    }
+    p = mmap(0, size, prot_read_write, map_private_anonymous, -1, 0)
+    if p == -1: {
+        return 0
+    }
+    return p
+}
+
+def mem_aligned_free(ptr: i64, size: i64) -> i64: {
+    if ptr == 0: {
+        return -1
+    }
+    if size <= 0: {
+        return -1
+    }
+    return munmap(ptr, size)
+}
+
+# --- Arena (bump allocator) ------------------------------------------------
+
+# Reserve capacity bytes for the arena. Returns the base pointer, or 0.
+def arena_create(state: out ArenaState, capacity: i64) -> i64: {
+    const prot_read: i64 = 1
+    const prot_write: i64 = 2
+    const map_private: i64 = 2
+    const map_anonymous: i64 = 32
+    const prot_read_write: i64 = prot_read + prot_write
+    const map_private_anonymous: i64 = map_private + map_anonymous
+    state.base = 0
+    state.cursor = 0
+    state.capacity = 0
+    if capacity <= 0: {
+        return 0
+    }
+    base = mmap(0, capacity, prot_read_write, map_private_anonymous, -1, 0)
+    if base == -1: {
+        return 0
+    }
+    state.base = base
+    state.cursor = 0
+    state.capacity = capacity
+    return base
+}
+
+# Bump-allocate size bytes from the arena. Returns the pointer, or 0 when the
+# request is invalid or the arena is exhausted. The subtraction form avoids
+# cursor + size overflow before the capacity check.
+def arena_alloc(state: out ArenaState, size: i64) -> i64: {
+    if size < 0: {
+        return 0
+    }
+    if state.base == 0: {
+        return 0
+    }
+    if state.capacity <= 0: {
+        return 0
+    }
+    if state.cursor < 0: {
+        return 0
+    }
+    if state.cursor > state.capacity: {
+        return 0
+    }
+    if size > state.capacity - state.cursor: {
+        return 0
+    }
+    p = state.base + state.cursor
+    state.cursor = state.cursor + size
+    return p
+}
+
+# Rewind the cursor so the arena reuses its backing storage.
+def arena_reset(state: out ArenaState) -> void {
+    if state.base == 0: {
+        return
+    }
+    if state.capacity <= 0: {
+        return
+    }
+    state.cursor = 0
+}
+
+# Release the backing storage. Returns 0 on success. A zero base is already
+# destroyed and is treated as a successful no-op.
+def arena_destroy(state: out ArenaState) -> i64 {
+    if state.base == 0: {
+        state.cursor = 0
+        state.capacity = 0
+        return 0
+    }
+    r = munmap(state.base, state.capacity)
+    state.base = 0
+    state.cursor = 0
+    state.capacity = 0
+    return r
+}
+
+# --- Pool (fixed-size block free list) -------------------------------------
+# PoolState names the four scalar fields. The caller supplies free_list with
+# at least `count` elements, avoiding an embedded dynamic object.
+#
+# pool_free validates range, alignment, and current allocation state by
+# scanning the free-index stack. This keeps foreign pointers and double frees
+# from corrupting the caller-owned free list without adding hidden metadata.
+def pool_create(state: out PoolState, free_list: out []i64,
+                block_size: i64, count: i64) -> i64 {
+    const prot_read: i64 = 1
+    const prot_write: i64 = 2
+    const map_private: i64 = 2
+    const map_anonymous: i64 = 32
+    const prot_read_write: i64 = prot_read + prot_write
+    const map_private_anonymous: i64 = map_private + map_anonymous
+    const max_i64: i64 = 2147483647 * 2147483647 * 2 + 2147483647 * 4 + 1
+    state.base = 0
+    state.block_size = 0
+    state.count = 0
+    state.free_top = 0
+    if block_size <= 0: {
+        return 0
+    }
+    if count <= 0: {
+        return 0
+    }
+    if len(free_list) < count: {
+        return 0
+    }
+    if block_size > max_i64 / count: {
+        return 0
+    }
+    cap = block_size * count
+    if cap <= 0: {
+        return 0
+    }
+    if cap / block_size != count: {
+        return 0
+    }
+    base = mmap(0, cap, prot_read_write, map_private_anonymous, -1, 0)
+    if base == -1: {
+        return 0
+    }
+    state.base = base
+    state.block_size = block_size
+    state.count = count
+    state.free_top = count
+    i = 0
+    while i < count: {
+        free_list[i] = count - 1 - i
+        i = i + 1
+    }
+    return base
+}
+
+def pool_alloc(state: out PoolState, free_list: readonly []i64) -> i64 {
+    const max_i64: i64 = 2147483647 * 2147483647 * 2 + 2147483647 * 4 + 1
+    if state.base == 0: {
+        return 0
+    }
+    if state.block_size <= 0: {
+        return 0
+    }
+    if state.count <= 0: {
+        return 0
+    }
+    if state.free_top <= 0: {
+        return 0
+    }
+    if state.free_top > state.count: {
+        return 0
+    }
+    if state.block_size > max_i64 / state.count: {
+        return 0
+    }
+    cap = state.block_size * state.count
+    if cap <= 0: {
+        return 0
+    }
+    if cap / state.block_size != state.count: {
+        return 0
+    }
+    if len(free_list) < state.count: {
+        return 0
+    }
+    n = state.free_top
+    idx = free_list[n - 1]
+    if idx < 0: {
+        return 0
+    }
+    if idx >= state.count: {
+        return 0
+    }
+    state.free_top = n - 1
+    return state.base + idx * state.block_size
+}
+
+def pool_free(state: out PoolState, free_list: out []i64, p: i64) -> i64 {
+    const max_i64: i64 = 2147483647 * 2147483647 * 2 + 2147483647 * 4 + 1
+    if p == 0: {
+        return -1
+    }
+    if state.base == 0: {
+        return -1
+    }
+    if state.block_size <= 0: {
+        return -1
+    }
+    if state.count <= 0: {
+        return -1
+    }
+    if state.free_top < 0: {
+        return -1
+    }
+    if state.free_top > state.count: {
+        return -1
+    }
+    if state.block_size > max_i64 / state.count: {
+        return -1
+    }
+    cap = state.block_size * state.count
+    if cap <= 0: {
+        return -1
+    }
+    if cap / state.block_size != state.count: {
+        return -1
+    }
+    if len(free_list) < state.count: {
+        return -1
+    }
+    if p < state.base: {
+        return -1
+    }
+    delta = p - state.base
+    if delta >= cap: {
+        return -1
+    }
+    idx = delta / state.block_size
+    if idx < 0: {
+        return -1
+    }
+    if idx >= state.count: {
+        return -1
+    }
+    if idx * state.block_size != delta: {
+        return -1
+    }
+    n = state.free_top
+    if n >= state.count: {
+        return -1
+    }
+    i = 0
+    while i < n: {
+        if free_list[i] == idx: {
+            return -1
+        }
+        i = i + 1
+    }
+    free_list[n] = idx
+    state.free_top = n + 1
+    return 0
+}
+
+# Release the pool and clear every state field. A second destroy is a safe
+# no-op, matching arena_destroy.
+def pool_destroy(state: out PoolState) -> i64 {
+    const max_i64: i64 = 2147483647 * 2147483647 * 2 + 2147483647 * 4 + 1
+    if state.base == 0: {
+        state.block_size = 0
+        state.count = 0
+        state.free_top = 0
+        return 0
+    }
+    if state.block_size <= 0: {
+        return -1
+    }
+    if state.count <= 0: {
+        return -1
+    }
+    if state.block_size > max_i64 / state.count: {
+        return -1
+    }
+    cap = state.block_size * state.count
+    if cap <= 0: {
+        return -1
+    }
+    if cap / state.block_size != state.count: {
+        return -1
+    }
+    r = munmap(state.base, cap)
+    state.base = 0
+    state.block_size = 0
+    state.count = 0
+    state.free_top = 0
+    return r
+}

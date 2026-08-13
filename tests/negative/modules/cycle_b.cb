@@ -1,0 +1,5 @@
+import "cycle_a.cb"
+
+def cycle_b() -> i64: {
+    return 2
+}

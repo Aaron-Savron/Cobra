@@ -1,0 +1,8 @@
+struct RequestView: {
+    body: readonly []u8,
+}
+
+def invalid_field_free(request: RequestView): {
+    free(request.body)
+    return 0
+}

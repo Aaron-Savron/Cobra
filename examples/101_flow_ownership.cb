@@ -1,0 +1,67 @@
+# Flow-sensitive ownership: canonical readonly/out qualifiers composing with
+# aliases, rebinds, frees, and region lifetime. Each test pins a boundary
+# where a static alias contract meets runtime flow state, which is exactly
+# where ownership bugs surface.
+
+def scale_copy(dst: out []f32, src: readonly []f32, k: f32) -> i64: {
+    for i in len(dst): {
+        dst[i] = src[i] * k
+    }
+    return 0
+}
+
+# An owned buffer aliased into a readonly param, a region-backed out target,
+# then the alias rebound and the original owner freed. The canonical
+# qualifiers hold at the call boundary while flow state tracks the borrow.
+def test_alias_rebind_free_region(): {
+    owner = alloc_f32(4)
+    fill_f32(owner, 2.0)
+    view = alloc_f32(4)
+    view = owner
+    with region scratch: {
+        dst = scratch.alloc_f32(4)
+        scale_copy(dst, view, 3.0)
+        assert(dst[0] == 6.0)
+        assert(dst[3] == 6.0)
+    }
+    view = alloc_f32(4)
+    fill_f32(view, 7.0)
+    assert(view[0] == 7.0)
+    free(owner)
+    free(view)
+    return 0
+}
+
+# An out param targets an owned buffer, which is freed and rebound after the
+# call. The out contract is a call-boundary fact, not a sticky local state.
+def test_out_free_rebind(): {
+    src = alloc_f32(4)
+    fill_f32(src, 2.0)
+    target = alloc_f32(4)
+    scale_copy(target, src, 2.0)
+    assert(target[0] == 4.0)
+    free(target)
+    target = alloc_f32(4)
+    fill_f32(target, 9.0)
+    assert(target[0] == 9.0)
+    free(src)
+    free(target)
+    return 0
+}
+
+# A region-backed view is read through a canonical readonly param, then the
+# region ends. No heap free may touch region storage.
+def read_sum(v: readonly []f32) -> i64: {
+    s = sum_f32(v)
+    return 0
+}
+
+def test_region_readonly_view(): {
+    with region scratch: {
+        raw = scratch.alloc_f32(8)
+        fill_f32(raw, 4.0)
+        read_sum(raw)
+        assert(sum_f32(raw) == 32.0)
+    }
+    return 0
+}

@@ -1,0 +1,63 @@
+# Struct payloads stay in caller-owned native frame storage.
+# This first ABI supports structs made from scalar fields. Slice fields remain
+# rejected until borrowed view layout is defined.
+
+struct Point: {
+    x: i64,
+    y: i64,
+}
+
+def checked_point(value: i64) -> Result[Point, i64]: {
+    if value < 0: {
+        return err(7)
+    }
+    let point: Point
+    point.x = value
+    point.y = value + 1
+    return ok(point)
+}
+
+def forwarded_point(value: i64) -> Result[Point, i64]: {
+    return checked_point(value)?
+}
+
+def maybe_point(enabled: i64) -> Option[Point]: {
+    if enabled == 0: {
+        return none
+    }
+    let point: Point
+    point.x = 40
+    point.y = 2
+    return some(point)
+}
+
+def test_struct_result_payload(): {
+    result = checked_point(10)
+    assert(is_ok(result))
+    let point: Point = unwrap_ok(result)
+    assert(point.x == 10)
+    assert(point.y == 11)
+
+    forwarded = forwarded_point(20)
+    assert(is_ok(forwarded))
+    let forwarded_value: Point = unwrap_ok(forwarded)
+    assert(forwarded_value.x == 20)
+    assert(forwarded_value.y == 21)
+
+    failure = forwarded_point(-1)
+    assert(is_ok(failure) == 0)
+    assert(unwrap_err(failure) == 7)
+    return 0
+}
+
+def test_struct_option_payload(): {
+    present = maybe_point(1)
+    assert(is_some(present))
+    let point: Point = unwrap(present)
+    assert(point.x == 40)
+    assert(point.y == 2)
+
+    absent = maybe_point(0)
+    assert(is_some(absent) == 0)
+    return 0
+}

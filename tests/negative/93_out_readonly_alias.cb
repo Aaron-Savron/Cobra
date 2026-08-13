@@ -1,0 +1,15 @@
+# A readonly slice cannot be passed where an out slice is expected. The
+# canonical mutability check rejects the borrow at the call boundary even
+# though both sides are []f32 and the legacy kinds match.
+
+def fill_target(dst: out []f32) -> i64: {
+    for i in len(dst): {
+        dst[i] = 1.0
+    }
+    return 0
+}
+
+def bad(src: readonly []f32) -> i64: {
+    fill_target(src)
+    return 0
+}

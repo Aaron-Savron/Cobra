@@ -1,0 +1,61 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build site structure
+        run: |
+          mkdir -p _site/docs
+
+          # Copy the web shell files
+          cp web/index.html  _site/index.html
+          cp web/docs.html   _site/docs.html
+          cp web/cobra_logo.jpg _site/cobra_logo.jpg
+
+          # Copy every documentation markdown file used by the docs app.
+          cp docs/*.md _site/docs/
+          cp CONTRIBUTING.md   _site/CONTRIBUTING.md
+          cp ROADMAP.md        _site/ROADMAP.md
+
+          # Patch the fetch paths in docs.html from relative-to-web/ to root-relative
+          sed -i "s|path: '../docs/TOUR.md'|path: 'docs/TOUR.md'|g"         _site/docs.html
+          sed -i "s|path: '../docs/REFERENCE.md'|path: 'docs/REFERENCE.md'|g" _site/docs.html
+          sed -i "s|path: '../docs/FOUNDATION_SAFETY.md'|path: 'docs/FOUNDATION_SAFETY.md'|g" _site/docs.html
+          sed -i "s|path: '../docs/STRING_FOUNDATION.md'|path: 'docs/STRING_FOUNDATION.md'|g" _site/docs.html
+          sed -i "s|path: '../CONTRIBUTING.md'|path: 'CONTRIBUTING.md'|g"    _site/docs.html
+          sed -i "s|path: '../ROADMAP.md'|path: 'ROADMAP.md'|g"              _site/docs.html
+
+          # Patch logo src in index.html (stays the same, cobra_logo.jpg is at root)
+          # Patch back-link in docs.html from index.html to ./
+          sed -i 's|href="index.html"|href="./"|g' _site/docs.html
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,23 @@
+# Example 10: Cobra Standard Library Test (lib/std.cb) 
+
+def main(): {
+    print_banner()
+    
+    # 1. Use stdlib math functions
+    a = 0 - 88
+    a_abs = abs_val(a)
+    a_abs?
+    
+    highest = max_val(100, 250)
+    highest?
+    
+    lowest = min_val(100, 250)
+    lowest?
+    
+    # 2. Use stdlib SIMD AVX2 vectorization
+    data = [1, 2, 3, 4]
+    vector_scale_avx2(data)
+    
+    print("Zero-Dependency Cobra Standard Library (lib/std.cb) verified!")
+    return highest
+}

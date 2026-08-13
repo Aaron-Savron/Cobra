@@ -1,0 +1,11 @@
+struct InnerBytes: {
+    body: readonly []u8,
+}
+
+struct OuterBytes: {
+    inner: InnerBytes,
+}
+
+def invalid_nested_borrowed_field(value: OuterBytes) -> i64: {
+    return 0
+}

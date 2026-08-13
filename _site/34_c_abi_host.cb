@@ -1,0 +1,12 @@
+# C ABI host example: emitted functions are ordinary global SysV symbols.
+# Build the assembly with:
+#   ./cobra emit-asm examples/34_c_abi_host.cb -o /tmp/cobra_host.s
+# Then compile the host:
+#   gcc -O2 -no-pie /tmp/cobra_host.s examples/34_c_abi_host.c -lm -o /tmp/cobra_host
+
+def cobra_affine(values: []f32): {
+    for i in len(values): {
+        values[i] = values[i] * 2.0 + 1.0
+    }
+    return 0
+}

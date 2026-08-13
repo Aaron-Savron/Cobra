@@ -1,0 +1,22 @@
+# Repeated reduction workload: reductions plus ordinary model-style passes.
+# The buffers are allocated once; each process performs enough work to make
+# reduction throughput measurable without introducing a runtime benchmark API.
+
+def main(): {
+    values = alloc_f32(16384)
+    fill_f32(values, 2.0)
+
+    iterations = 1500
+    while iterations > 0: {
+        total = sum_f32(values)
+        average = mean_f32(values)
+        peak = max_f32(values)
+        assert(total == 32768.0)
+        assert(average == 2.0)
+        assert(peak == 2.0)
+        iterations = iterations - 1
+    }
+
+    free(values)
+    return 0
+}

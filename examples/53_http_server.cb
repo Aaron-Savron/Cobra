@@ -1,0 +1,49 @@
+# Example 53: Networking Lane  HTTP Server (lib/net.cb)
+# A real TCP server in userland Cobra. Zero imports in this file: the socket
+# lifecycle, the request read, and the HTTP response are all native libc
+# calls through the bridge. Serves three requests, then exits so it can be
+# driven by an external client in a test.
+
+def serve_once(fd: i64) -> i64: {
+    c = net_accept(fd)
+    if c < 0: {
+        return -1
+    }
+    req = alloc_i64(64)
+    n = net_recv(c, req, 512)
+    free(req)
+    response = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 12\r\nConnection: close\r\n\r\nHello Cobra\n"
+    sent = net_send(c, response)
+    net_close(c)
+    if sent < 0: {
+        return -1
+    }
+    return n
+}
+
+def main(): {
+    fd = net_socket()
+    if fd < 0: {
+        print("socket failed")
+        return 1
+    }
+    net_reuseaddr(fd)
+    if net_bind(fd, 18080) != 0: {
+        print("bind failed")
+        return 1
+    }
+    if net_listen(fd, 8) != 0: {
+        print("listen failed")
+        return 1
+    }
+    print("serving on 18080")
+    served = 0
+    while served < 3: {
+        if serve_once(fd) >= 0: {
+            served = served + 1
+        }
+    }
+    net_close(fd)
+    print("served 3 requests")
+    return 0
+}

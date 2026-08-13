@@ -1,0 +1,30 @@
+# Cobra Python Comfort: everyday code stays familiar and native.
+
+def main(): {
+    values = [4, 5, 6]
+
+    total = 0
+    for i in range(5): {
+        total = total + i
+    }
+
+    indexed_total = 0
+    for index, value in enumerate(values): {
+        indexed_total = indexed_total + index + value
+    }
+
+    assert(total == 10)
+    assert(indexed_total == 18)
+    assert(sum(values) == 15)
+    assert(min(values) == 4)
+    assert(max(values) == 6)
+    assert(any(values))
+    assert(all(values))
+
+    empty = []
+    assert(any(empty) == 0)
+    assert(all(empty) == 1)
+
+    print("Python comfort, native execution")
+    return 0
+}

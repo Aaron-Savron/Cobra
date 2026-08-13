@@ -1,0 +1,47 @@
+# Reduction Engine v1 regressions.
+# Covers full AVX2 groups, scalar tails, short buffers, empty buffers, and
+# negative values without changing the ordinary Cobra reduction API.
+
+def test_vector_sum_and_mean(): {
+    values = alloc_f32(17)
+    fill_f32(values, 2.0)
+    assert(sum_f32(values) == 34.0)
+    assert(mean_f32(values) == 2.0)
+    free(values)
+    return 0
+}
+
+def test_vector_max_and_tail(): {
+    values = alloc_f32(11)
+    fill_f32(values, -3.0)
+    values[8] = 9.0
+    values[10] = 7.0
+    # 8 lanes plus a three-element scalar tail.
+    assert(max_f32(values) == 9.0)
+    assert(sum_f32(values) == -11.0)
+    free(values)
+    return 0
+}
+
+def test_short_and_empty_reductions(): {
+    short = alloc_f32(3)
+    short[0] = -4.0
+    short[1] = -2.0
+    short[2] = -6.0
+    assert(sum_f32(short) == -12.0)
+    assert(mean_f32(short) == -4.0)
+    assert(max_f32(short) == -2.0)
+    free(short)
+
+    empty = alloc_f32(0)
+    assert(sum_f32(empty) == 0.0)
+    assert(mean_f32(empty) == 0.0)
+    free(empty)
+    return 0
+}
+
+def main(): {
+    test_vector_sum_and_mean()
+    test_vector_max_and_tail()
+    return test_short_and_empty_reductions()
+}

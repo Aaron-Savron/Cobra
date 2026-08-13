@@ -1,0 +1,8 @@
+def read_floats(values: readonly []f32) -> i64 {
+    return len(values)
+}
+
+def test_array_element_mismatch(): {
+    let values = [1, 2]
+    return read_floats(values)
+}

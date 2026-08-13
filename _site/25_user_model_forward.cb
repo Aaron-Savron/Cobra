@@ -1,0 +1,83 @@
+# User-authored model math: softmax and a two-layer MLP forward pass
+# written entirely in Cobra. The base language supplies native AVX2
+# reductions, vectorized user loops, FMA fusion, and transcendental
+# math; the model itself is ordinary user code - the foundation for
+# user-built model libraries.
+
+# softmax_f32 now ships in lib/nn.cb (auto-prepended to every program);
+# it is ordinary Cobra code on the same base primitives shown here.
+
+# MLP forward pass: h = ReLU(input * w1 + b1), out = h * w2 + b2.
+# The bias-and-activation loop is user code that vectorizes to
+# vaddps + vmaxps in one pass.
+def mlp_forward(input: []f32, w1: []f32, b1: []f32, h: []f32,
+                w2: []f32, b2: []f32, out: []f32): {
+    matmul_f32(input, w1, h, 1, 4, 4)
+    for i in len(h): {
+        h[i] = h[i] + b1[i]
+        if h[i] < 0.0: {
+            h[i] = 0.0
+        }
+    }
+    matmul_f32(h, w2, out, 1, 2, 4)
+    for i in len(out): {
+        out[i] = out[i] + b2[i]
+    }
+    return 0
+}
+
+def test_user_model_forward(): {
+    input = alloc_f32(4)
+    w1 = alloc_f32(16)
+    b1 = alloc_f32(4)
+    h = alloc_f32(4)
+    w2 = alloc_f32(8)
+    b2 = alloc_f32(2)
+    out = alloc_f32(2)
+
+    fill_f32(input, 0.0)
+    input[0] = 2.0
+    fill_f32(w1, 0.0)
+    w1[0] = 1.0
+    w1[5] = 1.0
+    w1[10] = 1.0
+    w1[15] = 1.0
+    fill_f32(b1, 0.0)
+    fill_f32(w2, 0.0)
+    w2[0] = 1.0
+    w2[3] = 1.0
+    fill_f32(b2, 0.0)
+
+    # h = [2, 0, 0, 0] after identity weights, bias, and user ReLU.
+    mlp_forward(input, w1, b1, h, w2, b2, out)
+    assert(sum_f32(h) == 2.0)
+    assert(mean_f32(h) == 0.5)
+    assert(max_f32(h) == 2.0)
+
+    # out = [2, 0]; softmax yields roughly [0.881, 0.119].
+    softmax_f32(out)
+    d = sum_f32(out) - 1.0
+    assert(d > -0.0001)
+    assert(d < 0.0001)
+    assert(out[0] > out[1])
+
+    # Transcendental intrinsics dispatch to libm and return f32.
+    assert(exp_f32(0.0) == 1.0)
+    assert(sqrt_f32(16.0) == 4.0)
+    assert(tanh_f32(0.0) == 0.0)
+    assert(log_f32(1.0) == 0.0)
+    assert(pow_f32(2.0, 3.0) == 8.0)
+
+    free(input)
+    free(w1)
+    free(b1)
+    free(h)
+    free(w2)
+    free(b2)
+    free(out)
+    return 0
+}
+
+def main(): {
+    return test_user_model_forward()
+}

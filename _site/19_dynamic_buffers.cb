@@ -1,0 +1,28 @@
+# Explicit owned dynamic buffers
+
+def scale(values: []i64): {
+    @compute: {
+        for value in values: {
+            value = value * 2
+        }
+    }
+    return 0
+}
+
+def test_dynamic_buffer_lifecycle(): {
+    values = alloc_i64(6)
+
+    # alloc_i64 is zero-initialized and carries a runtime length.
+    assert(len(values) == 6)
+    assert(values[0] == 0)
+    assert(values[5] == 0)
+
+    # The helper borrows pointer + length; no copy occurs.
+    scale(values)
+    assert(values[0] == 0)
+    assert(values[5] == 0)
+
+    # The creator owns the buffer and releases it explicitly.
+    free(values)
+    return 0
+}

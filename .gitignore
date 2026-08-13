@@ -1,0 +1,26 @@
+# Cobra Compiler Git Ignore File
+
+# Build & Assembly Artifacts
+cobra
+output
+output.s
+*.s
+*.wat
+*.o
+*.d
+.repl_tmp*
+
+# Release Packaging
+dist/
+*.tar.gz
+
+# System Files
+.DS_Store
+
+# Local credentials
+.env
+.cobra-site-check/
+
+# Python tooling caches
+__pycache__/
+*.pyc

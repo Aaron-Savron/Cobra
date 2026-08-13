@@ -1,0 +1,7 @@
+def invalid_region_u8_owner_free(): {
+    with region scratch: {
+        owner = scratch.alloc_u8(8)
+        free(owner)
+    }
+    return 0
+}

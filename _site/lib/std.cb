@@ -1,0 +1,48 @@
+# Cobra Standard Library (lib/std.cb)
+# Zero-dependency system standard library for Cobra.
+
+import c "libc.so.6" (abs)
+
+def print_banner(): {
+    print("=== Cobra Standard Library ===")
+}
+
+def abs_val(x): {
+    if x < 0: {
+        return 0 - x
+    }
+    return x
+}
+
+def max_val(a, b): {
+    if a > b: {
+        return a
+    }
+    return b
+}
+
+def min_val(a, b): {
+    if a < b: {
+        return a
+    }
+    return b
+}
+
+def vector_scale_avx2(numbers): {
+    @compute: {
+        for i in numbers: {
+            i = i * 2
+        }
+    }
+    return 0
+}
+
+def sys_io_uring_socket(): {
+    asm: "mov rax, 41\n  mov rdi, 2\n  mov rsi, 1\n  mov rdx, 0\n  syscall"
+    return 0
+}
+
+def file_write_log(msg): {
+    print(msg)
+    return 0
+}

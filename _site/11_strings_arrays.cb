@@ -1,0 +1,18 @@
+# Example 11: Dynamic Strings & Scope-Arena Arrays! 
+
+def main(): {
+    print("=== Cobra Scope-Arena Strings & Arrays ===")
+    
+    # 1. len() Built-in Operator on String Literals
+    msg = "Hello Cobra System"
+    msg_len = len("Hello Cobra System")
+    msg_len?
+    
+    # 2. len() Operator on Scope-Arena Arrays
+    data = [10, 20, 30, 40, 50]
+    data_len = len(data)
+    data_len?
+    
+    print("Dynamic string and array length tracking complete with 0-cost Scope-Arena memory!")
+    return msg_len
+}

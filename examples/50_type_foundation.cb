@@ -1,0 +1,56 @@
+# Type foundation: bool, none, const, and user structs with field access.
+# Every value is a direct native slot; structs are contiguous frame regions
+# with IR-assigned field offsets, so member access is a single load/store.
+
+struct Point: { x: i64, y: i64 }
+struct Config: { name: string, scale: f32, enabled: bool }
+
+def test_struct_fields(): {
+    let p: Point
+    p.x = 3
+    p.y = 4
+    assert(p.x == 3)
+    assert(p.y == 4)
+
+    let c: Config
+    c.scale = 2.5
+    c.enabled = true
+    assert(c.enabled == 1)
+    assert(c.scale == 2.5)
+    return 0
+}
+
+def test_const_bindings(): {
+    const limit: i64 = 42
+    const label: string = "cobra"
+    assert(limit == 42)
+    assert(label == "cobra")
+    return 0
+}
+
+def test_bool_values(): {
+    let flag: bool = true
+    let off: bool = false
+    assert(flag == 1)
+    assert(off == 0)
+    assert((flag == 1) == true)
+    if flag: {
+        flag = flag
+    }
+    return 0
+}
+
+def test_none_literal(): {
+    let empty: i64 = none
+    assert(empty == 0)
+    return 0
+}
+
+def main(): {
+    test_struct_fields()
+    test_const_bindings()
+    test_bool_values()
+    test_none_literal()
+    print("type foundation passed")
+    return 0
+}

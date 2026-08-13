@@ -1,0 +1,128 @@
+# Cobra Time Library (lib/time.cb)
+# Wall clock and CPU time stay as plain integers on the libc ABI bridge. The
+# checked variants use native Result values with integer error codes.
+
+import c "libc.so.6" (time, clock, gettimeofday, clock_gettime)
+
+# Integer error codes used by the checked time helpers.
+# 1 = libc clock failure, 2 = invalid timestamp, 3 = CPU clock failure.
+
+# Unix wall-clock seconds since the epoch.
+def time_now() -> i64: {
+    return time(0)
+}
+
+# Checked Unix wall-clock seconds. A negative libc result is a clock failure.
+def time_now_checked() -> Result[i64, i64]: {
+    value = time(0)
+    if value < 0: {
+        return err(1)
+    }
+    return ok(value)
+}
+
+# Microseconds since the Unix epoch, from gettimeofday. The two 8-byte timeval
+# fields land directly in a two-element []i64 buffer, so the fields are plain
+# indexed reads.
+def time_precise_us() -> i64: {
+    tv = alloc_i64(2)
+    status = gettimeofday(tv, 0)
+    if status != 0: {
+        free(tv)
+        return -1
+    }
+    sec = tv[0]
+    usec = tv[1]
+    free(tv)
+    return sec * 1000000 + usec
+}
+
+# Checked microseconds since the Unix epoch. The temporary timeval storage is
+# released on both the libc failure path and the success path.
+def time_precise_us_checked() -> Result[i64, i64]: {
+    tv = alloc_i64(2)
+    status = gettimeofday(tv, 0)
+    if status != 0: {
+        free(tv)
+        return err(1)
+    }
+    sec = tv[0]
+    usec = tv[1]
+    free(tv)
+    return ok(sec * 1000000 + usec)
+}
+
+# Microseconds elapsed since a time_precise_us() start point.
+def time_elapsed_us(start: i64) -> i64: {
+    return time_precise_us() - start
+}
+
+# Checked wall-clock elapsed time. Negative start points are rejected as
+# invalid timestamps, and a wall-clock rollback is reported instead of
+# returning a negative duration. Use the monotonic helpers below when elapsed
+# time must not depend on wall-clock adjustments.
+def time_elapsed_us_checked(start: i64) -> Result[i64, i64]: {
+    if start < 0: {
+        return err(2)
+    }
+    current = time_precise_us_checked()?
+    if current < start: {
+        return err(2)
+    }
+    return ok(current - start)
+}
+
+# Monotonic microseconds from CLOCK_MONOTONIC. The Linux clock id is 1.
+def time_monotonic_us() -> i64: {
+    ts = alloc_i64(2)
+    status = clock_gettime(1, ts)
+    if status != 0: {
+        free(ts)
+        return -1
+    }
+    sec = ts[0]
+    nsec = ts[1]
+    free(ts)
+    return sec * 1000000 + nsec / 1000
+}
+
+# Checked monotonic microseconds. This is the preferred source for durations.
+def time_monotonic_us_checked() -> Result[i64, i64]: {
+    ts = alloc_i64(2)
+    status = clock_gettime(1, ts)
+    if status != 0: {
+        free(ts)
+        return err(1)
+    }
+    sec = ts[0]
+    nsec = ts[1]
+    free(ts)
+    return ok(sec * 1000000 + nsec / 1000)
+}
+
+# Checked monotonic duration. Negative starts are invalid and clock rollback
+# remains guarded even though CLOCK_MONOTONIC should never move backwards.
+def time_elapsed_monotonic_us_checked(start: i64) -> Result[i64, i64]: {
+    if start < 0: {
+        return err(2)
+    }
+    current = time_monotonic_us_checked()?
+    if current < start: {
+        return err(2)
+    }
+    return ok(current - start)
+}
+
+# CPU time consumed by this process, in CLOCKS_PER_SEC ticks.
+def time_clock_ticks() -> i64: {
+    return clock()
+}
+
+# Checked process CPU time. A negative libc result is a CPU clock failure.
+def time_clock_ticks_checked() -> Result[i64, i64]: {
+    ticks = clock()
+    if ticks < 0: {
+        return err(3)
+    }
+    return ok(ticks)
+}

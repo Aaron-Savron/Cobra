@@ -1,0 +1,238 @@
+# Cross-feature stress suite: bugs live at the boundaries between
+# ownership, regions, aliases, comptime specialization, and parallel
+# execution. Each test below pins one interaction that an isolated
+# feature test would miss.
+
+# --- 1. readonly slices passed through regions -----------------------------
+# A region-backed buffer is a normal []f32 to callees. readonly still means
+# no-write, and the region owner keeps full write access after the call.
+
+def sum_readonly(v: readonly []f32) -> i64: {
+    s = sum_f32(v)
+    return 0
+}
+
+def test_readonly_via_region(): {
+    with region scratch: {
+        a = scratch.alloc_f32(64)
+        fill_f32(a, 1.0)
+        sum_readonly(a)
+        assert(a[0] == 1.0)
+        a[0] = 2.0
+        assert(a[0] == 2.0)
+    }
+    return 0
+}
+
+# --- 2. out buffers backed by regions --------------------------------------
+# An out param receives a region-backed write target; the callee writes
+# through it and the arena owns the storage.
+
+def fill_out(dst: out []f32) -> i64: {
+    for i in len(dst): {
+        dst[i] = 9.0
+    }
+    return 0
+}
+
+def test_out_region_backed(): {
+    with region scratch: {
+        o = scratch.alloc_f32(16)
+        fill_out(o)
+        assert(o[0] == 9.0)
+        assert(o[15] == 9.0)
+    }
+    return 0
+}
+
+# --- 3. nested regions with early returns ----------------------------------
+# A return from inside a nested region must release both arenas, innermost
+# first, on the way out.
+
+def nested_early(k: i64) -> i64: {
+    with region outer: {
+        a = outer.alloc_f32(8)
+        fill_f32(a, 1.0)
+        with region inner: {
+            b = inner.alloc_f32(8)
+            fill_f32(b, 2.0)
+            if k == 1: {
+                return 11
+            }
+            assert(b[7] == 2.0)
+        }
+        if k == 2: {
+            return 12
+        }
+        assert(a[7] == 1.0)
+    }
+    return 13
+}
+
+def test_nested_region_early_return(): {
+    assert(nested_early(1) == 11)
+    assert(nested_early(2) == 12)
+    assert(nested_early(3) == 13)
+    return 0
+}
+
+# --- 4. constant-shape GEMM using region allocations ------------------------
+# The specialized dense_f32 kernel must accept region-backed buffers: the
+# arena bumps page-aligned storage, so SIMD loads stay in bounds and the
+# straight-line kernel runs unchanged.
+
+def test_const_gemm_region(): {
+    with region scratch: {
+        a = scratch.alloc_f32(2)
+        w = scratch.alloc_f32(32)
+        b = scratch.alloc_f32(8)
+        out = scratch.alloc_f32(8)
+        fill_f32(a, 1.0)
+        fill_f32(w, 1.0)
+        fill_f32(b, 0.0)
+        dense_f32(a, w, b, out, @comptime(1), @comptime(8), @comptime(2))
+        assert(out[0] == 2.0)
+        assert(out[7] == 2.0)
+    }
+    return 0
+}
+
+# --- 5. aliases passed into @parallel ---------------------------------------
+# out/readonly contracts hold through @parallel blocks: dst is a write
+# target, src is read-only, and the disjointness proof is carried by the
+# types, not a runtime check.
+
+def parallel_copy(dst: out []f32, src: readonly []f32) -> i64: {
+    @parallel: {
+        for i in len(dst): {
+            dst[i] = src[i]
+        }
+    }
+    return 0
+}
+
+def test_parallel_aliases(): {
+    a = alloc_f32(4096)
+    b = alloc_f32(4096)
+    fill_f32(a, 3.5)
+    parallel_copy(b, a)
+    assert(b[0] == 3.5)
+    assert(b[4095] == 3.5)
+    free(a)
+    free(b)
+    return 0
+}
+
+# --- 6. region allocations inside functions that propagate errors -----------
+# A failing postfix `?` call inside a region must release the arena on the
+# propagate path, not just on the normal path.
+
+def maybe_fail(x: i64) -> i64: {
+    if x < 0: {
+        return 5
+    }
+    return 0
+}
+
+def region_propagate(x: i64) -> i64: {
+    with region scratch: {
+        v = scratch.alloc_f32(32)
+        fill_f32(v, 1.0)
+        st = maybe_fail(x)?
+        assert(v[31] == 1.0)
+    }
+    return 0
+}
+
+def test_region_propagate(): {
+    assert(region_propagate(-1) == 5)
+    assert(region_propagate(1) == 0)
+    return 0
+}
+
+# --- 7. @comptime dimensions mixed with runtime dimensions -------------------
+# Fully-constant shapes take the specialized kernel; any runtime dimension
+# falls back to the generic checked path. Both must agree.
+
+def test_mixed_dims(): {
+    a = alloc_f32(2)
+    w = alloc_f32(32)
+    b = alloc_f32(8)
+    out = alloc_f32(8)
+    fill_f32(a, 1.0)
+    fill_f32(w, 1.0)
+    fill_f32(b, 0.0)
+    n = 8
+    k = 2
+    dense_f32(a, w, b, out, @comptime(1), n, k)
+    assert(out[0] == 2.0)
+    assert(out[7] == 2.0)
+    m = 1
+    dense_f32(a, w, b, out, m, @comptime(8), @comptime(2))
+    assert(out[3] == 2.0)
+    free(a)
+    free(w)
+    free(b)
+    free(out)
+    return 0
+}
+
+# --- 8. alignment and arena exhaustion paths ---------------------------------
+# The lib-level arena reports exhaustion as a 0 result (assertable) instead
+# of aborting; mmap backing is page-aligned, so the first bump is SIMD-safe.
+
+def test_arena_alignment(): {
+    let state: ArenaState
+    base = arena_create(state, 1024)
+    assert(base != 0)
+    # mmap returns page-aligned storage: base is an exact multiple of 4096.
+    assert((base / 4096) * 4096 == base)
+    p = arena_alloc(state, 8)
+    assert(p != 0)
+    arena_destroy(state)
+    return 0
+}
+
+def test_arena_exhaustion_returns_zero(): {
+    let state: ArenaState
+    base = arena_create(state, 64)
+    assert(base != 0)
+    p1 = arena_alloc(state, 32)
+    p2 = arena_alloc(state, 32)
+    p3 = arena_alloc(state, 32)
+    assert(p1 != 0)
+    assert(p2 != 0)
+    assert(p3 == 0)
+    arena_destroy(state)
+    return 0
+}
+
+def test_region_tight_fit(): {
+    # A 64-byte region holds exactly 16 floats; the bump must land inside
+    # the capacity and the block form stays clean.
+    with region tiny(64): {
+        ok = tiny.alloc_f32(16)
+        fill_f32(ok, 1.0)
+        assert(ok[15] == 1.0)
+    }
+    return 0
+}
+
+# --- readonly is not sticky: rebinding an alias to fresh storage -----------
+# A local that once aliased a readonly buffer can be rebound to writable
+# owned storage and written again; only the current binding's qualifier
+# governs. (The readonly-param side is pinned by the negative tests; this
+# pins the reset direction on owned storage.)
+
+def test_owned_rebind_after_readonly_alias(): {
+    x = alloc_f32(8)
+    fill_f32(x, 1.0)
+    v = alloc_f32(8)
+    v = x
+    v = alloc_f32(8)
+    fill_f32(v, 3.0)
+    assert(v[0] == 3.0)
+    free(x)
+    free(v)
+    return 0
+}

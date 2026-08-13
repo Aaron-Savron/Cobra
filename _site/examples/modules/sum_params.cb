@@ -1,0 +1,10 @@
+# Cross-module scalar sum ABI boundary.
+def module_sum_value(value: Result[i32, f32], optional: Option[u64]) -> i64 {
+    if is_ok(value): {
+        return unwrap_ok(value)
+    }
+    if is_some(optional): {
+        return unwrap(optional)
+    }
+    return 0
+}

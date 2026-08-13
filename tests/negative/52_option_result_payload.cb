@@ -1,0 +1,5 @@
+def main(): {
+    let wrong_option: Option[i64] = some("not an integer")
+    let wrong_result: Result[i64, string] = err(7)
+    return 0
+}

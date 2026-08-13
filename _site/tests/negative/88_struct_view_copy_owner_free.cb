@@ -1,0 +1,16 @@
+struct RequestViews: {
+    body: readonly []u8,
+    trailer: readonly []u8,
+}
+
+def invalid_struct_view_copy_free(): {
+    body = alloc_u8(4)
+    trailer = alloc_u8(3)
+    let first: RequestViews
+    first.body = body
+    first.trailer = trailer
+    let second: RequestViews
+    second = first
+    free(body)
+    return 0
+}

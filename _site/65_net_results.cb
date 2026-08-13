@@ -1,0 +1,148 @@
+# Checked networking contract suite.
+# Socket pairs keep the tests local and deterministic. No external server or
+# port is required for the send, receive, EOF, and cleanup checks.
+
+def test_net_socket_pair(): {
+    handles = alloc_i64(2)
+    opened = net_socket_pair_checked(handles)
+    assert(is_ok(opened))
+
+    left = handles[0]
+    right = handles[1]
+    payload = "cobra"
+    sent = net_send_checked(left, payload)
+    assert(is_ok(sent))
+    assert(unwrap_ok(sent) == len(payload))
+
+    buffer = alloc_i64(2)
+    received = net_recv_checked(right, buffer, len(payload))
+    assert(is_ok(received))
+    assert(unwrap_ok(received) == len(payload))
+    assert(fs_bytes_equal(buffer, payload, len(payload)) == 1)
+
+    closed_left = net_close_checked(left)
+    assert(is_ok(closed_left))
+    eof = net_recv_checked(right, buffer, 8)
+    assert(is_ok(eof))
+    assert(unwrap_ok(eof) == 0)
+
+    closed_right = net_close_checked(right)
+    assert(is_ok(closed_right))
+    closed_again = net_close_checked(right)
+    assert(is_ok(closed_again) == 0)
+    assert(unwrap_err(closed_again) == 3)
+
+    free(buffer)
+    free(handles)
+    return 0
+}
+
+def test_net_invalid_arguments(): {
+    short_handles = alloc_i64(1)
+    short_pair = net_socket_pair_checked(short_handles)
+    assert(is_ok(short_pair) == 0)
+    assert(unwrap_err(short_pair) == 2)
+    free(short_handles)
+
+    invalid_bind = net_bind_checked(-1, 0)
+    assert(is_ok(invalid_bind) == 0)
+    assert(unwrap_err(invalid_bind) == 2)
+
+    invalid_port = net_connect_checked(-1, "127.0.0.1", 70000)
+    assert(is_ok(invalid_port) == 0)
+    assert(unwrap_err(invalid_port) == 2)
+
+    invalid_socket_opened = net_socket_checked()
+    assert(is_ok(invalid_socket_opened))
+    let invalid_socket: i64 = unwrap_ok(invalid_socket_opened)
+    invalid_host = net_connect_checked(invalid_socket, "not-an-ip", 1)
+    assert(is_ok(invalid_host) == 0)
+    assert(unwrap_err(invalid_host) == 2)
+    net_close_checked(invalid_socket)
+
+    invalid_receive = alloc_i64(1)
+    bad_receive = net_recv_checked(-1, invalid_receive, 1)
+    assert(is_ok(bad_receive) == 0)
+    assert(unwrap_err(bad_receive) == 2)
+    free(invalid_receive)
+    return 0
+}
+
+def test_net_listener_setup(): {
+    opened = net_socket_checked()
+    assert(is_ok(opened))
+    let server: i64 = unwrap_ok(opened)
+
+    reused = net_reuseaddr_checked(server)
+    assert(is_ok(reused))
+    bound = net_bind_checked(server, 0)
+    assert(is_ok(bound))
+
+    port_result = net_port_checked(server)
+    assert(is_ok(port_result))
+    let port: i64 = unwrap_ok(port_result)
+    assert(port > 0)
+
+    listening = net_listen_checked(server, 4)
+    assert(is_ok(listening))
+
+    client_opened = net_socket_checked()
+    assert(is_ok(client_opened))
+    let client: i64 = unwrap_ok(client_opened)
+    connected = net_connect_checked(client, "127.0.0.1", port)
+    assert(is_ok(connected))
+
+    accepted = net_accept_checked(server)
+    assert(is_ok(accepted))
+    let peer: i64 = unwrap_ok(accepted)
+
+    payload = "hello"
+    sent = net_send_checked(client, payload)
+    assert(is_ok(sent))
+    assert(unwrap_ok(sent) == len(payload))
+    buffer = alloc_i64(1)
+    received = net_recv_checked(peer, buffer, len(payload))
+    assert(is_ok(received))
+    assert(unwrap_ok(received) == len(payload))
+    assert(fs_bytes_equal(buffer, payload, len(payload)) == 1)
+
+    client_closed = net_close_checked(client)
+    peer_closed = net_close_checked(peer)
+    server_closed = net_close_checked(server)
+    assert(is_ok(client_closed))
+    assert(is_ok(peer_closed))
+    assert(is_ok(server_closed))
+    free(buffer)
+    return 0
+}
+
+def test_net_nonblocking_and_buffer_send(): {
+    handles = alloc_i64(2)
+    opened = net_socket_pair_checked(handles)
+    assert(is_ok(opened))
+
+    nonblocking = net_set_nonblocking_checked(handles[1])
+    assert(is_ok(nonblocking))
+
+    payload = alloc_i64(1)
+    payload[0] = 1234
+    sent = net_send_buffer_checked(handles[0], payload, 8)
+    assert(is_ok(sent))
+    assert(unwrap_ok(sent) == 8)
+
+    received_buffer = alloc_i64(1)
+    received = net_recv_checked(handles[1], received_buffer, 8)
+    assert(is_ok(received))
+    assert(unwrap_ok(received) == 8)
+    assert(received_buffer[0] == 1234)
+
+    first_close = net_close_checked(handles[0])
+    second_close = net_close_checked(handles[1])
+    assert(is_ok(first_close))
+    assert(is_ok(second_close))
+
+    free(received_buffer)
+    free(payload)
+    free(handles)
+    return 0
+}

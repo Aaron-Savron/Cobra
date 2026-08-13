@@ -1,0 +1,10 @@
+def take_value(value: Option[i64]) -> i64: {
+    if is_some(value): {
+        return unwrap(value)
+    }
+    return 0
+}
+
+def test_bad_direct_sum_parameter(): {
+    return take_value(some(7))
+}

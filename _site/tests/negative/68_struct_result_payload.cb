@@ -1,0 +1,7 @@
+struct NestedResult: {
+    state: Result[i64, i64],
+}
+
+def invalid_nested_sum_payload() -> Result[NestedResult, i64]: {
+    return err(1)
+}

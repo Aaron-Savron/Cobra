@@ -1,0 +1,7 @@
+struct InvalidView: {
+    body: []u8,
+}
+
+def invalid_view_parameter(view: InvalidView) -> i64: {
+    return 0
+}

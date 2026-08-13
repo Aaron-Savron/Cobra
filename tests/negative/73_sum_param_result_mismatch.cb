@@ -1,0 +1,8 @@
+def take_result(value: Result[i32, bool]) -> i64: {
+    return 0
+}
+
+def test_bad_result_parameter(): {
+    let value: Result[i64, i64] = ok(7)
+    return take_result(value)
+}

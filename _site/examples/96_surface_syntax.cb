@@ -1,0 +1,21 @@
+# The colon is optional before a brace block. Existing colon-brace code remains
+# valid, and constants are compile-time scalar bindings.
+
+def mark(slot: out []i64) -> void {
+    const marker: i64 = 42
+    slot[0] = marker
+}
+
+def test_surface_syntax() -> i64 {
+    const capacity: i64 = 4
+    values = alloc_i64(capacity)
+    for i in capacity {
+        values[i] = i
+    }
+    if values[3] == 3 {
+        mark(values)
+    }
+    assert(values[0] == 42)
+    free(values)
+    return 0
+}

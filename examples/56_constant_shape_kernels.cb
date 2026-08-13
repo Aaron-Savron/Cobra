@@ -1,0 +1,185 @@
+# Constant-shape kernels: when M, N, and K are compile-time constants and N is
+# a multiple of eight, dense_f32 lowers to a specialized kernel with immediate
+# trip bounds, no per-row vector/scalar decision, and no tail branches.
+
+def test_single_row_eight_cols(): {
+    # M=1, N=8, K=4: fully straight-line kernel, single tile, no row loop.
+    a = alloc_f32(4)
+    w = alloc_f32(32)
+    b = alloc_f32(8)
+    out = alloc_f32(8)
+    fill_f32(a, 1.0)
+    fill_f32(w, 1.0)
+    fill_f32(b, 0.5)
+    dense_f32(a, w, b, out, @comptime(1), @comptime(8), @comptime(4))
+    # out[j] = relu(sum_k a[k]*w[k,j] + b[j]) = relu(4*1 + 0.5) = 4.5
+    assert(out[0] == 4.5)
+    assert(out[7] == 4.5)
+    return 0
+}
+
+def test_batched_rows(): {
+    # M=3, N=16, K=8: two tiles per row, vector only, no scalar fallback.
+    a = alloc_f32(24)
+    w = alloc_f32(128)
+    b = alloc_f32(16)
+    out = alloc_f32(48)
+    fill_f32(a, 2.0)
+    fill_f32(w, 0.5)
+    fill_f32(b, 1.0)
+    dense_f32(a, w, b, out, @comptime(3), @comptime(16), @comptime(8))
+    # out = relu(8 * 2 * 0.5 + 1) = relu(9) = 9 for every element
+    assert(out[0] == 9.0)
+    assert(out[15] == 9.0)
+    assert(out[16] == 9.0)
+    assert(out[47] == 9.0)
+    return 0
+}
+
+def test_tiny_k_unrolled(): {
+    # M=1, N=8, K=3: the inner dot product unrolls with no loop at all.
+    a = alloc_f32(3)
+    w = alloc_f32(24)
+    b = alloc_f32(8)
+    out = alloc_f32(8)
+    fill_f32(a, 1.0)
+    fill_f32(w, 1.0)
+    fill_f32(b, 0.0)
+    dense_f32(a, w, b, out, @comptime(1), @comptime(8), @comptime(3))
+    assert(out[0] == 3.0)
+    assert(out[7] == 3.0)
+    return 0
+}
+
+def test_multi_tile_remainder_k(): {
+    # M=1, N=16, K=5: two tiles, K tail path exercised (K % 4 != 0).
+    a = alloc_f32(5)
+    w = alloc_f32(80)
+    b = alloc_f32(16)
+    out = alloc_f32(16)
+    fill_f32(a, 1.0)
+    fill_f32(w, 1.0)
+    fill_f32(b, 0.0)
+    dense_f32(a, w, b, out, @comptime(1), @comptime(16), @comptime(5))
+    assert(out[0] == 5.0)
+    assert(out[8] == 5.0)
+    assert(out[15] == 5.0)
+    return 0
+}
+
+def test_nonuniform_columns(): {
+    # Distinct per-column weights make tile-boundary addressing bugs visible.
+    # w[k][j] = k*16 + j, so out[j] = w[j] + w[16+j] = j + (16+j) = 16 + 2j.
+    a = alloc_f32(2)
+    w = alloc_f32(32)
+    b = alloc_f32(16)
+    out = alloc_f32(16)
+    fill_f32(a, 1.0)
+    fill_f32(b, 0.0)
+    for i in len(w): { w[i] = i }
+    dense_f32(a, w, b, out, @comptime(1), @comptime(16), @comptime(2))
+    assert(out[0] == 16.0)
+    assert(out[7] == 30.0)
+    assert(out[8] == 32.0)
+    assert(out[15] == 46.0)
+    return 0
+}
+
+def test_plain_literal_dims(): {
+    # Plain integer literals specialize too, not just @comptime.
+    a = alloc_f32(2)
+    w = alloc_f32(16)
+    b = alloc_f32(8)
+    out = alloc_f32(8)
+    fill_f32(a, 2.0)
+    fill_f32(w, 3.0)
+    fill_f32(b, 1.0)
+    dense_f32(a, w, b, out, 1, 8, 2)
+    # out = relu(2 * 2 * 3 + 1) = relu(13) = 13
+    assert(out[0] == 13.0)
+    assert(out[7] == 13.0)
+    return 0
+}
+
+def test_batched_single_tile(): {
+    # M=3, N=8, K=4: every row must be computed. A past emitter bug fell
+    # through to the kernel exit after row 0, leaving rows 1 and 2 untouched.
+    a = alloc_f32(12)
+    w = alloc_f32(32)
+    b = alloc_f32(8)
+    out = alloc_f32(24)
+    fill_f32(a, 2.0)
+    fill_f32(w, 1.5)
+    fill_f32(b, 1.0)
+    dense_f32(a, w, b, out, @comptime(3), @comptime(8), @comptime(4))
+    # out[i][j] = relu(sum_k a[i][k]*w[k][j] + b[j]) = relu(2*4*1.5 + 1) = 13
+    assert(out[0] == 13.0)
+    assert(out[7] == 13.0)
+    assert(out[8] == 13.0)
+    assert(out[15] == 13.0)
+    assert(out[16] == 13.0)
+    assert(out[23] == 13.0)
+    return 0
+}
+
+def test_batched_multi_tile_small_k(): {
+    # M=3, N=16, K=4: unrolled multi-tile path, all rows and both tiles.
+    a = alloc_f32(12)
+    w = alloc_f32(64)
+    b = alloc_f32(16)
+    out = alloc_f32(48)
+    fill_f32(a, 2.0)
+    fill_f32(w, 1.5)
+    fill_f32(b, 1.0)
+    dense_f32(a, w, b, out, @comptime(3), @comptime(16), @comptime(4))
+    assert(out[0] == 13.0)
+    assert(out[15] == 13.0)
+    assert(out[16] == 13.0)
+    assert(out[31] == 13.0)
+    assert(out[32] == 13.0)
+    assert(out[47] == 13.0)
+    return 0
+}
+
+def test_single_row_many_tiles_small_k(): {
+    # M=1, N=128, K=4: the tile counter lives in a register and every tile
+    # runs a straight-line unrolled dot product.
+    a = alloc_f32(4)
+    w = alloc_f32(512)
+    b = alloc_f32(128)
+    out = alloc_f32(128)
+    fill_f32(a, 2.0)
+    fill_f32(w, 1.5)
+    fill_f32(b, 1.0)
+    dense_f32(a, w, b, out, @comptime(1), @comptime(128), @comptime(4))
+    assert(out[0] == 13.0)
+    assert(out[64] == 13.0)
+    assert(out[127] == 13.0)
+    return 0
+}
+
+def test_matmul_unrolled_no_bias(): {
+    # matmul_f32 through the unrolled const kernel: the add_bias=false branch
+    # (no bias load, no ReLU) is distinct from dense and needs its own test.
+    a = alloc_f32(8)
+    w = alloc_f32(32)
+    out = alloc_f32(8)
+    fill_f32(a, 1.0)
+    fill_f32(w, 2.0)
+    matmul_f32(a, w, out, @comptime(1), @comptime(8), @comptime(4))
+    # out[j] = sum_k a[k]*w[k,j] = 4 * 2 = 8
+    assert(out[0] == 8.0)
+    assert(out[7] == 8.0)
+    # batched: M=2, N=8, K=8 exercises the general-M single-tile unrolled path
+    a2 = alloc_f32(16)
+    w2 = alloc_f32(64)
+    out2 = alloc_f32(16)
+    fill_f32(a2, 1.5)
+    fill_f32(w2, 2.0)
+    matmul_f32(a2, w2, out2, @comptime(2), @comptime(8), @comptime(8))
+    # out[i][j] = 8 * 1.5 * 2 = 24
+    assert(out2[0] == 24.0)
+    assert(out2[8] == 24.0)
+    assert(out2[15] == 24.0)
+    return 0
+}

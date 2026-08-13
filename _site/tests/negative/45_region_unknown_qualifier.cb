@@ -1,0 +1,6 @@
+# Allocating from an undeclared qualifier is rejected: ghost is neither a
+# region nor a source module alias.
+def broken(): {
+    x = ghost.alloc_f32(16)
+    return 0
+}

@@ -1,0 +1,24 @@
+# Compute-bound @parallel kernel. The body is pure arithmetic with no libm
+# calls, so it passes the index-purity proof and dispatches through the
+# persistent worker pool. Memory traffic is small relative to ALU work, so
+# scaling should track core count.
+
+def par_poly(values: []f32): {
+    @parallel: {
+        for i in len(values): {
+            values[i] = values[i] * values[i] * values[i] * values[i] * values[i] + 4.0 * values[i] * values[i] * values[i] + 2.0 * values[i] + 0.1
+        }
+    }
+    return 0
+}
+
+def main(): {
+    n = 8388608
+    a = alloc_f32(n)
+    fill_f32(a, 0.5)
+    for r in range(30): {
+        par_poly(a)
+    }
+    print(sum_f32(a))
+    return 0
+}

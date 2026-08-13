@@ -1,0 +1,40 @@
+# Shape annotations feel like familiar Python type hints, but Cobra checks
+# rank and known dimensions before emitting the same pointer+count ABI.
+
+def project(
+    x: tensor[batch, hidden]f32,
+    w: tensor[hidden, classes]f32,
+    out: tensor[batch, classes]f32,
+    batch: i64,
+    classes: i64,
+    hidden: i64
+): {
+    matmul_f32(x, w, out, batch, classes, hidden)
+    return 0
+}
+
+def test_shape_safe_projection(): {
+    let x: tensor[2, 3]f32 = alloc_f32(6)
+    let w: tensor[3, 2]f32 = alloc_f32(6)
+    let out: tensor[2, 2]f32 = alloc_f32(4)
+    fill_f32(x, 1.0)
+    fill_f32(w, 2.0)
+    fill_f32(out, 0.0)
+
+    # x is [2,3], w is [3,2], out is [2,2].
+    project(x, w, out, 2, 2, 3)
+    assert(out[0] == 6.0)
+    assert(out[1] == 6.0)
+    assert(out[2] == 6.0)
+    assert(out[3] == 6.0)
+
+    free(x)
+    free(w)
+    free(out)
+    return 0
+}
+
+def main(): {
+    test_shape_safe_projection()
+    return 0
+}

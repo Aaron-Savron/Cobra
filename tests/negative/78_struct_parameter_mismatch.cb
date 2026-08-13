@@ -1,0 +1,17 @@
+struct Point: {
+    x: i64,
+}
+
+struct Other: {
+    x: i64,
+}
+
+def take_point(point: Point) -> i64: {
+    return point.x
+}
+
+def wrong_parameter_type(): {
+    let other: Other
+    other.x = 9
+    return take_point(other)
+}

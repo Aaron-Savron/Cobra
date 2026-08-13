@@ -1,0 +1,13 @@
+# Fixed arrays can borrow as readonly slices.
+# The view keeps the array pointer and length. No allocation or copy occurs.
+
+def readonly_sum(values: readonly []f32) -> f32 {
+    return sum_f32(values)
+}
+
+def test_array_to_readonly_slice(): {
+    let values = [1.0, 2.0]
+    assert(readonly_sum(values) == 3.0)
+    assert(sum_f32(values) == 3.0)
+    return 0
+}

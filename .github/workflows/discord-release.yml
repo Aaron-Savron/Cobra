@@ -1,0 +1,39 @@
+name: Announce Cobra updates in Discord
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  announce:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post commit embed to Discord
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_RELEASE_CHANNEL_ID: ${{ secrets.DISCORD_RELEASE_CHANNEL_ID }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message || 'Manual run' }}
+          COMMIT_AUTHOR: ${{ github.event.head_commit.author.name }}
+          COMMIT_URL: https://github.com/${{ github.repository }}/commit/${{ github.sha }}
+          COMPARE_URL: https://github.com/${{ github.repository }}/compare/${{ github.event.before }}...${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          test -n "$DISCORD_BOT_TOKEN"
+          test -n "$DISCORD_RELEASE_CHANNEL_ID"
+          payload=$(jq -n \
+            --arg message "$COMMIT_MESSAGE" \
+            --arg author "$COMMIT_AUTHOR" \
+            --arg commit_url "$COMMIT_URL" \
+            --arg compare_url "$COMPARE_URL" \
+            --arg branch "$BRANCH" \
+            '{embeds:[{title:"Cobra repository update",description:$message,url:$commit_url,color:13116490,fields:[{name:"Author",value:$author,inline:true},{name:"Branch",value:$branch,inline:true},{name:"Changes",value:("[View commit](" + $commit_url + ") | [Compare changes](" + $compare_url + ")"),inline:false}],footer:{text:"Cobra repository"}}]}')
+          curl --fail-with-body -sS \
+            -X POST \
+            -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data "$payload" \
+            "https://discord.com/api/v10/channels/$DISCORD_RELEASE_CHANNEL_ID/messages"

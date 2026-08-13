@@ -1,0 +1,99 @@
+# Typed postfix propagation keeps the successful payload and returns the
+# original Option or Result value on the failure path.
+
+enum Mode: {
+    Fast,
+    Safe
+}
+
+def read_value(value: i64) -> Result[i64, i64]: {
+    if value >= 0: {
+        return ok(value)
+    }
+    return err(7)
+}
+
+def maybe_value(value: i64) -> Option[i64]: {
+    if value > 0: {
+        return some(value)
+    }
+    return none
+}
+
+def float_value(value: i64) -> Result[f32, i64]: {
+    if value > 0: {
+        return ok(2.5)
+    }
+    return err(11)
+}
+
+def float_chain(value: i64) -> Result[f32, i64]: {
+    with region scratch: {
+        work = scratch.alloc_f32(4)
+        fill_f32(work, 1.0)
+        return float_value(value)?
+    }
+}
+
+def process(mode: Mode, value: i64) -> Result[i64, i64]: {
+    match mode: {
+        case Mode.Fast: {
+            return read_value(value)?
+        }
+        else: {
+            with region scratch: {
+                work = scratch.alloc_f32(8)
+                fill_f32(work, 1.0)
+                checked = read_value(value)?
+                assert(work[7] == 1.0)
+                return ok(checked + 1)
+            }
+        }
+    }
+}
+
+def option_chain(value: i64) -> Option[i64]: {
+    first = maybe_value(value)?
+    second = maybe_value(first)?
+    return some(second + 1)
+}
+
+def loop_chain(limit: i64) -> Result[i64, i64]: {
+    total = 0
+    for i in limit: {
+        step = read_value(i)?
+        total = total + step
+    }
+    return ok(total)
+}
+
+def test_typed_propagation(): {
+    fast_ok = process(Mode.Fast, 4)
+    fast_err = process(Mode.Fast, -1)
+    safe_ok = process(Mode.Safe, 4)
+    safe_err = process(Mode.Safe, -1)
+    option_ok = option_chain(4)
+    option_none = option_chain(0)
+    float_ok = float_chain(1)
+    float_err = float_chain(-1)
+    loop_ok = loop_chain(4)
+
+    assert(is_ok(fast_ok))
+    assert(unwrap_ok(fast_ok) == 4)
+    assert(is_ok(fast_err) == 0)
+    assert(unwrap_err(fast_err) == 7)
+    assert(is_ok(safe_ok))
+    assert(unwrap_ok(safe_ok) == 5)
+    assert(is_ok(safe_err) == 0)
+    assert(unwrap_err(safe_err) == 7)
+    assert(is_some(option_ok))
+    assert(unwrap(option_ok) == 5)
+    assert(is_some(option_none) == 0)
+    assert(is_ok(float_ok))
+    assert(unwrap_ok(float_ok) == 2.5)
+    assert(is_ok(float_err) == 0)
+    assert(unwrap_err(float_err) == 11)
+    assert(is_ok(loop_ok))
+    assert(unwrap_ok(loop_ok) == 6)
+    return 0
+}

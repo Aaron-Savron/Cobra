@@ -1,0 +1,45 @@
+# Negative ownership contracts for automatic everyday values.
+# The CLI harness runs these cases individually and expects rejection.
+
+def borrowed_free(values: list[i64]): {
+    free(values)
+    return 0
+}
+
+def use_after_free(): {
+    let values: list[i64] = [1]
+    free(values)
+    return len(values)
+}
+
+def unsafe_alias(): {
+    let first: list[i64] = [1]
+    let second: list[i64] = [2]
+    second = first
+    return 0
+}
+
+def identity_text(value: string) -> string: {
+    return value
+}
+
+def discarded_string(): {
+    concat("discarded", " value")
+    return 0
+}
+
+def live_string_alias(): {
+    let source: string = "source" + " value"
+    let forwarded: string = identity_text(source)
+    string_free(source)
+    return 0
+}
+
+def escaped_string_alias(value: string) -> string: {
+    let forwarded: string = identity_text(value)
+    return forwarded
+}
+
+def main(): {
+    return 0
+}

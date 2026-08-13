@@ -1,0 +1,7 @@
+private def hidden_value() -> i64: {
+    return 40
+}
+
+pub def public_value() -> i64: {
+    return hidden_value() + 2
+}

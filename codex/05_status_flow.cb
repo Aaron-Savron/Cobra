@@ -1,0 +1,26 @@
+def maybe_fail(value: i64) -> i64: {
+    if value < 0: {
+        return 9
+    }
+    return 0
+}
+
+def run_with_scratch(value: i64) -> i64: {
+    with region scratch: {
+        values = scratch.alloc_f32(32)
+        fill_f32(values, 1.0)
+        status = maybe_fail(value)?
+        assert(values[31] == 1.0)
+    }
+    return 0
+}
+
+def test_status_and_cleanup(): {
+    assert(run_with_scratch(-1) == 9)
+    assert(run_with_scratch(1) == 0)
+}
+
+def main(): {
+    test_status_and_cleanup()
+    print("status flow ok")
+}

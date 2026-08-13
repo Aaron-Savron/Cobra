@@ -1,0 +1,29 @@
+# Cobra correctness regression suite
+
+def test_operator_precedence(): {
+    assert(2 + 3 * 4 == 14)
+    assert(10 - 4 / 2 == 8)
+    return 0
+}
+
+def test_control_flow(): {
+    counter = 0
+    total = 0
+    while counter < 4: {
+        counter = counter + 1
+        total = total + counter
+    }
+    assert(total == 10)
+    return 0
+}
+
+def test_array_iteration(): {
+    values = [10, 20, 30]
+    total = 0
+    for value in values: {
+        total = total + value
+    }
+    assert(total == 60)
+    assert(len(values) == 3)
+    return 0
+}

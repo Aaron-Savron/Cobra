@@ -1,0 +1,12 @@
+# Example 2: Cobra Inline Assembly + Pythonic Syntax!
+
+def main() -> i64 {
+    asm: {
+        mov rax, 100
+        add rax, 337
+        mov rsp, rbp
+        pop rbp
+        ret
+    }
+    return 0
+}

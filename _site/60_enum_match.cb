@@ -1,0 +1,50 @@
+enum Phase: {
+    Idle,
+    Running,
+    Failed = 7,
+}
+
+def phase_score(phase: Phase) -> i64: {
+    match phase: {
+        case Phase.Idle: {
+            return 0
+        }
+        case Phase.Running: {
+            return 1
+        }
+        case Phase.Failed: {
+            return 2
+        }
+    }
+    return -1
+}
+
+def default_phase() -> Phase: {
+    return Phase.Idle
+}
+
+def fallback_score(phase: Phase) -> i64: {
+    match phase: {
+        case Phase.Idle: {
+            return 10
+        }
+        else: {
+            return 20
+        }
+    }
+    return -1
+}
+
+def test_enum_match(): {
+    let idle: Phase = Phase.Idle
+    let running: Phase = Phase.Running
+    let failed: Phase = Phase.Failed
+    let returned: Phase = default_phase()
+    assert(phase_score(returned) == 0)
+    assert(phase_score(idle) == 0)
+    assert(phase_score(running) == 1)
+    assert(phase_score(failed) == 2)
+    assert(fallback_score(idle) == 10)
+    assert(fallback_score(failed) == 20)
+    return 0
+}

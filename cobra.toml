@@ -1,0 +1,7 @@
+[package]
+name = "cobra"
+version = "1.0.0"
+
+[dependencies]
+stdlib = "lib"
+modules = "examples/modules"

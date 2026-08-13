@@ -1,0 +1,25 @@
+# Typed array-view regression
+# []i64 is a zero-residency pointer + length pair in the native ABI.
+
+def scale_values(values: []i64): {
+    @compute: {
+        for value in values: {
+            value = value * 2
+        }
+    }
+    return 0
+}
+
+def slice_length(values: []i64, marker: i64) -> i64: {
+    return len(values) + marker
+}
+
+def test_typed_slice_helper(): {
+    values = [1, 2, 3, 4, 5, 6]
+    scale_values(values)
+    assert(values[0] == 2)
+    assert(values[3] == 8)
+    assert(values[5] == 12)
+    assert(slice_length(values, 1) == 7)
+    return 0
+}

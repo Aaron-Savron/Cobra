@@ -1,0 +1,8 @@
+# Source-module Result boundary used by examples/62_sum_interactions.cb.
+
+def module_read(value: i64) -> Result[i64, i64]: {
+    if value >= 0: {
+        return ok(value + 10)
+    }
+    return err(23)
+}

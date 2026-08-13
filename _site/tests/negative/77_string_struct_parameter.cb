@@ -1,0 +1,7 @@
+struct Label: {
+    text: string,
+}
+
+def take_label(label: Label) -> i64: {
+    return 0
+}

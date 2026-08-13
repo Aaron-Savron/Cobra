@@ -1,0 +1,41 @@
+# Cobra Marvel Edition Example (lib/std.cb & v2.0 Architecture)
+
+import c "libc.so.6" (abs)
+
+def marvel_abs(x: i64) -> i64: {
+    if x < 0: {
+        return 0 - x
+    }
+    return x
+}
+
+def marvel_max(a: i64, b: i64) -> i64: {
+    if a > b: {
+        return a
+    }
+    return b
+}
+
+def marvel_scale(numbers: v256) -> void: {
+    @compute: {
+        for i in numbers: {
+            i = i * 2
+        }
+    }
+}
+
+def main(): {
+    print("=== Cobra Marvel Edition (v2.0 Architecture) ===")
+    
+    val1 = marvel_abs(0 - 500)
+    val1?
+    
+    val2 = marvel_max(1250, 4200)
+    val2?
+    
+    data = [10, 20, 30, 40]
+    marvel_scale(data)
+    
+    print("Marvel Edition hybrid typing and AVX2 vector primitives complete!")
+    return val2
+}

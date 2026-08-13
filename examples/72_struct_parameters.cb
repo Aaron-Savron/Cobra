@@ -1,0 +1,43 @@
+# Scalar structs use semantic by-value parameters.
+# The callee receives a private copy, so mutation cannot change the caller.
+
+import "modules/struct_params.cb"
+
+struct Point: {
+    x: i64,
+    y: i64,
+}
+
+def point_score(point: Point) -> i64: {
+    return point.x * 10 + point.y
+}
+
+def point_mutate(point: Point) -> i64: {
+    point.x = 99
+    point.y = 101
+    return point.x + point.y
+}
+
+def test_struct_parameters(): {
+    let point: Point
+    point.x = 3
+    point.y = 4
+
+    assert(point_score(point) == 34)
+    assert(point_mutate(point) == 200)
+    assert(point.x == 3)
+    assert(point.y == 4)
+    return 0
+}
+
+def test_struct_parameters_across_module(): {
+    let point: ModulePoint
+    point.x = 8
+    point.y = 5
+
+    assert(module_point_score(point) == 85)
+    assert(module_point_mutate(point) == 77)
+    assert(point.x == 8)
+    assert(point.y == 5)
+    return 0
+}

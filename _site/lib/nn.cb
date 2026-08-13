@@ -1,0 +1,238 @@
+# Cobra Neural Network Reference Library (lib/nn.cb)
+# ====================================================
+# Model math composed from base-language primitives. Every function here is
+# ordinary Cobra code running on the native AVX2 builtins (matmul_f32,
+# dense_f32, reductions) and auto-vectorized user loops - there is no
+# runtime tensor library, no interpreter, no VM. The model math you write
+# compiles straight to native SIMD, and the operations below are the ones
+# you compose your own models from.
+#
+# Conventions:
+#   - All math is f32; buffers are caller-owned []f32 (alloc_f32 / free).
+#   - Workspaces (attention probabilities, im2col columns) are caller
+#     provided so hot loops never allocate.
+#   - Shapes and counts are integer (i64) arguments.
+#   - GEMM-heavy paths (attention, convolution) dispatch to the native
+#     AVX2 matmul_f32 kernel; only data movement (transpose, im2col,
+#     embedding gather) is user-loop code.
+
+# --- Activations -----------------------------------------------------------
+
+# In-place softmax over one row (max-subtraction for stability). The exp pass
+# is scalar (libm); the normalize pass is index-pure and auto-vectorizes.
+def softmax_f32(row: []f32) -> void: {
+    m = max_f32(row)
+    for i in len(row): {
+        row[i] = exp_f32(row[i] - m)
+    }
+    s = sum_f32(row)
+    for i in len(row): {
+        row[i] = row[i] / s
+    }
+}
+
+# Row-wise softmax of a seq x seq matrix stored row-major in p (the attention
+# probability matrix). Each row subtracts its own max for stability.
+def softmax_rows_f32(p: []f32, seq: i64) -> void: {
+    for r in seq: {
+        base = r * seq
+        m = p[base]
+        for j in seq: {
+            if p[base + j] > m: {
+                m = p[base + j]
+            }
+        }
+        s = 0.0
+        for j in seq: {
+            p[base + j] = exp_f32(p[base + j] - m)
+            s = s + p[base + j]
+        }
+        for j in seq: {
+            p[base + j] = p[base + j] / s
+        }
+    }
+}
+
+# In-place logistic sigmoid: 1 / (1 + exp(-x)).
+def sigmoid_buf(x: []f32) -> void: {
+    for i in len(x): {
+        x[i] = 1.0 / (1.0 + exp_f32(0.0 - x[i]))
+    }
+}
+
+# In-place GELU using the tanh approximation (same form as PyTorch's gelu).
+def gelu_buf(x: []f32) -> void: {
+    for i in len(x): {
+        x[i] = 0.5 * x[i] * (1.0 + tanh_f32(0.7978845608 * (x[i] + 0.044715 * x[i] * x[i] * x[i])))
+    }
+}
+
+# Fused dense layer + ReLU activation: out = ReLU(input * w + b).
+def dense_relu_f32(input: []f32, w: []f32, b: []f32, out: []f32, m: i64, n: i64, k: i64) -> void: {
+    dense_f32(input, w, b, out, m, n, k)
+    relu_f32(out)
+}
+
+# --- Normalization ---------------------------------------------------------
+
+# Layer normalization over a whole buffer: mean-centers and scales to unit
+# variance. The variance pass is a scalar reduction; the normalize pass is an
+# index-pure loop and auto-vectorizes to AVX2.
+def layernorm_f32(x: []f32) -> void: {
+    m = mean_f32(x)
+    v = 0.0
+    for i in len(x): {
+        d = x[i] - m
+        v = v + d * d
+    }
+    v = v / len(x)
+    s = 1.0 / sqrt_f32(v + 0.00001)
+    for i in len(x): {
+        x[i] = (x[i] - m) * s
+    }
+}
+
+# --- Attention -------------------------------------------------------------
+
+# Row-major transpose: b[j*m + i] = a[i*n + j]. Memory-bound data movement;
+# this is the one op attention wants natively, authored here in user code.
+def transpose_f32(a: []f32, b: []f32, m: i64, n: i64) -> void: {
+    for i in m: {
+        for j in n: {
+            b[j * m + i] = a[i * n + j]
+        }
+    }
+}
+
+# Scale a seq x seq score matrix by the attention temperature 1/sqrt(d).
+# Index-pure loop: lowers to vmulps with a broadcast scalar.
+def scale_attention_f32(p: []f32, d: i64) -> void: {
+    # `1.0 * d` coerces the integer dimension to f32 for the libm intrinsic.
+    s = 1.0 / sqrt_f32(1.0 * d)
+    for i in len(p): {
+        p[i] = p[i] * s
+    }
+}
+
+# Scaled dot-product attention: out = softmax(Q K^T / sqrt(d)) V.
+#   q, k, v : seq x d row-major
+#   p       : seq x seq workspace (scores, then attention probabilities)
+#   kt      : seq x d workspace (transposed K)
+#   out     : seq x d result
+# Both GEMMs are native AVX2; only the transpose is a user loop.
+def attention_forward(q: []f32, k: []f32, v: []f32, p: []f32, out: []f32, kt: []f32, seq: i64, d: i64) -> void: {
+    transpose_f32(k, kt, seq, d)
+    matmul_f32(q, kt, p, seq, seq, d)
+    scale_attention_f32(p, d)
+    softmax_rows_f32(p, seq)
+    matmul_f32(p, v, out, seq, d, seq)
+}
+
+# Minimal transformer encoder block: self-attention (shared q=k=v), layer
+# norm, then an MLP with ReLU - the shape of a transformer layer.
+#   x        : seq x d input (also the q, k, v source)
+#   p, kt    : attention workspaces (seq x seq, seq x d)
+#   a        : seq x d post-attention / post-norm buffer
+#   w1, b1   : first MLP layer  (d x ff, ff)
+#   h        : seq x ff MLP hidden buffer
+#   w2, b2   : second MLP layer (ff x d, d)
+#   out      : seq x d result
+def self_attn_block_f32(x: []f32, p: []f32, kt: []f32, a: []f32,
+                        w1: []f32, b1: []f32, h: []f32,
+                        w2: []f32, b2: []f32, out: []f32,
+                        seq: i64, d: i64, ff: i64) -> void: {
+    attention_forward(x, x, x, p, a, kt, seq, d)
+    layernorm_f32(a)
+    dense_f32(a, w1, b1, h, seq, ff, d)
+    relu_f32(h)
+    dense_f32(h, w2, b2, out, seq, d, ff)
+}
+
+# --- Embedding -------------------------------------------------------------
+
+# Token embedding gather: out[i*dim + k] = table[ids[i]*dim + k]. The ids
+# buffer is a writable []i64 (token ids, integer indices).
+def embed_f32(table: []f32, ids: []i64, out: []f32, dim: i64, count: i64) -> void: {
+    for i in count: {
+        for k in dim: {
+            out[i * dim + k] = table[ids[i] * dim + k]
+        }
+    }
+}
+
+# --- Convolution -----------------------------------------------------------
+
+# im2col: expand a c-channel image into the column matrix a GEMM consumes.
+#   col[(oh*out_w + ow)*kk + cc*k*k + kh*k + kw] =
+#       input[(oh*stride + kh)*in_w + (ow*stride + kw)]
+# with kk = c*k*k and out_h/out_w derived from the input and stride, so
+# convolution becomes one native AVX2 matmul instead of specialized kernels.
+def im2col_f32(input: []f32, col: []f32, in_h: i64, in_w: i64, c: i64, k: i64, stride: i64) -> void: {
+    out_h = (in_h - k) / stride + 1
+    out_w = (in_w - k) / stride + 1
+    kk = c * k * k
+    for oh in out_h: {
+        for ow in out_w: {
+            for cc in c: {
+                for kh in k: {
+                    for kw in k: {
+                        col[(oh * out_w + ow) * kk + cc * k * k + kh * k + kw] = input[(oh * stride + kh) * in_w + (ow * stride + kw)]
+                    }
+                }
+            }
+        }
+    }
+}
+
+# 2D convolution as GEMM: out = im2col(input) * w + b.
+#   input : in_h x in_w x c   (row-major, c innermost)
+#   w     : (c*k*k) x out_c   (the filter bank)
+#   b     : out_c
+#   col   : (out_h*out_w) x (c*k*k) workspace
+#   out   : out_h x out_w x out_c
+def conv2d_f32(input: []f32, w: []f32, b: []f32, col: []f32, out: []f32,
+               in_h: i64, in_w: i64, c: i64, k: i64, out_c: i64, stride: i64) -> void: {
+    out_h = (in_h - k) / stride + 1
+    out_w = (in_w - k) / stride + 1
+    out_hw = out_h * out_w
+    kk = c * k * k
+    im2col_f32(input, col, in_h, in_w, c, k, stride)
+    matmul_f32(col, w, out, out_hw, out_c, kk)
+    for r in out_hw: {
+        for cc in out_c: {
+            out[r * out_c + cc] = out[r * out_c + cc] + b[cc]
+        }
+    }
+}
+
+# Max pooling: out[oh*out_w + ow] = max over each pool x pool window.
+def maxpool_f32(input: []f32, out: []f32, in_h: i64, in_w: i64, pool: i64) -> void: {
+    out_h = in_h / pool
+    out_w = in_w / pool
+    for oh in out_h: {
+        for ow in out_w: {
+            m = input[oh * pool * in_w + ow * pool]
+            for ph in pool: {
+                for pw in pool: {
+                    v = input[(oh * pool + ph) * in_w + (ow * pool + pw)]
+                    if v > m: {
+                        m = v
+                    }
+                }
+            }
+            out[oh * out_w + ow] = m
+        }
+    }
+}
+
+# --- Loss ------------------------------------------------------------------
+
+# Mean squared error over the first n elements: out[0] = mean((a-b)^2).
+def mse_loss_f32(a: []f32, b: []f32, out: []f32, n: i64) -> void: {
+    s = 0.0
+    for i in n: {
+        d = a[i] - b[i]
+        s = s + d * d
+    }
+    out[0] = s / n
+}

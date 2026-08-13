@@ -1,0 +1,6 @@
+import "../../examples/modules/math.cb" as math
+import "../../examples/modules/shared.cb" as math
+
+def test_duplicate_alias() -> i64: {
+    return 0
+}

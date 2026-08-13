@@ -1,0 +1,177 @@
+# Filesystem Result contract suite.
+# File descriptors are scalar i64 handles. EOF is ok(0), while system and
+# argument failures are typed errors.
+
+def region_file_probe(path: string) -> Result[i64, i64]: {
+    with region scratch: {
+        temp = scratch.alloc_f32(2)
+        return fs_read_file_f32_checked(path, temp, 8)?
+    }
+}
+
+def transform_file(input_path: string, output_path: string) -> Result[i64, i64]: {
+    input = alloc_i64(4)
+    received = fs_read_file_checked(input_path, input, 32)
+    if is_ok(received) == 0: {
+        let error_code: i64 = unwrap_err(received)
+        free(input)
+        return err(error_code)
+    }
+    let count: i64 = unwrap_ok(received)
+    if count != 32: {
+        free(input)
+        return err(2)
+    }
+    for i in 4: {
+        input[i] = input[i] * 2
+    }
+    written = fs_write_file_bytes_checked(output_path, input, count)
+    free(input)
+    if is_ok(written) == 0: {
+        let error_code: i64 = unwrap_err(written)
+        return err(error_code)
+    }
+    let output_count: i64 = unwrap_ok(written)
+    return ok(output_count)
+}
+
+def test_fs_paths_and_eof(): {
+    missing = "/tmp/cobra_fs_missing_parent/file"
+    empty_path = "/tmp/cobra_fs_empty.bin"
+    inaccessible = "/proc/cobra_fs_denied"
+
+    fs_remove(empty_path)
+    missing_open = fs_open_read(missing)
+    assert(is_ok(missing_open) == 0)
+    assert(unwrap_err(missing_open) == 1)
+
+    denied_open = fs_open_write(inaccessible)
+    assert(is_ok(denied_open) == 0)
+    assert(unwrap_err(denied_open) == 1)
+
+    empty_write = fs_write_file_checked(empty_path, "")
+    assert(is_ok(empty_write))
+    assert(unwrap_ok(empty_write) == 0)
+
+    empty_buf = alloc_i64(1)
+    empty_read = fs_read_file_checked(empty_path, empty_buf, 8)
+    assert(is_ok(empty_read))
+    assert(unwrap_ok(empty_read) == 0)
+    free(empty_buf)
+    assert(fs_size(empty_path) == 0)
+    assert(fs_remove(empty_path) == 0)
+    return 0
+}
+
+def test_fs_partial_binary_and_double_close(): {
+    path = "/tmp/cobra_fs_binary.bin"
+    large_path = "/tmp/cobra_fs_large.bin"
+    source = alloc_i64(4)
+    source[0] = 16961
+    source[1] = 0
+    source[2] = 7
+    source[3] = 255
+
+    written = fs_write_file_bytes_checked(path, source, 32)
+    assert(is_ok(written))
+    assert(unwrap_ok(written) == 32)
+
+    opened = fs_open_read(path)
+    assert(is_ok(opened))
+    let fd: i64 = unwrap_ok(opened)
+    chunk = alloc_i64(1)
+    expected = alloc_i64(1)
+    expected[0] = source[0]
+
+    first = fs_read_fd(fd, chunk, 8)
+    assert(is_ok(first))
+    assert(unwrap_ok(first) == 8)
+    assert(fs_buffers_equal(chunk, expected, 8) == 1)
+
+    second = fs_read_fd(fd, chunk, 8)
+    third = fs_read_fd(fd, chunk, 8)
+    fourth = fs_read_fd(fd, chunk, 8)
+    assert(is_ok(second))
+    assert(is_ok(third))
+    assert(is_ok(fourth))
+    assert(unwrap_ok(second) == 8)
+    assert(unwrap_ok(third) == 8)
+    assert(unwrap_ok(fourth) == 8)
+
+    eof = fs_read_fd(fd, chunk, 8)
+    assert(is_ok(eof))
+    assert(unwrap_ok(eof) == 0)
+    closed = fs_close(fd)
+    assert(is_ok(closed))
+    closed_again = fs_close(fd)
+    assert(is_ok(closed_again) == 0)
+    assert(unwrap_err(closed_again) == 1)
+
+    free(expected)
+    free(chunk)
+    free(source)
+    assert(fs_remove(path) == 0)
+
+    # A larger raw file exercises the caller-provided buffer capacity path.
+    large_source = alloc_i64(128)
+    for i in 128: {
+        large_source[i] = i
+    }
+    large_written = fs_write_file_bytes_checked(large_path, large_source, 1024)
+    assert(is_ok(large_written))
+    assert(unwrap_ok(large_written) == 1024)
+    large_read = alloc_i64(128)
+    large_received = fs_read_file_checked(large_path, large_read, 1024)
+    assert(is_ok(large_received))
+    assert(unwrap_ok(large_received) == 1024)
+    assert(fs_buffers_equal(large_source, large_read, 1024) == 1)
+    free(large_read)
+    free(large_source)
+    assert(fs_remove(large_path) == 0)
+    return 0
+}
+
+def test_fs_region_cleanup(): {
+    path = "/tmp/cobra_fs_region.bin"
+    written = fs_write_file_checked(path, "12345678")
+    assert(is_ok(written))
+    result = region_file_probe(path)
+    assert(is_ok(result))
+    assert(unwrap_ok(result) == 8)
+    assert(fs_remove(path) == 0)
+    return 0
+}
+
+def test_fs_checked_transform(): {
+    input_path = "/tmp/cobra_fs_transform_input.bin"
+    output_path = "/tmp/cobra_fs_transform_output.bin"
+    source = alloc_i64(4)
+    source[0] = 2
+    source[1] = 0
+    source[2] = 4
+    source[3] = 6
+    expected = alloc_i64(4)
+    expected[0] = 4
+    expected[1] = 0
+    expected[2] = 8
+    expected[3] = 12
+
+    created = fs_write_file_bytes_checked(input_path, source, 32)
+    assert(is_ok(created))
+    transformed = transform_file(input_path, output_path)
+    assert(is_ok(transformed))
+    assert(unwrap_ok(transformed) == 32)
+
+    output = alloc_i64(4)
+    received = fs_read_file_checked(output_path, output, 32)
+    assert(is_ok(received))
+    assert(unwrap_ok(received) == 32)
+    assert(fs_buffers_equal(output, expected, 32) == 1)
+
+    free(output)
+    free(expected)
+    free(source)
+    assert(fs_remove(input_path) == 0)
+    assert(fs_remove(output_path) == 0)
+    return 0
+}

@@ -1,0 +1,5 @@
+# Nested sums remain outside the scalar payload contract.
+
+def nested() -> Result[Option[i64], i64]: {
+    return err(1)
+}

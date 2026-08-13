@@ -1,0 +1,11 @@
+def take_float(value: Option[f32]) -> i64: {
+    if is_some(value): {
+        return 1
+    }
+    return 0
+}
+
+def test_bad_sum_parameter(): {
+    let value: Option[i64] = some(7)
+    return take_float(value)
+}

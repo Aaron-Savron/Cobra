@@ -1,0 +1,8 @@
+# Intentionally invalid: two loop targets require enumerate(collection).
+def main(): {
+    values = [1, 2, 3]
+    for index, value in values: {
+        print(index)
+    }
+    return 0
+}

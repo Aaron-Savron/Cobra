@@ -1,0 +1,13 @@
+# A typed postfix propagation call must match the caller's sum contract.
+
+def maybe_value(value: i64) -> Option[i64]: {
+    if value > 0: {
+        return some(value)
+    }
+    return none
+}
+
+def bad_result(value: i64) -> Result[i64, i64]: {
+    received = maybe_value(value)?
+    return ok(received)
+}

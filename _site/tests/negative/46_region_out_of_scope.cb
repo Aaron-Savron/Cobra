@@ -1,0 +1,9 @@
+# A region only exists inside its own block: using the qualifier after the
+# block ends is rejected.
+def broken(): {
+    with region scratch: {
+        a = scratch.alloc_f32(8)
+    }
+    b = scratch.alloc_f32(8)
+    return 0
+}

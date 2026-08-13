@@ -1,0 +1,9 @@
+# By-value recursion has no finite native layout and must be rejected.
+
+struct Node: {
+    next: Node,
+}
+
+def invalid_recursive_layout(node: Node) -> i64: {
+    return 0
+}

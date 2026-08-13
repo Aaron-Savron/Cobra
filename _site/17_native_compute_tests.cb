@@ -1,0 +1,23 @@
+# Native backend regression tests
+
+def test_native_assertions(): {
+    left = 14
+    right = 28
+    assert(left + right == 42)
+    assert(left <= right)
+    assert(right >= left)
+    return 0
+}
+
+def test_compute_doubles_array(): {
+    values = [1, 2, 3, 4, 5, 6]
+    @compute: {
+        for value in values: {
+            value = value * 2
+        }
+    }
+    assert(values[0] == 2)
+    assert(values[3] == 8)
+    assert(values[5] == 12)
+    return 0
+}

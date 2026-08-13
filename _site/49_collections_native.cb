@@ -1,0 +1,35 @@
+# Native collections: membership, comprehensions, dict inspection.
+
+def main(): {
+    let metrics: dict[string]i64 = {"loss": 7, "step": 2, "epoch": 3}
+    assert("loss" in metrics)
+    assert(("missing" in metrics) == 0)
+    assert(("missing" not in metrics) == 1)
+    assert(len(metrics) == 3)
+
+    delete(metrics, "step")
+    assert(("step" in metrics) == 0)
+    let removed: i64 = pop(metrics, "epoch", 0)
+    assert(removed == 3)
+    assert(pop(metrics, "absent", 42) == 42)
+    assert(len(metrics) == 1)
+
+    let values: list[i64] = [1, 2, 3, 4]
+    assert(2 in values)
+    assert((9 in values) == 0)
+    assert((9 not in values) == 1)
+    assert(len(values) == 4)
+
+    let doubled: list[i64] = [value * 2 for value in values]
+    assert(doubled[0] == 2)
+    assert(doubled[3] == 8)
+    assert(len(doubled) == 4)
+
+    let evens: list[i64] = [value for value in values if value > 2]
+    assert(evens[0] == 3)
+    assert(evens[1] == 4)
+    assert(len(evens) == 2)
+
+    print("native collections passed")
+    return 0
+}

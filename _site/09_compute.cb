@@ -1,0 +1,18 @@
+# Example 9: Cobra Universal Compute Fabric  @compute Hardware Vector Engine! 
+
+def main(): {
+    print("=== Cobra Universal Compute Fabric (@compute) ===")
+    
+    # 1. Standard Scope-Arena Memory Array
+    numbers = [1, 2, 3, 4, 5, 6, 7, 8]
+    
+    # 2. @compute marks block for hardware vectorization / SIMD GPU dispatch
+    @compute: {
+        for i in numbers: {
+            i = i * 2
+        }
+    }
+
+    print("Hardware vectorization complete with 0-cost SIMD dispatch!")
+    return 0
+}

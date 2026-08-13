@@ -1,0 +1,39 @@
+# User-authored f32 kernels: no dense_f32 builtin required.
+# Index-range loops preserve the tensor index, so values[i] is checked f32 access.
+
+def scale_and_shift(values: []f32): {
+    for i in len(values): {
+        values[i] = values[i] * 2.0 + 1.0
+    }
+    return 0
+}
+
+def relu_in_place(values: []f32): {
+    for i in len(values): {
+        if values[i] < 0.0: {
+            values[i] = 0.0
+        }
+    }
+    return 0
+}
+
+def test_user_authored_f32_kernels(): {
+    values = alloc_f32(4)
+    values[0] = -2.0
+    values[1] = 1.0
+    values[2] = 3.0
+    values[3] = 4.0
+
+    scale_and_shift(values)
+    # [-3, 3, 7, 9]
+    relu_in_place(values)
+    # [0, 3, 7, 9]
+    assert(sum_f32(values) == 19)
+
+    free(values)
+    return 0
+}
+
+def main(): {
+    return test_user_authored_f32_kernels()
+}

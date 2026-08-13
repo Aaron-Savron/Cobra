@@ -1,0 +1,17 @@
+# Portable backend contract: the same Cobra loop runs through the scalar path.
+
+def test_portable_scalar(): {
+    values = alloc_f32(9)
+    for i in len(values): {
+        values[i] = 1.0
+    }
+    @compute: {
+        for i in len(values): {
+            values[i] = values[i] * 2.0 + 1.0
+        }
+    }
+    assert(values[0] == 3.0)
+    assert(values[8] == 3.0)
+    free(values)
+    return 0
+}

@@ -1,0 +1,9 @@
+# Intentionally invalid: postfix ? requires an integer status-returning call.
+def float_result() -> f32: {
+    return 1.0
+}
+
+def bad_propagation() -> i64: {
+    float_result()?
+    return 0
+}

@@ -1,0 +1,120 @@
+name: Cobra Systems Language CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+
+    - name: Build Cobra Compiler Binary
+      run: |
+        make clean
+        make
+
+    - name: Strict Compile Check
+      run: |
+        gcc -Wall -Wextra -Werror -Iinclude -fsyntax-only src/main.c src/lexer.c src/parser.c src/ast.c src/interpreter.c src/codegen.c src/ir.c src/type.c
+
+    - name: Run Canonical Type Regression
+      run: |
+        make type-tests
+
+    - name: Run Full Native Test Suite
+      run: |
+        set -e
+        pass=0; fail=0
+        for f in examples/*.cb; do
+          if grep -qE '^def test_' "$f"; then
+            if ./cobra test "$f" >/tmp/cobra-suite.log 2>&1; then
+              pass=$((pass+1))
+            else
+              fail=$((fail+1))
+              echo "FAIL $f"
+              tail -8 /tmp/cobra-suite.log
+            fi
+          fi
+        done
+        echo "native suites passed: $pass, failed: $fail"
+        test "$fail" -eq 0
+
+    - name: Run Negative Diagnostics
+      run: |
+        set -e
+        for f in tests/negative/*.cb; do
+          if ./cobra check "$f" >/dev/null 2>&1; then
+            echo "negative test unexpectedly passed: $f"
+            exit 1
+          fi
+        done
+        echo "all negative diagnostics rejected"
+
+    - name: Check Typed Sum Lowering
+      run: |
+        bash tests/check_sum_lowering.sh
+
+    - name: Check Portable Scalar Backend
+      run: |
+        ./cobra test examples/91_portable_scalar.cb --cpu=portable
+        ./cobra emit-asm examples/91_portable_scalar.cb -o /tmp/cobra_portable.s --cpu=portable
+        ! grep -Eiq '^[[:space:]]+v[a-z0-9]+' /tmp/cobra_portable.s
+        if ./cobra emit-asm examples/93_portable_nn_rejected.cb -o /tmp/cobra_portable_nn.s --cpu=portable >/dev/null 2>&1; then
+          echo "portable mode unexpectedly accepted a reachable AVX-backed NN wrapper"
+          exit 1
+        fi
+        ./cobra emit-asm examples/92_module_visibility.cb -o /tmp/cobra_visibility.s
+        grep -Eq '^    \.local hidden_value$' /tmp/cobra_visibility.s
+        ! grep -Eq '^    \.global hidden_value$' /tmp/cobra_visibility.s
+
+    - name: Run Systems Lane Demo
+      run: |
+        ./cobra build examples/51_systems_lane.cb -o /tmp/cobra_sys51
+        /tmp/cobra_sys51
+
+    - name: Run Parallel Pool Guard Probe
+      run: |
+        gcc -Wall -Wextra -Werror -O2 -pthread -o /tmp/cobra_guard tests/parallel_guard.c runtime/cobra_parallel.c
+        /tmp/cobra_guard
+        COBRA_WORKERS=4 /tmp/cobra_guard
+        COBRA_WORKERS=1 /tmp/cobra_guard
+
+    - name: Verify Project Workflow Commands
+      run: |
+        ./tools/test_cli_workflow.sh
+
+    - name: Verify Multi-Target Assembly Emission
+      run: |
+        ./cobra emit-asm examples/01_hello.cb -o hello_win.s --target=win64
+        ./cobra emit-asm examples/01_hello.cb -o hello_arm.s --target=arm64
+        ./cobra emit-asm examples/01_hello.cb -o hello_wasm.wat --target=wasm32
+
+    - name: Check Native Assembly Contracts
+      run: |
+        bash benchmarks/check_contracts.sh
+
+    - name: Capture Native Performance Baseline
+      run: |
+        python3 benchmarks/performance_baseline.py --runs 3 --warmup 1 --output /tmp/cobra-performance-baseline.json
+
+    - name: Upload Performance Baseline
+      uses: actions/upload-artifact@v3
+      with:
+        name: cobra-native-performance-baseline
+        path: /tmp/cobra-performance-baseline.json
+
+    - name: Create Release Archive
+      run: |
+        make dist
+
+    - name: Upload Release Artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: cobra-v1.0.0-linux-x86_64
+        path: cobra-v1.0.0-linux-x86_64.tar.gz

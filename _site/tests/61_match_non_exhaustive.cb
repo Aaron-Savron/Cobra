@@ -1,0 +1,13 @@
+enum Mode: {
+    Cold,
+    Hot,
+}
+
+def test_non_exhaustive(value: Mode) -> i64: {
+    match value: {
+        case Mode.Cold: {
+            return 0
+        }
+    }
+    return 1
+}

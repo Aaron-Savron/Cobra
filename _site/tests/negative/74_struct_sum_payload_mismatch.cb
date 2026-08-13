@@ -1,0 +1,13 @@
+struct Point: { x: i64 }
+struct Other: { x: i64 }
+
+def make_point() -> Result[Point, i64]: {
+    let point: Point
+    point.x = 1
+    return ok(point)
+}
+
+def invalid_struct_sum_payload(): {
+    let wrong: Result[Other, i64] = make_point()
+    return 0
+}

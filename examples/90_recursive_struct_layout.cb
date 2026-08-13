@@ -1,0 +1,37 @@
+# Recursive layout milestone: nested by-value structs use one shared ABI layout.
+
+struct Point: {
+    x: i64,
+    y: i64,
+}
+
+struct Box: {
+    top: Point,
+    bottom: Point,
+    tag: i64,
+}
+
+def box_score(box: Box) -> i64: {
+    return box.top.x * 10 + box.bottom.y + box.tag
+}
+
+def mutate_box(box: Box) -> i64: {
+    box.top.x = 70
+    box.bottom.y = 5
+    return box.top.x + box.bottom.y
+}
+
+def test_recursive_struct_layout(): {
+    let box: Box
+    box.top.x = 3
+    box.top.y = 4
+    box.bottom.x = 8
+    box.bottom.y = 9
+    box.tag = 2
+
+    assert(box_score(box) == 41)
+    assert(mutate_box(box) == 75)
+    assert(box.top.x == 3)
+    assert(box.bottom.y == 9)
+    return 0
+}

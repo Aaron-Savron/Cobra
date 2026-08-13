@@ -1,0 +1,7 @@
+import "modules/math.cb" as math
+
+def test_module_alias() -> i64: {
+    answer = math.module_add(19, 23)
+    assert(answer == 42)
+    return 0
+}

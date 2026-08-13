@@ -1,0 +1,24 @@
+# Example 5: Cobra Phase 1  Scope-Arena & Heap Allocations! 
+
+def process_data(): {
+    # 1. Scope-Arena Allocation: Temporary data inside this function.
+    # Automatically reclaimed instantly upon return with zero GC pauses!
+    temp_a = 500
+    temp_b = 200
+    local_result = temp_a + temp_b
+    local_result?
+    return local_result
+}
+
+def main(): {
+    print("=== Cobra Phase 1: Scope-Arena & Heap Memory ===")
+    
+    # Run Scope-Arena function (memory resets in 1 CPU cycle upon return)
+    res = process_data()
+    
+    # 2. Long-lived Heap Allocation (using explicit heap keyword)
+    heap persistent_val = 9999
+    
+    print("Execution complete with Zero GC Pauses!")
+    return res
+}

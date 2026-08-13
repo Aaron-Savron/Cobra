@@ -1,0 +1,7 @@
+struct Envelope: {
+    status: Option[i64],
+}
+
+def main(): {
+    return 0
+}

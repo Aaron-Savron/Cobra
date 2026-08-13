@@ -1,0 +1,13 @@
+struct ModulePoint: {
+    x: i64,
+    y: i64,
+}
+
+def module_point_score(point: ModulePoint) -> i64: {
+    return point.x * 10 + point.y
+}
+
+def module_point_mutate(point: ModulePoint) -> i64: {
+    point.y = 77
+    return point.y
+}

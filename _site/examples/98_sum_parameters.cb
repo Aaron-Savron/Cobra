@@ -1,0 +1,50 @@
+# Scalar Option and Result parameters use the native sum ABI.
+# Parameters are borrowed views of caller-owned frame storage. No heap object
+# or runtime type dispatch is introduced.
+
+def maybe_value(value: i64) -> Option[i64]: {
+    if value >= 0: {
+        return some(value)
+    }
+    return none
+}
+
+def checked_value(value: i64) -> Result[i64, i64]: {
+    if value >= 0: {
+        return ok(value * 2)
+    }
+    return err(7)
+}
+
+def consume_option(value: Option[i64], fallback: i64) -> i64: {
+    if is_some(value): {
+        return unwrap(value)
+    }
+    return fallback
+}
+
+def consume_result(value: Result[i64, i64], fallback: i64) -> i64: {
+    if is_ok(value): {
+        return unwrap_ok(value)
+    }
+    return fallback + unwrap_err(value)
+}
+
+# The sum pointer also works after all six SysV integer registers are used.
+def consume_after_six(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, value: Option[i64]) -> i64 {
+    return a + b + c + d + e + f + consume_option(value, 0)
+}
+
+def test_scalar_sum_parameters(): {
+    let present: Option[i64] = maybe_value(21)
+    let absent: Option[i64] = maybe_value(-1)
+    let success: Result[i64, i64] = checked_value(21)
+    let failure: Result[i64, i64] = checked_value(-1)
+
+    assert(consume_option(present, 99) == 21)
+    assert(consume_option(absent, 99) == 99)
+    assert(consume_result(success, 99) == 42)
+    assert(consume_result(failure, 99) == 106)
+    assert(consume_after_six(1, 2, 3, 4, 5, 6, present) == 42)
+    return 0
+}

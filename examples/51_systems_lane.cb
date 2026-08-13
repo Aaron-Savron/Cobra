@@ -1,0 +1,93 @@
+# Example 51: Systems Lane  File I/O and Time (lib/fs.cb + lib/time.cb)
+# Every function used below is userland Cobra on the libc ABI bridge. There
+# are no imports in this file and no runtime: checked file descriptors, reads,
+# writes, time results, and their cleanup compile straight to native libc calls.
+
+def main(): {
+    path = "/tmp/cobra_systems_demo.txt"
+    content = "Cobra systems lane: file round trip\nline two\n"
+
+    # Write the file and confirm it exists with the exact size.
+    written = fs_write_file_checked(path, content)
+    assert(is_ok(written))
+    let written_count: i64 = unwrap_ok(written)
+    assert(written_count == len(content))
+    assert(fs_exists(path) == 1)
+    size = fs_size(path)
+    assert(size == len(content))
+
+    # Read it back into a zeroed buffer and compare byte for byte.
+    # alloc_i64(64) provides 512 bytes of storage; we read up to 64 bytes.
+    buf = alloc_i64(64)
+    received = fs_read_file_checked(path, buf, 64)
+    assert(is_ok(received))
+    let n: i64 = unwrap_ok(received)
+    assert(n == size)
+    assert(fs_bytes_equal(buf, content, n) == 1)
+
+    # Append a line and confirm the file grew by exactly that many bytes.
+    extra = "appended line\n"
+    fs_append(path, extra)
+    assert(fs_size(path) == size + len(extra))
+
+    # Rename, confirm the new path is live and the old one is gone.
+    renamed = path + ".renamed"
+    assert(fs_rename(path, renamed) == 0)
+    assert(fs_exists(renamed) == 1)
+    assert(fs_exists(path) == 0)
+
+    # Wall clock: checked calls expose libc failures as typed results.
+    wall_start = time_now_checked()
+    wall_end = time_now_checked()
+    assert(is_ok(wall_start))
+    assert(is_ok(wall_end))
+    assert(unwrap_ok(wall_end) >= unwrap_ok(wall_start))
+
+    # Microsecond precision: a small busy loop costs measurable time.
+    precise_start = time_precise_us_checked()
+    assert(is_ok(precise_start))
+    let checked_start: i64 = unwrap_ok(precise_start)
+
+    # An invalid timestamp is a typed failure, not a sentinel used as data.
+    let invalid_start: i64 = 0 - 1
+    invalid_elapsed = time_elapsed_us_checked(invalid_start)
+    assert(is_ok(invalid_elapsed) == 0)
+    assert(unwrap_err(invalid_elapsed) == 2)
+
+    # The infallible helper remains available for low-level hot paths.
+    let raw_start: i64 = time_precise_us()
+    assert(raw_start >= 0)
+
+    # The checked helper uses the same native Result ABI as propagated calls.
+    elapsed_checked = time_elapsed_us_checked(checked_start)
+    assert(is_ok(elapsed_checked))
+    assert(unwrap_ok(elapsed_checked) >= 0)
+
+    # The legacy integer helper still measures the same kind of delta.
+    elapsed_raw = time_elapsed_us(raw_start)
+    assert(elapsed_raw >= 0)
+
+    # Continue the busy loop after the clock probes.
+    let busy_start: i64 = time_precise_us()
+
+    busy = 0
+    for i in 1000000: {
+        busy = busy + 1
+    }
+    elapsed = time_elapsed_us(busy_start)
+    assert(elapsed >= 0)
+    assert(busy == 1000000)
+
+    # CPU ticks expose both the legacy integer helper and checked Result form.
+    assert(time_clock_ticks() > 0)
+    ticks = time_clock_ticks_checked()
+    assert(is_ok(ticks))
+    assert(unwrap_ok(ticks) > 0)
+
+    # Clean up the renamed file.
+    assert(fs_remove(renamed) == 0)
+    assert(fs_exists(renamed) == 0)
+
+    print("systems lane passed: file round trip, append, rename, time")
+    return 0
+}

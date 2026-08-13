@@ -1,0 +1,34 @@
+# Runtime-shaped GEMM workload for the generic output-blocked path.
+# The dimensions stay in locals, so the compiler cannot use the constant-shape
+# kernel. N=24 exercises one sixteen-column block followed by an eight-column tile.
+
+def main(): {
+    input = alloc_f32(12)
+    weights = alloc_f32(144)
+    bias = alloc_f32(24)
+    matmul_output = alloc_f32(48)
+    dense_output = alloc_f32(48)
+    m = len(input) / 6
+    n = len(bias)
+    k = len(input) / m
+    fill_f32(input, 1.0)
+    fill_f32(weights, 0.5)
+    fill_f32(bias, 1.0)
+
+    iterations = 2000000
+    while iterations > 0: {
+        matmul_f32(input, weights, matmul_output, m, n, k)
+        dense_f32(input, weights, bias, dense_output, m, n, k)
+        iterations = iterations - 1
+    }
+
+    # Matmul outputs are 6 * 0.5 = 3; dense outputs are 4 after bias and ReLU.
+    assert(sum_f32(matmul_output) == 144)
+    assert(sum_f32(dense_output) == 192)
+    free(input)
+    free(weights)
+    free(bias)
+    free(matmul_output)
+    free(dense_output)
+    return 0
+}

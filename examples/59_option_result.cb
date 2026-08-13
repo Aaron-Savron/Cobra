@@ -1,0 +1,44 @@
+# Native scalar Option and Result values.
+# Values stay in the native frame and do not allocate heap objects.
+
+def maybe_value(value: i64) -> Option[i64]: {
+    if value > 0: {
+        return some(value)
+    }
+    return none
+}
+
+def checked_value(value: i64) -> Result[i64, i64]: {
+    if value >= 0: {
+        return ok(value * 2)
+    }
+    return err(7)
+}
+
+def test_option_result(): {
+    let direct_some: Option[i64] = some(5)
+    let direct_none: Option[i64] = none
+    let direct_ok: Result[i64, i64] = ok(9)
+    let direct_err: Result[i64, i64] = err(4)
+    assert(is_some(direct_some))
+    assert(unwrap(direct_some) == 5)
+    assert(is_some(direct_none) == 0)
+    assert(is_ok(direct_ok))
+    assert(unwrap_ok(direct_ok) == 9)
+    assert(is_ok(direct_err) == 0)
+    assert(unwrap_err(direct_err) == 4)
+
+    let present: Option[i64] = maybe_value(21)
+    let absent: Option[i64] = maybe_value(0)
+    assert(is_some(present))
+    assert(unwrap(present) == 21)
+    assert(is_some(absent) == 0)
+
+    let success: Result[i64, i64] = checked_value(21)
+    let failure: Result[i64, i64] = checked_value(-1)
+    assert(is_ok(success))
+    assert(unwrap_ok(success) == 42)
+    assert(is_ok(failure) == 0)
+    assert(unwrap_err(failure) == 7)
+    return 0
+}

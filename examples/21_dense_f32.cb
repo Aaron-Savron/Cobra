@@ -1,0 +1,130 @@
+# Fused native dense layer: ReLU(input * weights + bias)
+# Layouts are row-major: input[M,K], weights[K,N], bias[N], output[M,N].
+
+def test_dense_vector_tile(): {
+    input = alloc_f32(2)
+    weights = alloc_f32(16)
+    bias = alloc_f32(8)
+    output = alloc_f32(8)
+
+    fill_f32(input, 2.0)
+    fill_f32(weights, 3.0)
+    fill_f32(bias, 1.0)
+    dense_f32(input, weights, bias, output, 1, 8, 2)
+
+    # Every output is (2 * 3) + (2 * 3) + 1 = 13; eight outputs total 104.
+    assert(sum_f32(output) == 104)
+
+    free(input)
+    free(weights)
+    free(bias)
+    free(output)
+    return 0
+}
+
+def test_dense_scalar_tail(): {
+    input = alloc_f32(2)
+    weights = alloc_f32(6)
+    bias = alloc_f32(3)
+    output = alloc_f32(3)
+
+    fill_f32(input, 2.0)
+    fill_f32(weights, 3.0)
+    fill_f32(bias, 1.0)
+    dense_f32(input, weights, bias, output, 1, 3, 2)
+
+    # N=3 exercises the scalar tail: three outputs total 39.
+    assert(sum_f32(output) == 39)
+
+    free(input)
+    free(weights)
+    free(bias)
+    free(output)
+    return 0
+}
+
+def test_dense_multiple_rows(): {
+    input = alloc_f32(4)
+    weights = alloc_f32(8)
+    bias = alloc_f32(4)
+    output = alloc_f32(8)
+
+    fill_f32(input, 2.0)
+    fill_f32(weights, 3.0)
+    fill_f32(bias, 1.0)
+    dense_f32(input, weights, bias, output, 2, 4, 2)
+
+    # Two rows × four columns, each output is 13: total 104.
+    assert(sum_f32(output) == 104)
+
+    free(input)
+    free(weights)
+    free(bias)
+    free(output)
+    return 0
+}
+
+def test_dense_fused_relu_negative(): {
+    input = alloc_f32(2)
+    weights = alloc_f32(16)
+    bias = alloc_f32(8)
+    output = alloc_f32(8)
+
+    fill_f32(input, 1.0)
+    fill_f32(weights, -2.0)
+    fill_f32(bias, -1.0)
+    # The pre-activation is -5; fused dense must clamp every lane to zero.
+    dense_f32(input, weights, bias, output, 1, 8, 2)
+    assert(sum_f32(output) == 0)
+
+    free(input)
+    free(weights)
+    free(bias)
+    free(output)
+    return 0
+}
+
+def test_dynamic_output_block(): {
+    # Runtime N=24 takes one sixteen-column block, then the existing eight-column path.
+    m = 2
+    n = 24
+    k = 3
+    input = alloc_f32(6)
+    weights = alloc_f32(72)
+    bias = alloc_f32(24)
+    output = alloc_f32(48)
+    fill_f32(input, 1.0)
+    fill_f32(weights, 2.0)
+    fill_f32(bias, 1.0)
+    dense_f32(input, weights, bias, output, m, n, k)
+    # Every output is 3 * 2 + 1 = 7, across two rows and 24 columns.
+    assert(sum_f32(output) == 336)
+    free(input)
+    free(weights)
+    free(bias)
+    free(output)
+    return 0
+}
+
+def test_dynamic_matmul_block(): {
+    # The biasless path uses the same blocked lowering with runtime dimensions.
+    m = 2
+    n = 16
+    k = 3
+    input = alloc_f32(6)
+    weights = alloc_f32(48)
+    output = alloc_f32(32)
+    fill_f32(input, 1.0)
+    fill_f32(weights, 2.0)
+    matmul_f32(input, weights, output, m, n, k)
+    assert(sum_f32(output) == 192)
+    free(input)
+    free(weights)
+    free(output)
+    return 0
+}
+
+def main(): {
+    test_dense_vector_tile()
+    return test_dense_fused_relu_negative()
+}

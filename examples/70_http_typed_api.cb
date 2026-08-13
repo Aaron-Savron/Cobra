@@ -1,0 +1,220 @@
+# Typed single-request HTTP API.
+# Request metadata stays caller-owned until Cobra supports struct payloads in
+# Result. Every field is an offset or length into the original []u8 request.
+
+def parse_request_checked(buf: []u8, size: i64, meta: []i64, name: []i64, value: []i64) -> Result[i64, i64]: {
+    parsed = http_request_parse(buf, size, meta, name, value)?
+    return ok(parsed)
+}
+
+def test_http_typed_request(): {
+    handles = alloc_i64(2)
+    pair = net_socket_pair_checked(handles)
+    assert(is_ok(pair))
+
+    with region request_region: {
+        request = request_region.alloc_u8(256)
+        request_size = http_copy_text(request, 0, "GET /health HTTP/1.1\r\nHost: cobra\r\nContent-Length: 5\r\n\r\nhello")
+        request_meta = alloc_i64(12)
+        name_meta = alloc_i64(2)
+        value_meta = alloc_i64(2)
+        parsed = parse_request_checked(request, request_size, request_meta, name_meta, value_meta)
+        assert(is_ok(parsed))
+        assert(http_request_method_is(request, request_meta, "GET") == 1)
+        assert(http_route_matches(request, request_meta, "/health") == 1)
+        assert(http_request_should_close(request_meta) == 1)
+        expected_body = http_request_body_expected(request_meta)
+        assert(is_ok(expected_body))
+        assert(unwrap_ok(expected_body) == 5)
+
+        host = http_request_header(request, request_size, request_meta, "Host", name_meta, value_meta)
+        assert(is_ok(host))
+        assert(unwrap_ok(host) == 1)
+        assert(http_span_equals(request, value_meta, "cobra") == 1)
+
+        body_meta = alloc_i64(2)
+        body_range = http_request_body_meta(request_meta, body_meta)
+        assert(is_ok(body_range))
+        let body: []u8 = slice_u8(request, body_meta[0], body_meta[1])
+        assert(len(body) == 5)
+        assert(body[0] == 104)
+        free(body)
+        free(body_meta)
+    }
+
+    with region response_region: {
+        response_headers = response_region.alloc_u8(64)
+        header_bytes = http_copy_text(response_headers, 0, "Connection: close\r\n")
+        let header_view: []u8 = slice_u8(response_headers, 0, header_bytes)
+        response_body = response_region.alloc_u8(5)
+        http_copy_text(response_body, 0, "alive")
+        response = response_region.alloc_u8(128)
+        progress = alloc_i64(1)
+        sent = http_response_send(handles[0], http_status_ok(), header_view, response_body, response, progress)
+        assert(is_ok(sent))
+        let sent_size: i64 = unwrap_ok(sent)
+        received = alloc_u8(128)
+        wire = net_recv_bytes_checked(handles[1], received, sent_size)
+        assert(is_ok(wire))
+        assert(unwrap_ok(wire) == sent_size)
+        assert(received[0] == 72)
+        free(received)
+        free(progress)
+        free(header_view)
+    }
+
+    net_close_checked(handles[0])
+    net_close_checked(handles[1])
+    free(value_meta)
+    free(name_meta)
+    free(request_meta)
+    free(handles)
+    return 0
+}
+
+def test_http_typed_partial_send(): {
+    handles = alloc_i64(2)
+    pair = net_socket_pair_checked(handles)
+    assert(is_ok(pair))
+    nonblocking = net_set_nonblocking_checked(handles[0])
+    assert(is_ok(nonblocking))
+    payload = alloc_u8(4194304)
+    progress = alloc_i64(1)
+    sent = http_write_response(handles[0], payload, len(payload), progress)
+    assert(is_ok(sent) == 0)
+    assert(progress[0] > 0)
+    net_close_checked(handles[0])
+    net_close_checked(handles[1])
+    free(progress)
+    free(payload)
+    free(handles)
+    return 0
+}
+
+def test_http_typed_failures(): {
+    with region request_region: {
+        request = request_region.alloc_u8(256)
+        bad_size = http_copy_text(request, 0, "GET  /health HTTP/1.1\r\n\r\n")
+        meta = alloc_i64(12)
+        name = alloc_i64(2)
+        value = alloc_i64(2)
+        bad = parse_request_checked(request, bad_size, meta, name, value)
+        assert(is_ok(bad) == 0)
+        assert(unwrap_err(bad) == 10)
+
+        oversized_size = http_copy_text(request, 0, "GET /health HTTP/1.1\r\nContent-Length: 16777217\r\n\r\n")
+        oversized = parse_request_checked(request, oversized_size, meta, name, value)
+        assert(is_ok(oversized) == 0)
+        assert(unwrap_err(oversized) == 11)
+
+        partial_size = http_copy_text(request, 0, "POST /upload HTTP/1.1\r\nContent-Length: 5\r\n\r\nhe")
+        partial = parse_request_checked(request, partial_size, meta, name, value)
+        assert(is_ok(partial))
+        partial_body = alloc_i64(2)
+        partial_range = http_request_body_meta(meta, partial_body)
+        assert(is_ok(partial_range))
+        assert(partial_body[1] == 2)
+        expected = http_request_body_expected(meta)
+        assert(is_ok(expected))
+        assert(unwrap_ok(expected) == 5)
+
+        invalid_response = alloc_u8(1)
+        invalid_progress = alloc_i64(1)
+        invalid_write = http_write_response(-1, invalid_response, 1, invalid_progress)
+        assert(is_ok(invalid_write) == 0)
+        assert(unwrap_err(invalid_write) == 2)
+        assert(invalid_progress[0] == 0)
+        free(invalid_progress)
+        free(invalid_response)
+        free(partial_body)
+        free(value)
+        free(name)
+        free(meta)
+    }
+    return 0
+}
+
+def serve_typed_once(server: i64) -> i64 {
+    accepted = net_accept_checked(server)
+    if is_ok(accepted) == 0: {
+        return -1
+    }
+    let client: i64 = unwrap_ok(accepted)
+    with region request_region: {
+        request = request_region.alloc_u8(4096)
+        received = net_recv_bytes_checked(client, request, 4096)
+        if is_ok(received) == 0: {
+            net_close_checked(client)
+            return -1
+        }
+        let request_size: i64 = unwrap_ok(received)
+        request_meta = alloc_i64(12)
+        name_meta = alloc_i64(2)
+        value_meta = alloc_i64(2)
+        parsed = parse_request_checked(request, request_size, request_meta, name_meta, value_meta)
+        if is_ok(parsed) == 0: {
+            net_close_checked(client)
+            free(value_meta)
+            free(name_meta)
+            free(request_meta)
+            return -1
+        }
+        route_ok = http_request_method_is(request, request_meta, "GET")
+        if route_ok == 1: {
+            route_ok = http_route_matches(request, request_meta, "/health")
+        }
+        status = http_status_not_found()
+        message = "not found"
+        if route_ok == 1: {
+            status = http_status_ok()
+            message = "Hello from Cobra\n"
+        }
+        response_headers = request_region.alloc_u8(64)
+        header_bytes = http_copy_text(response_headers, 0, "Connection: close\r\n")
+        let header_view: []u8 = slice_u8(response_headers, 0, header_bytes)
+        response_body = request_region.alloc_u8(len(message))
+        http_copy_text(response_body, 0, message)
+        response = request_region.alloc_u8(256)
+        progress = alloc_i64(1)
+        written = http_response_send(client, status, header_view, response_body, response, progress)
+        net_close_checked(client)
+        free(progress)
+        free(header_view)
+        free(value_meta)
+        free(name_meta)
+        free(request_meta)
+        if is_ok(written) == 0: {
+            return -1
+        }
+    }
+    return 0
+}
+
+def main(): {
+    opened = net_socket_checked()
+    if is_ok(opened) == 0: {
+        return 1
+    }
+    let server: i64 = unwrap_ok(opened)
+    net_reuseaddr_checked(server)
+    bound = net_bind_checked(server, 18082)
+    if is_ok(bound) == 0: {
+        net_close_checked(server)
+        return 1
+    }
+    listening = net_listen_checked(server, 8)
+    if is_ok(listening) == 0: {
+        net_close_checked(server)
+        return 1
+    }
+    print("typed HTTP server on 18082")
+    served = 0
+    while served < 3: {
+        if serve_typed_once(server) == 0: {
+            served = served + 1
+        }
+    }
+    net_close_checked(server)
+    print("served 3 typed requests")
+    return 0
+}

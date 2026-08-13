@@ -1,0 +1,5 @@
+import "modules/cycle_a.cb"
+
+def test_cycle_is_rejected() -> i64: {
+    return 0
+}

@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#050505">
+<meta name="description" content="The comfort of Python. The bare metal of x86_64. Cobra emits direct native code for Linux x86_64.">
+<meta property="og:title" content="Cobra, Python comfort at native speed">
+<meta property="og:description" content="The comfort of Python. The bare metal of x86_64. Direct native code, explicit memory, and SIMD kernels.">
+<title>Cobra / native systems programming</title>
+<link rel="icon" href="cobra_logo.jpg" type="image/jpeg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --black: #050505;
+  --panel: #0a0a0a;
+  --panel-2: #0f0f0f;
+  --line: #202020;
+  --line-bright: #343434;
+  --text: #f0eee7;
+  --muted: #9a9891;
+  --dim: #5e5d58;
+  --gold: #d4a94f;
+  --gold-soft: #f0cf7a;
+  --green: #91d6a1;
+  --mono: "DM Mono", monospace;
+  --sans: "Manrope", system-ui, sans-serif;
+  --max: 1120px;
+}
+
+* { box-sizing: border-box; }
+html { background: var(--black); scroll-behavior: smooth; }
+body {
+  margin: 0;
+  min-width: 320px;
+  background: var(--black);
+  color: var(--text);
+  font: 14px/1.6 var(--sans);
+}
+a { color: inherit; text-decoration: none; }
+button { color: inherit; font: inherit; }
+.shell { width: min(var(--max), calc(100% - 40px)); margin: 0 auto; }
+
+.topbar {
+  border-bottom: 1px solid var(--line);
+  background: rgba(5, 5, 5, .96);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+.topbar-inner {
+  align-items: center;
+  display: flex;
+  height: 58px;
+  justify-content: space-between;
+}
+.brand { align-items: center; display: flex; gap: 10px; }
+.brand-mark { height: 24px; object-fit: cover; width: 24px; }
+.brand-name { font: 500 .74rem var(--mono); letter-spacing: .16em; text-transform: uppercase; }
+.brand-version { color: var(--dim); font: .58rem var(--mono); margin-left: 3px; }
+.nav { align-items: center; display: flex; gap: 22px; }
+.nav a { color: var(--muted); font: .64rem var(--mono); }
+.nav a:hover { color: var(--gold-soft); }
+.nav .nav-cta { border: 1px solid var(--line-bright); color: var(--text); padding: 6px 10px; }
+.nav .nav-cta:hover { border-color: var(--gold); }
+
+.intro {
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  gap: 48px;
+  grid-template-columns: minmax(0, .82fr) minmax(420px, 1.18fr);
+  padding: 74px 0 66px;
+}
+.intro-copy { align-self: center; max-width: 430px; }
+.eyebrow { color: var(--gold); font: .62rem var(--mono); letter-spacing: .13em; text-transform: uppercase; }
+h1 { font-size: clamp(2rem, 4vw, 3.25rem); font-weight: 500; letter-spacing: -.06em; line-height: 1.05; margin: 18px 0 16px; }
+.lede { color: var(--muted); font-size: .94rem; max-width: 360px; }
+.intro-actions { align-items: center; display: flex; flex-wrap: wrap; gap: 10px; margin-top: 28px; }
+.button { border: 1px solid var(--line-bright); font: .64rem var(--mono); padding: 9px 13px; }
+.button:hover { border-color: var(--gold); color: var(--gold-soft); }
+.button.primary { background: var(--gold); border-color: var(--gold); color: #100e08; }
+.button.primary:hover { background: var(--gold-soft); }
+
+.code-window { background: var(--panel); border: 1px solid var(--line-bright); min-width: 0; }
+.window-bar { align-items: center; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; padding: 10px 13px; }
+.window-file, .window-status { font: .58rem var(--mono); }
+.window-file { color: var(--muted); }
+.window-status { color: var(--green); }
+.window-status::before { content: ""; background: var(--green); border-radius: 50%; display: inline-block; height: 5px; margin: 0 6px 1px 0; width: 5px; }
+.code-layout { display: grid; grid-template-columns: 1fr 1fr; }
+.code-pane { min-width: 0; padding: 19px; }
+.code-pane + .code-pane { background: #080808; border-left: 1px solid var(--line); }
+.pane-label { color: var(--dim); font: .57rem var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+pre { margin: 14px 0 0; overflow-x: auto; }
+.code-pane pre { color: #b9b6ad; font: .67rem/1.9 var(--mono); }
+.kw { color: #d9b45d; }
+.type { color: #a9d5ad; }
+.num { color: #e8d097; }
+.str { color: #d9a88e; }
+.comment { color: #55534e; }
+.asm pre { color: #86847e; }
+.asm strong { color: var(--gold-soft); font-weight: 400; }
+
+.stats { border-bottom: 1px solid var(--line); display: grid; grid-template-columns: repeat(4, 1fr); }
+.stat { min-height: 108px; padding: 22px 20px; }
+.stat + .stat { border-left: 1px solid var(--line); }
+.stat-value { color: var(--text); font: .78rem var(--mono); }
+.stat-value em { color: var(--green); font-style: normal; }
+.stat-label { color: var(--dim); font: .59rem var(--mono); margin-top: 7px; text-transform: uppercase; }
+
+.section { border-bottom: 1px solid var(--line); padding: 46px 0; }
+.section-heading { align-items: baseline; display: flex; justify-content: space-between; margin-bottom: 20px; }
+.section-heading h2 { font: 500 .75rem var(--mono); letter-spacing: .1em; margin: 0; text-transform: uppercase; }
+.section-heading span { color: var(--dim); font: .59rem var(--mono); }
+.route-grid { display: grid; gap: 10px; grid-template-columns: repeat(3, 1fr); }
+.route { border: 1px solid var(--line); min-height: 142px; padding: 17px; transition: border-color .15s, background .15s; }
+.route:hover { background: var(--panel); border-color: var(--line-bright); }
+.route-index { color: var(--gold); font: .59rem var(--mono); }
+.route h3 { font-size: .92rem; font-weight: 500; margin: 29px 0 5px; }
+.route p { color: var(--muted); font-size: .72rem; margin: 0; }
+.route-arrow { color: var(--dim); float: right; font: .9rem var(--mono); }
+
+.install { align-items: center; display: flex; gap: 28px; justify-content: space-between; }
+.install-copy { min-width: 190px; }
+.install-copy h2 { font: 500 .75rem var(--mono); letter-spacing: .1em; margin: 0 0 7px; text-transform: uppercase; }
+.install-copy p { color: var(--muted); font-size: .72rem; margin: 0; }
+.command { align-items: center; background: var(--panel); border: 1px solid var(--line-bright); display: flex; flex: 1; justify-content: space-between; max-width: 570px; padding: 11px 13px; }
+.command code { color: var(--gold-soft); font: .66rem var(--mono); overflow-x: auto; white-space: nowrap; }
+.command-stack { align-items: flex-start; }
+.command-stack pre { margin: 0; overflow-x: auto; }
+.command-stack pre code { display: block; line-height: 1.75; white-space: pre; }
+.copy-button { align-items: center; background: transparent; border: 0; color: var(--dim); cursor: pointer; display: inline-flex; flex: 0 0 auto; padding: 3px; }
+.copy-button:hover { color: var(--gold-soft); }
+.copy-button svg { height: 15px; width: 15px; }
+
+.footer { align-items: center; color: var(--dim); display: flex; font: .59rem var(--mono); justify-content: space-between; padding: 20px 0 28px; }
+.footer-links { display: flex; gap: 18px; }
+.footer a:hover { color: var(--gold-soft); }
+
+@media (max-width: 820px) {
+  .intro { gap: 34px; grid-template-columns: 1fr; padding: 52px 0; }
+  .intro-copy { max-width: 560px; }
+  .route-grid { grid-template-columns: 1fr; }
+  .route { min-height: auto; }
+  .route h3 { margin-top: 18px; }
+  .install { align-items: stretch; flex-direction: column; gap: 18px; }
+  .command { max-width: none; }
+}
+@media (max-width: 600px) {
+  .shell { width: min(var(--max), calc(100% - 28px)); }
+  .topbar-inner { height: 54px; }
+  .nav { gap: 12px; }
+  .nav a:not(.nav-cta) { display: none; }
+  .intro { padding: 42px 0; }
+  .code-layout { grid-template-columns: 1fr; }
+  .code-pane + .code-pane { border-left: 0; border-top: 1px solid var(--line); }
+  .stats { grid-template-columns: repeat(2, 1fr); }
+  .stat:nth-child(3) { border-left: 0; border-top: 1px solid var(--line); }
+  .stat:nth-child(4) { border-top: 1px solid var(--line); }
+  .footer { align-items: flex-start; flex-direction: column; gap: 12px; }
+}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="shell topbar-inner">
+    <a class="brand" href="./" aria-label="Cobra home">
+      <img class="brand-mark" src="cobra_logo.jpg" alt="">
+      <span class="brand-name">Cobra</span>
+      <span class="brand-version">v1.0</span>
+    </a>
+    <nav class="nav" aria-label="Primary navigation">
+      <a href="docs.html?doc=tour">Tour</a>
+      <a href="docs.html?doc=reference">Reference</a>
+      <a href="https://discord.gg/b9h4ZD5JNM" target="_blank" rel="noreferrer">Community</a>
+      <a class="nav-cta" href="https://github.com/Aaron-Savron/Cobra" target="_blank" rel="noreferrer">Source</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+  <section class="shell intro">
+    <div class="intro-copy">
+      <div class="eyebrow">native systems programming</div>
+      <h1>The comfort of Python.<br>The bare metal of x86_64.</h1>
+      <p class="lede">Write everyday programs with a familiar surface. Cobra emits direct native code with explicit memory, C ABI access, SIMD kernels, and no virtual machine.</p>
+      <div class="intro-actions">
+        <a class="button primary" href="docs.html?doc=tour">Read the tour</a>
+        <a class="button" href="docs.html?doc=reference">CLI reference</a>
+      </div>
+    </div>
+    <div class="code-window" aria-label="Cobra source and emitted assembly">        <div class="window-bar"><span class="window-file">examples/54_user_loop_vectorization.cb</span><span class="window-status">AVX2 path</span></div>
+      <div class="code-layout">
+        <div class="code-pane">
+          <div class="pane-label">cobra</div>
+          <pre><span class="comment"># Python comfort, native loop</span>
+<span class="kw">for</span> i <span class="kw">in</span> len(values): {
+    values[i] = values[i] * <span class="num">2.0</span> + <span class="num">1.0</span>
+}</pre>
+        </div>
+        <div class="code-pane asm">
+          <div class="pane-label">x86_64</div>
+          <pre><span class="comment">; emitted AVX2 path</span>
+<strong>vmovups</strong> ymm0, [rbx + rdx*4]
+<strong>vfmadd213ps</strong> ymm0, ymm1, ymm2
+<strong>vmovups</strong> [rbx + rdx*4], ymm0
+<strong>vzeroupper</strong></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="shell stats" aria-label="Cobra characteristics">
+    <div class="stat"><div class="stat-value"><em>native</em></div><div class="stat-label">execution model</div></div>
+    <div class="stat"><div class="stat-value">x86_64</div><div class="stat-label">primary target</div></div>
+    <div class="stat"><div class="stat-value">AVX2 / FMA</div><div class="stat-label">numeric path</div></div>
+    <div class="stat"><div class="stat-value">no VM</div><div class="stat-label">runtime model</div></div>
+  </section>
+
+  <section class="shell section">
+    <div class="section-heading"><h2>Start here</h2><span>three useful paths</span></div>
+    <div class="route-grid">
+      <a class="route" href="docs.html?doc=tour"><span class="route-index">01</span><span class="route-arrow">&gt;</span><h3>Language tour</h3><p>Types, memory, collections, compute, and C interop.</p></a>
+      <a class="route" href="docs.html?doc=reference"><span class="route-index">02</span><span class="route-arrow">&gt;</span><h3>CLI reference</h3><p>Build, run, test, benchmark, format, and emit assembly.</p></a>
+      <a class="route" href="https://github.com/Aaron-Savron/Cobra" target="_blank" rel="noreferrer"><span class="route-index">03</span><span class="route-arrow">&gt;</span><h3>Read the source</h3><p>Compiler, standard library, runtime, examples, and tests.</p></a>
+    </div>
+  </section>
+
+  <section class="shell section install">
+    <div class="install-copy"><h2>Get Cobra</h2><p>Build locally, then run the first example.</p></div>
+    <div class="command command-stack"><pre id="install-command"><code>git clone https://github.com/Aaron-Savron/Cobra.git
+cd Cobra
+make
+./cobra run examples/01_hello.cb</code></pre><button class="copy-button" type="button" aria-label="Copy install commands" title="Copy install commands" onclick="copyInstall()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="8" y="8" width="11" height="11" rx="1"></rect><path d="M5 16H4a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h11a1 1 0 0 1 1 1v1"></path></svg></button></div>
+  </section>
+</main>
+
+<footer class="shell footer"><span>COBRA / MIT LICENSE</span><div class="footer-links"><a href="docs.html">Docs</a><a href="https://discord.gg/b9h4ZD5JNM" target="_blank" rel="noreferrer">Discord</a><a href="https://github.com/Aaron-Savron/Cobra" target="_blank" rel="noreferrer">GitHub</a></div></footer>
+<script>
+function copyInstall() {
+  const command = document.getElementById('install-command').textContent;
+  navigator.clipboard.writeText(command).then(function () {
+    const button = document.querySelector('.copy-button');
+    button.setAttribute('aria-label', 'Copied');
+    button.title = 'Copied';
+    setTimeout(function () {    button.setAttribute('aria-label', 'Copy install commands'); button.title = 'Copy install commands'; }, 1400);
+  });
+}
+</script>
+</body>
+</html>

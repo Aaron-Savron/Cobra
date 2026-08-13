@@ -1,0 +1,81 @@
+# Example 52: Systems Lane 2  Memory and CPU
+# Named scalar state keeps the ABI explicit while out parameters mutate the
+# caller-owned frame storage directly.
+
+def scale_avx2(v: []f32) -> i64: {
+    for i in len(v): {
+        v[i] = v[i] * 2.0
+    }
+    return 0
+}
+
+def scale_portable(v: []f32) -> i64 {
+    for i in len(v): {
+        v[i] = v[i] * 2.0
+    }
+    return 0
+}
+
+def main(): {
+    let arena: ArenaState
+    base = arena_create(arena, 4096)
+    assert(base != 0)
+    p1 = arena_alloc(arena, 256)
+    p2 = arena_alloc(arena, 256)
+    assert(p1 != 0)
+    assert(p2 == p1 + 256)
+    assert(arena_alloc(arena, 4000) == 0)
+    arena_reset(arena)
+    assert(arena_alloc(arena, 256) == p1)
+    assert(arena_destroy(arena) == 0)
+
+    let pool: PoolState
+    free_list = alloc_i64(8)
+    pbase = pool_create(pool, free_list, 64, 8)
+    assert(pbase != 0)
+    b1 = pool_alloc(pool, free_list)
+    b2 = pool_alloc(pool, free_list)
+    assert(b1 != 0)
+    assert(b2 == b1 + 64)
+    assert(pool_free(pool, free_list, b1) == 0)
+    assert(pool_alloc(pool, free_list) == b1)
+    assert(pool_destroy(pool) == 0)
+    free(free_list)
+
+    ap = mem_aligned_alloc(8192, 64)
+    assert(ap != 0)
+    assert(ap / 64 * 64 == ap)
+    assert(mem_aligned_free(ap, 8192) == 0)
+
+    src = alloc_i64(16)
+    dst = alloc_i64(16)
+    for i in 16: {
+        src[i] = i * 7
+    }
+    mem_copy(dst, src, 128)
+    assert(mem_equal(dst, src, 128) == 0)
+    mem_set(dst, 0, 128)
+    assert(mem_equal(dst, src, 128) != 0)
+
+    assert(cpu_has_feature("fpu") == 1)
+    assert(cpu_has_popcnt() == 1)
+    v = alloc_f32(64)
+    for i in 64: {
+        v[i] = 1.0
+    }
+    fast = 0
+    if cpu_has_avx2() == 1: {
+        if cpu_has_fma() == 1: {
+            fast = 1
+        }
+    }
+    if fast == 1: {
+        scale_avx2(v)
+    } else: {
+        scale_portable(v)
+    }
+    assert(sum_f32(v) == 128.0)
+
+    print("systems mem + cpu passed")
+    return 0
+}

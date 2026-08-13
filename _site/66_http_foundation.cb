@@ -1,0 +1,242 @@
+# HTTP/1.1 foundation tests.
+# Every parser input and output buffer is caller-owned. The suite includes
+# embedded zero bytes, malformed spacing, duplicate lengths, body EOF, and a
+# full response build and send over a local socket pair.
+
+def test_http_valid_request(): {
+    request = alloc_u8(256)
+    request_size = http_copy_text(request, 0, "POST /model HTTP/1.1\r\nHost: Example\r\ncontent-length: 5\r\nX-Test: yes\r\n\r\nhello")
+    assert(request_size > 0)
+
+    method = alloc_i64(2)
+    path = alloc_i64(2)
+    version = alloc_i64(2)
+    line = http_parse_request_line(request, request_size, method, path, version)
+    assert(is_ok(line))
+    assert(http_span_equals(request, method, "POST") == 1)
+    assert(http_span_equals(request, path, "/model") == 1)
+    assert(http_span_equals(request, version, "HTTP/1.1") == 1)
+
+    name = alloc_i64(2)
+    value = alloc_i64(2)
+    let line_start: i64 = unwrap_ok(line)
+    first = http_parse_header(request, request_size, line_start, name, value)
+    assert(is_ok(first))
+    assert(http_header_name_is(request, name, "host") == 1)
+
+    let first_start: i64 = unwrap_ok(first)
+    second = http_parse_header(request, request_size, first_start, name, value)
+    assert(is_ok(second))
+    assert(http_header_name_is(request, name, "Content-Length") == 1)
+    parsed_length = http_parse_content_length(request, value)
+    assert(is_ok(parsed_length))
+    assert(unwrap_ok(parsed_length) == 5)
+
+    content_length = alloc_i64(1)
+    header_count = alloc_i64(1)
+    headers = http_parse_headers(request, request_size, line_start, content_length, header_count, name, value)
+    assert(is_ok(headers))
+    assert(unwrap_ok(headers) > unwrap_ok(line))
+    assert(content_length[0] == 5)
+    assert(header_count[0] == 3)
+
+    # A valid bounded header block can be followed by a large body. The
+    # aggregate limit applies to headers, not the entire receive buffer.
+    large_request = alloc_u8(20064)
+    large_header_size = http_copy_text(large_request, 0, "POST /bulk HTTP/1.1\r\nHost: cobra\r\n\r\n")
+    i = large_header_size
+    while i < large_header_size + 20000: {
+        large_request[i] = 0
+        i = i + 1
+    }
+    large_size = large_header_size + 20000
+    large_line = http_parse_request_line(large_request, large_size, method, path, version)
+    assert(is_ok(large_line))
+    let large_start: i64 = unwrap_ok(large_line)
+    large_headers = http_parse_headers(large_request, large_size, large_start, content_length, header_count, name, value)
+    assert(is_ok(large_headers))
+    assert(content_length[0] == 0)
+    assert(header_count[0] == 1)
+    free(large_request)
+
+    free(header_count)
+    free(content_length)
+    free(value)
+    free(name)
+    free(version)
+    free(path)
+    free(method)
+    free(request)
+    return 0
+}
+
+def test_http_malformed_input(): {
+    bad_version = alloc_u8(64)
+    bad_version_size = http_copy_text(bad_version, 0, "GET / HTTP/2.0\r\n")
+    method = alloc_i64(2)
+    path = alloc_i64(2)
+    version = alloc_i64(2)
+    parsed_version = http_parse_request_line(bad_version, bad_version_size, method, path, version)
+    assert(is_ok(parsed_version) == 0)
+    assert(unwrap_err(parsed_version) == 14)
+
+    bad_spacing = alloc_u8(64)
+    bad_spacing_size = http_copy_text(bad_spacing, 0, "GET  / HTTP/1.1\r\n")
+    parsed_spacing = http_parse_request_line(bad_spacing, bad_spacing_size, method, path, version)
+    assert(is_ok(parsed_spacing) == 0)
+    assert(unwrap_err(parsed_spacing) == 10)
+
+    bad_header = alloc_u8(64)
+    bad_header_size = http_copy_text(bad_header, 0, "Host value\r\n\r\n")
+    name = alloc_i64(2)
+    value = alloc_i64(2)
+    parsed_header = http_parse_header(bad_header, bad_header_size, 0, name, value)
+    assert(is_ok(parsed_header) == 0)
+    assert(unwrap_err(parsed_header) == 12)
+
+    nul_header = alloc_u8(64)
+    nul_size = http_copy_text(nul_header, 0, "Host: good\r\n")
+    nul_header[6] = 0
+    parsed_nul = http_parse_header(nul_header, nul_size, 0, name, value)
+    assert(is_ok(parsed_nul) == 0)
+    assert(unwrap_err(parsed_nul) == 12)
+
+    duplicate = alloc_u8(128)
+    duplicate_size = http_copy_text(duplicate, 0, "GET / HTTP/1.1\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\n")
+    line = http_parse_request_line(duplicate, duplicate_size, method, path, version)
+    assert(is_ok(line))
+    content_length = alloc_i64(1)
+    header_count = alloc_i64(1)
+    let duplicate_start: i64 = unwrap_ok(line)
+    duplicate_headers = http_parse_headers(duplicate, duplicate_size, duplicate_start, content_length, header_count, name, value)
+    assert(is_ok(duplicate_headers) == 0)
+    assert(unwrap_err(duplicate_headers) == 13)
+
+    oversized = alloc_u8(4105)
+    i = 0
+    while i < 4098: {
+        oversized[i] = 65
+        i = i + 1
+    }
+    oversized[4098] = 58
+    oversized[4099] = 13
+    oversized[4100] = 10
+    oversized_header = http_parse_header(oversized, 4101, 0, name, value)
+    assert(is_ok(oversized_header) == 0)
+    assert(unwrap_err(oversized_header) == 11)
+
+    oversized_request = alloc_u8(8202)
+    i = 0
+    while i < 8200: {
+        oversized_request[i] = 65
+        i = i + 1
+    }
+    oversized_request[8200] = 13
+    oversized_request[8201] = 10
+    oversized_line = http_parse_request_line(oversized_request, 8202, method, path, version)
+    assert(is_ok(oversized_line) == 0)
+    assert(unwrap_err(oversized_line) == 10)
+
+    chunked = alloc_u8(128)
+    chunked_size = http_copy_text(chunked, 0, "GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n")
+    chunked_line = http_parse_request_line(chunked, chunked_size, method, path, version)
+    assert(is_ok(chunked_line))
+    let chunked_start: i64 = unwrap_ok(chunked_line)
+    chunked_headers = http_parse_headers(chunked, chunked_size, chunked_start, content_length, header_count, name, value)
+    assert(is_ok(chunked_headers) == 0)
+    assert(unwrap_err(chunked_headers) == 12)
+
+    free(chunked)
+    free(oversized_request)
+    free(oversized)
+    free(header_count)
+    free(content_length)
+    free(duplicate)
+    free(value)
+    free(name)
+    free(nul_header)
+    free(bad_header)
+    free(version)
+    free(path)
+    free(method)
+    free(bad_spacing)
+    free(bad_version)
+    return 0
+}
+
+def test_http_body_and_response(): {
+    handles = alloc_i64(2)
+    pair = net_socket_pair_checked(handles)
+    assert(is_ok(pair))
+
+    wire = alloc_u8(5)
+    http_copy_text(wire, 0, "hello")
+    sent = net_send_bytes_checked(handles[0], wire, 5)
+    assert(is_ok(sent))
+    assert(unwrap_ok(sent) == 5)
+
+    body = alloc_u8(5)
+    progress = alloc_i64(1)
+    read_body = http_read_body(handles[1], body, 5, progress)
+    assert(is_ok(read_body))
+    assert(unwrap_ok(read_body) == 5)
+    assert(progress[0] == 5)
+    assert(http_bytes_equal(body, wire, 5) == 1)
+
+    headers = alloc_u8(64)
+    header_bytes = http_copy_text(headers, 0, "Connection: close\r\n")
+    let header_view: []u8 = slice_u8(headers, 0, header_bytes)
+    response_body = alloc_u8(5)
+    http_copy_text(response_body, 0, "world")
+    response = alloc_u8(128)
+    built = http_build_response(200, header_view, response_body, response)
+    assert(is_ok(built))
+    let response_bytes: i64 = unwrap_ok(built)
+    assert(response_bytes > 5)
+    assert(response[0] == 72)
+
+    write_progress = alloc_i64(1)
+    written = http_write_response(handles[0], response, response_bytes, write_progress)
+    assert(is_ok(written))
+    assert(unwrap_ok(written) == response_bytes)
+    received = alloc_u8(128)
+    received_response = net_recv_bytes_checked(handles[1], received, response_bytes)
+    assert(is_ok(received_response))
+    assert(unwrap_ok(received_response) == response_bytes)
+    assert(received[0] == 72)
+
+    net_close_checked(handles[0])
+    net_close_checked(handles[1])
+
+    truncated_handles = alloc_i64(2)
+    truncated_pair = net_socket_pair_checked(truncated_handles)
+    assert(is_ok(truncated_pair))
+    partial_wire = alloc_u8(2)
+    http_copy_text(partial_wire, 0, "he")
+    partial_sent = net_send_bytes_checked(truncated_handles[0], partial_wire, 2)
+    assert(is_ok(partial_sent))
+    net_close_checked(truncated_handles[0])
+    truncated_body = alloc_u8(5)
+    truncated_progress = alloc_i64(1)
+    truncated_read = http_read_body(truncated_handles[1], truncated_body, 5, truncated_progress)
+    assert(is_ok(truncated_read) == 0)
+    assert(unwrap_err(truncated_read) == 15)
+    assert(truncated_progress[0] == 2)
+    net_close_checked(truncated_handles[1])
+
+    free(truncated_progress)
+    free(truncated_body)
+    free(partial_wire)
+    free(truncated_handles)
+    free(received)
+    free(write_progress)
+    free(response)
+    free(response_body)
+    free(header_view)
+    free(headers)
+    free(progress)
+    free(body)
+    free(wire)
+    free(handles)
+    return 0
+}

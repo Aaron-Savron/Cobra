@@ -1,0 +1,57 @@
+# Cobra CPU Library (lib/cpu.cb)
+# CPU feature detection as userland Cobra on the libc ABI bridge. Feature
+# flags are read from /proc/cpuinfo through a zeroed buffer, so the checks
+# work on any Linux kernel and there is no assembly and no compiler support.
+#
+# Conventions:
+#   - cpu_has_feature returns 1 when the named flag appears in the CPU flags.
+#   - The convenience wrappers are the names you dispatch on in hot paths.
+#   - Dispatch stays explicit: `if cpu_has_avx2(): fast() else: portable()`.
+
+import c "libc.so.6" (strstr)
+
+# 1 when the /proc/cpuinfo flags contain the named feature, else 0.
+def cpu_has_feature(feature: string) -> i64: {
+    buf = alloc_i64(512)
+    n = fs_read("/proc/cpuinfo", buf, 4000)
+    if n <= 0: {
+        free(buf)
+        return 0
+    }
+    r = strstr(buf, feature)
+    free(buf)
+    if r == 0: {
+        return 0
+    }
+    return 1
+}
+
+# 1 on AVX2-capable hosts (256-bit vector FMA kernels).
+def cpu_has_avx2() -> i64: {
+    return cpu_has_feature("avx2")
+}
+
+# 1 on FMA-capable hosts (fused multiply-add on the vector path).
+def cpu_has_fma() -> i64: {
+    return cpu_has_feature("fma")
+}
+
+# 1 on AVX-512 capable hosts (512-bit vector kernels).
+def cpu_has_avx512() -> i64: {
+    return cpu_has_feature("avx512f")
+}
+
+# 1 on hosts with the AES-NI instruction set.
+def cpu_has_aes() -> i64: {
+    return cpu_has_feature("aes")
+}
+
+# 1 on hosts with the SHA-NI instruction set.
+def cpu_has_sha() -> i64: {
+    return cpu_has_feature("sha_ni")
+}
+
+# 1 on hosts with the POPCNT instruction.
+def cpu_has_popcnt() -> i64: {
+    return cpu_has_feature("popcnt")
+}

@@ -1,0 +1,738 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#080809">
+<meta name="description" content="Cobra documentation">
+<title>Cobra Docs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,300;0,400;0,500;1,400&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+/* ── Reset ──────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg:      #000000;
+  --bg1:     #080809;
+  --bg2:     #101012;
+  --bg3:     #171719;
+  --border:  #1c1c1e;
+  --border2: #34302a;
+  --text:    #eee9dc;
+  --muted:   #a39d90;
+  --dim:     #625d54;
+  --gold:    #c8a44a;
+  --gold2:   #e8d090;
+  --gold3:   rgba(200,164,74,.1);
+  --green:   #4ec994;
+  --blue:    #6eb0f0;
+  --red:     #d06070;
+  --mono:    'IBM Plex Mono', monospace;
+  --sans:    'IBM Plex Sans', system-ui, sans-serif;
+  --sidebar: 240px;
+  --topbar:  48px;
+}
+
+html, body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14.5px;
+  line-height: 1.6;
+}
+
+a { color: inherit; text-decoration: none; }
+button { cursor: pointer; border: none; background: none; font-family: inherit; }
+
+/* ── Top bar ────────────────────────────────────────────────── */
+.topbar {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: var(--topbar);
+  background: rgba(0, 0, 0, .96);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid rgba(200,164,74,.14);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px 0 0;
+  z-index: 50;
+}
+
+.topbar-left {
+  display: flex;
+  align-items: center;
+  height: 100%;
+}
+
+.logo-btn {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 16px;
+  height: 100%;
+  border-right: 1px solid rgba(200,164,74,.14);
+  flex-shrink: 0;
+}
+
+.logo-btn img {
+  width: 26px;
+  height: 26px;
+  object-fit: contain;
+  mix-blend-mode: screen;
+}
+
+.logo-btn .lname {
+  font-family: var(--mono);
+  font-size: .78rem;
+  font-weight: 400;
+  letter-spacing: .1em;
+  color: var(--gold2);
+}
+
+.logo-btn .lver {
+  font-family: var(--mono);
+  font-size: .55rem;
+  color: var(--dim);
+  letter-spacing: .06em;
+}
+
+.topbar-search {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px;
+  height: 100%;
+}
+
+.search-box {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(255,255,255,.025);
+  border: 1px solid var(--border2);
+  border-radius: 3px;
+  padding: 4px 10px;
+}
+
+.search-box input {
+  background: none;
+  border: none;
+  outline: none;
+  font-family: var(--mono);
+  font-size: .65rem;
+  color: var(--muted);
+  width: 160px;
+  letter-spacing: .02em;
+}
+
+.search-box input::placeholder { color: var(--dim); }
+
+.search-box kbd {
+  font-family: var(--mono);
+  font-size: .55rem;
+  color: var(--dim);
+  border: 1px solid var(--border2);
+  border-radius: 2px;
+  padding: 1px 4px;
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.tb-link {
+  font-family: var(--mono);
+  font-size: .6rem;
+  color: var(--dim);
+  padding: 4px 9px;
+  border-radius: 3px;
+  letter-spacing: .06em;
+  transition: color .12s, background .12s;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.tb-link:hover { color: var(--text); background: var(--bg2); }
+.tb-link.gh { border: 1px solid var(--border2); }
+.tb-link.gh:hover { border-color: var(--gold); color: var(--gold2); }
+
+/* ── Layout ─────────────────────────────────────────────────── */
+.layout {
+  display: flex;
+  height: 100vh;
+  padding-top: var(--topbar);
+}
+
+/* ── Sidebar ────────────────────────────────────────────────── */
+.sidebar {
+  width: var(--sidebar);
+  flex-shrink: 0;
+  border-right: 1px solid rgba(200,164,74,.12);
+  background: var(--bg1);
+  overflow-y: auto;
+  overflow-x: hidden;
+  position: fixed;
+  top: var(--topbar);
+  bottom: 0;
+  left: 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border2) transparent;
+}
+
+.sidebar::-webkit-scrollbar { width: 4px; }
+.sidebar::-webkit-scrollbar-track { background: transparent; }
+.sidebar::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+.sidebar-section { padding: 20px 0 8px; }
+
+.sidebar-group-label {
+  font-family: var(--mono);
+  font-size: .56rem;
+  font-weight: 500;
+  letter-spacing: .18em;
+  text-transform: uppercase;
+  color: var(--dim);
+  padding: 0 14px 6px;
+  display: block;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 6px 14px;
+  font-family: var(--mono);
+  font-size: .68rem;
+  color: var(--muted);
+  letter-spacing: .02em;
+  border-left: 2px solid transparent;
+  transition: color .1s, background .1s, border-color .1s;
+  cursor: pointer;
+  text-align: left;
+  border-right: none;
+  background: none;
+  font-family: var(--mono);
+}
+
+.nav-item:hover { color: var(--text); background: var(--bg2); }
+
+.nav-item.active {
+  color: var(--gold2);
+  border-left-color: var(--gold);
+  background: rgba(200,164,74,.12);
+  box-shadow: inset 4px 0 18px rgba(200,164,74,.04);
+}
+
+.nav-item .ni-icon {
+  font-size: .7rem;
+  opacity: .5;
+  flex-shrink: 0;
+}
+
+.nav-item.active .ni-icon { opacity: 1; }
+
+.sidebar-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 10px 0;
+}
+
+/* ── Main content ───────────────────────────────────────────── */
+.main {
+  margin-left: var(--sidebar);
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border2) transparent;
+}
+
+.main::-webkit-scrollbar { width: 4px; }
+.main::-webkit-scrollbar-track { background: transparent; }
+.main::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+/* welcome state */
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 16px;
+  color: var(--dim);
+}
+
+.welcome-logo {
+  width: 64px;
+  height: 64px;
+  opacity: .42;
+  mix-blend-mode: screen;
+}
+
+.welcome p {
+  font-family: var(--mono);
+  font-size: .68rem;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+
+/* doc content area */
+.doc-content {
+  display: none;
+  max-width: 820px;
+  margin: 0 auto;
+  padding: 40px 48px 80px;
+}
+
+.doc-content.visible { display: block; }
+
+/* breadcrumb */
+.breadcrumb {
+  font-family: var(--mono);
+  font-size: .6rem;
+  color: var(--dim);
+  letter-spacing: .08em;
+  margin-bottom: 28px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.breadcrumb a { color: var(--muted); transition: color .12s; }
+.breadcrumb a:hover { color: var(--gold2); }
+.breadcrumb span { color: var(--dim); }
+
+/* ── Markdown rendering ─────────────────────────────────────── */
+.md-body { line-height: 1.75; }
+
+.md-body h1 {
+  font-size: 1.65rem;
+  font-weight: 600;
+  letter-spacing: -.02em;
+  color: var(--gold2);
+  text-shadow: 0 0 22px rgba(200,164,74,.08);
+  margin-bottom: 10px;
+  line-height: 1.2;
+}
+
+.md-body h2 {
+  font-size: 1.1rem;
+  font-weight: 500;
+  color: var(--text);
+  margin: 36px 0 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(200,164,74,.18);
+  letter-spacing: -.01em;
+}
+
+.md-body h3 {
+  font-size: .9rem;
+  font-weight: 500;
+  color: var(--text);
+  margin: 24px 0 8px;
+}
+
+.md-body h4 {
+  font-family: var(--mono);
+  font-size: .72rem;
+  color: var(--gold);
+  margin: 20px 0 8px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.md-body p {
+  color: var(--muted);
+  font-size: .9rem;
+  margin-bottom: 14px;
+  line-height: 1.75;
+}
+
+.md-body a { color: var(--gold2); border-bottom: 1px solid rgba(232,208,144,.2); transition: border-color .12s; }
+.md-body a:hover { border-color: var(--gold2); }
+
+.md-body ul, .md-body ol {
+  color: var(--muted);
+  font-size: .9rem;
+  padding-left: 20px;
+  margin-bottom: 14px;
+}
+.md-body li { margin-bottom: 5px; line-height: 1.65; }
+.md-body li strong { color: var(--text); font-weight: 500; }
+
+.md-body strong { color: var(--text); font-weight: 500; }
+.md-body em { color: var(--muted); font-style: italic; }
+
+.md-body hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 28px 0;
+}
+
+.md-body code {
+  font-family: var(--mono);
+  font-size: .78em;
+  color: var(--gold2);
+  background: rgba(200,164,74,.08);
+  border: 1px solid rgba(200,164,74,.12);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+.md-body pre {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 16px 18px;
+  margin: 14px 0 20px;
+  overflow-x: auto;
+  position: relative;
+}
+
+.md-body pre code {
+  font-family: var(--mono);
+  font-size: .72rem;
+  line-height: 1.85;
+  color: var(--muted);
+  background: none;
+  border: none;
+  padding: 0;
+  white-space: pre;
+}
+
+.md-body blockquote {
+  border-left: 2px solid var(--gold);
+  padding: 8px 16px;
+  margin: 14px 0;
+  background: var(--gold3);
+  border-radius: 0 3px 3px 0;
+}
+.md-body blockquote p { color: var(--muted); margin: 0; font-size: .85rem; }
+
+/* tables */
+.md-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 16px 0 22px;
+  font-size: .83rem;
+}
+.md-body th {
+  font-family: var(--mono);
+  font-size: .62rem;
+  font-weight: 500;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border2);
+  text-align: left;
+}
+.md-body td {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+  vertical-align: top;
+}
+.md-body tr:last-child td { border-bottom: 0; }
+.md-body tr:hover td { background: var(--bg2); }
+.md-body td:first-child { color: var(--text); font-family: var(--mono); font-size: .72rem; white-space: nowrap; }
+
+/* ── Loading state ──────────────────────────────────────────── */
+.loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 40px 48px;
+  font-family: var(--mono);
+  font-size: .65rem;
+  color: var(--dim);
+  letter-spacing: .1em;
+}
+
+.loading-dot {
+  width: 4px; height: 4px;
+  border-radius: 50%;
+  background: var(--gold);
+  animation: blink .9s ease-in-out infinite;
+}
+.loading-dot:nth-child(2) { animation-delay: .15s; }
+.loading-dot:nth-child(3) { animation-delay: .3s; }
+@keyframes blink { 0%,80%,100% { opacity: .15 } 40% { opacity: 1 } }
+
+/* ── Mobile toggle ──────────────────────────────────────────── */
+.sidebar-toggle {
+  display: none;
+  padding: 0 12px;
+  height: 100%;
+  align-items: center;
+  color: var(--dim);
+  font-size: 1rem;
+}
+
+@media (max-width: 700px) {
+  :root { --sidebar: 0px; }
+  .sidebar {
+    transform: translateX(-100%);
+    transition: transform .2s;
+    width: 220px;
+    z-index: 40;
+  }
+  .sidebar.open { transform: translateX(0); }
+  .sidebar-toggle { display: flex; }
+  .main { margin-left: 0; }
+  .doc-content { padding: 24px 20px 60px; }
+}
+</style>
+</head>
+<body>
+
+<!-- Top bar -->
+<header class="topbar">
+  <div class="topbar-left">
+    <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle sidebar">&#9776;</button>
+    <a class="logo-btn" href="./">
+      <img src="cobra_logo.jpg" alt="Cobra">
+      <div>
+        <div class="lname">cobra</div>
+        <div class="lver">v1.0.0</div>
+      </div>
+    </a>
+    <div class="topbar-search">
+      <div class="search-box">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--dim);flex-shrink:0"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" id="search-input" placeholder="Search docs..." autocomplete="off" spellcheck="false">
+        <kbd>/</kbd>
+      </div>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <a class="tb-link" href="docs.html?doc=contributing">Contributing</a>
+    <a class="tb-link gh" href="https://github.com/Aaron-Savron/Cobra" target="_blank" rel="noreferrer">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+      GitHub
+    </a>
+  </div>
+</header>
+
+<div class="layout">
+
+  <!-- Sidebar -->
+  <nav class="sidebar" id="sidebar">
+
+    <div class="sidebar-section">
+      <span class="sidebar-group-label">Getting started</span>
+      <button class="nav-item" data-doc="tour">
+        <span class="ni-icon">&#9654;</span> Language tour
+      </button>
+      <button class="nav-item" data-doc="reference">
+        <span class="ni-icon">&#9632;</span> CLI reference
+      </button>
+      <button class="nav-item" data-doc="foundation">
+        <span class="ni-icon">&#9671;</span> Safety foundation
+      </button>
+      <button class="nav-item" data-doc="strings">
+        <span class="ni-icon">&#9671;</span> String foundation
+      </button>
+    </div>
+
+    <div class="sidebar-divider"></div>
+
+    <div class="sidebar-section">
+      <span class="sidebar-group-label">Language</span>
+      <button class="nav-item" data-doc="tour" data-section="memory">
+        <span class="ni-icon">&#9633;</span> Memory model
+      </button>
+      <button class="nav-item" data-doc="tour" data-section="compute">
+        <span class="ni-icon">&#9651;</span> @compute / SIMD
+      </button>
+      <button class="nav-item" data-doc="tour" data-section="comptime">
+        <span class="ni-icon">&#9670;</span> @comptime
+      </button>
+      <button class="nav-item" data-doc="tour" data-section="interop">
+        <span class="ni-icon">&#9632;</span> C interop
+      </button>
+      <button class="nav-item" data-doc="tour" data-section="tensors">
+        <span class="ni-icon">&#9675;</span> Tensor views
+      </button>
+    </div>
+
+    <div class="sidebar-divider"></div>
+
+    <div class="sidebar-section">
+      <span class="sidebar-group-label">Project</span>
+      <button class="nav-item" data-doc="contributing">
+        <span class="ni-icon">&#9998;</span> Contributing
+      </button>
+      <button class="nav-item" data-doc="roadmap">
+        <span class="ni-icon">&#9658;</span> Roadmap
+      </button>
+      <a class="nav-item" href="https://discord.gg/b9h4ZD5JNM" target="_blank" rel="noreferrer" style="display:flex;align-items:center;gap:7px;text-decoration:none">
+        <span class="ni-icon">&#9670;</span> Discord
+      </a>
+    </div>
+
+  </nav>
+
+  <!-- Main -->
+  <main class="main" id="main">
+
+    <div class="welcome" id="welcome-state">
+      <img class="welcome-logo" src="cobra_logo.jpg" alt="" style="mix-blend-mode:screen">
+      <p>Select a document</p>
+    </div>
+
+    <div class="doc-content" id="doc-content">
+      <div class="breadcrumb" id="breadcrumb"></div>
+      <div class="md-body" id="md-body"></div>
+    </div>
+
+  </main>
+
+</div>
+
+<!-- marked.js for markdown parsing -->
+<script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
+<script>
+// ── Document registry
+const DOCS = {
+  tour:         { label: 'Language tour',   path: 'docs/TOUR.md'          },
+  reference:    { label: 'CLI reference',   path: 'docs/REFERENCE.md'     },
+  foundation:   { label: 'Safety foundation', path: 'docs/FOUNDATION_SAFETY.md' },
+  strings:      { label: 'String foundation', path: 'docs/STRING_FOUNDATION.md' },
+  contributing: { label: 'Contributing',    path: 'CONTRIBUTING.md'       },
+  roadmap:      { label: 'Roadmap',         path: 'ROADMAP.md'            },
+};
+
+// ── Marked configuration
+marked.setOptions({
+  breaks: false,
+  gfm: true,
+});
+
+// ── State
+let currentDoc = null;
+
+// ── Load and render a document
+async function loadDoc(docId, scrollToSection) {
+  const meta = DOCS[docId];
+  if (!meta) return;
+
+  // Update nav active state
+  document.querySelectorAll('.nav-item').forEach(item => {
+    item.classList.toggle('active', item.dataset.doc === docId && !item.dataset.section);
+  });
+
+  // Show loading
+  document.getElementById('welcome-state').style.display = 'none';
+  const content = document.getElementById('doc-content');
+  const body = document.getElementById('md-body');
+  const breadcrumb = document.getElementById('breadcrumb');
+
+  content.classList.remove('visible');
+  body.innerHTML = '<div class="loading"><div class="loading-dot"></div><div class="loading-dot"></div><div class="loading-dot"></div><span style="margin-left:4px">loading</span></div>';
+  content.classList.add('visible');
+
+  try {
+    const res = await fetch(meta.path);
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    const md = await res.text();
+    const html = marked.parse(md);
+    body.innerHTML = html;
+
+    // Breadcrumb
+    breadcrumb.innerHTML = `
+      <a href="./">cobra</a>
+      <span>/</span>
+      <span style="color:var(--muted)">${meta.label}</span>
+    `;
+
+    currentDoc = docId;
+
+    // Update URL
+    const url = new URL(window.location);
+    url.searchParams.set('doc', docId);
+    window.history.pushState({}, '', url);
+
+    // Scroll to section if requested
+    if (scrollToSection) {
+      setTimeout(() => {
+        // find heading containing the section keyword
+        const headings = body.querySelectorAll('h1,h2,h3');
+        for (const h of headings) {
+          if (h.textContent.toLowerCase().includes(scrollToSection.toLowerCase())) {
+            h.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            break;
+          }
+        }
+      }, 80);
+    } else {
+      document.getElementById('main').scrollTop = 0;
+    }
+
+  } catch (err) {
+    body.innerHTML = `
+      <div style="padding:20px 0;font-family:var(--mono);font-size:.72rem;color:var(--dim)">
+        <p style="color:var(--red);margin-bottom:8px">Could not load document</p>
+        <p>${meta.path}</p>
+        <p style="margin-top:6px;color:var(--dim)">${err.message}</p>
+        <p style="margin-top:12px">Serving via a local HTTP server resolves cross-origin fetch restrictions.</p>
+        <pre style="margin-top:10px;background:var(--bg2);border:1px solid var(--border);padding:12px;border-radius:3px;color:var(--muted)">cd web && python3 -m http.server 8080</pre>
+      </div>
+    `;
+  }
+}
+
+// ── Nav item clicks
+document.querySelectorAll('.nav-item[data-doc]').forEach(item => {
+  item.addEventListener('click', () => {
+    const docId = item.dataset.doc;
+    const section = item.dataset.section || null;
+    loadDoc(docId, section);
+    // close mobile sidebar
+    document.getElementById('sidebar').classList.remove('open');
+  });
+});
+
+// ── Mobile sidebar toggle
+document.getElementById('sidebar-toggle').addEventListener('click', () => {
+  document.getElementById('sidebar').classList.toggle('open');
+});
+
+// ── Keyboard shortcut: / focuses search
+document.addEventListener('keydown', e => {
+  if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {
+    e.preventDefault();
+    document.getElementById('search-input').focus();
+  }
+  if (e.key === 'Escape') {
+    document.getElementById('search-input').blur();
+  }
+});
+
+// ── Search (client-side filter of nav items)
+document.getElementById('search-input').addEventListener('input', function() {
+  const q = this.value.trim().toLowerCase();
+  document.querySelectorAll('.nav-item').forEach(item => {
+    const label = item.textContent.toLowerCase();
+    item.style.display = (!q || label.includes(q)) ? '' : 'none';
+  });
+});
+
+// ── Load from URL param on page load
+const params = new URLSearchParams(window.location.search);
+const initialDoc = params.get('doc');
+if (initialDoc && DOCS[initialDoc]) {
+  loadDoc(initialDoc);
+} else {
+  // default to tour
+  loadDoc('tour');
+}
+</script>
+</body>
+</html>

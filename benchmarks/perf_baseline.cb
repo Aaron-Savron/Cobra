@@ -1,0 +1,130 @@
+# Native performance baseline workload.
+# Each section prints a stable name followed by elapsed microseconds. The Python
+# runner repeats the process and records medians with the host and revision.
+
+struct Point: {
+    x: i64,
+    y: i64,
+}
+
+def scalar_add(left: i64, right: i64) -> i64: {
+    return left + right
+}
+
+def score_point(point: Point) -> i64: {
+    return point.x * 3 + point.y
+}
+
+def checked_increment(value: i64) -> Result[i64, i64]: {
+    if value < 0: {
+        return err(1)
+    }
+    return ok(value + 1)
+}
+
+def emit_measurement(name: string, start: i64): {
+    print(name)
+    print(time_monotonic_us() - start)
+}
+
+def main(): {
+    let start: i64 = time_monotonic_us()
+    let scalar_total: i64 = 0
+    for i in range(0, 20000000): {
+        scalar_total = scalar_total + scalar_add(i, 1)
+    }
+    assert(scalar_total > 0)
+    emit_measurement("scalar_calls", start)
+
+    values = alloc_i64(1024)
+    for i in len(values): {
+        values[i] = 1
+    }
+    start = time_monotonic_us()
+    for pass in range(0, 20000): {
+        for i in len(values): {
+            values[i] = values[i] + 1
+        }
+    }
+    assert(values[0] == 20001)
+    assert(values[1023] == 20001)
+    emit_measurement("slice_loops", start)
+
+    let point: Point
+    point.x = 3
+    point.y = 4
+    start = time_monotonic_us()
+    let struct_total: i64 = 0
+    for i in range(0, 20000000): {
+        struct_total = struct_total + score_point(point)
+    }
+    assert(struct_total > 0)
+    emit_measurement("struct_copies", start)
+
+    start = time_monotonic_us()
+    let sum_total: i64 = 0
+    for i in range(0, 20000000): {
+        result = checked_increment(i)
+        if is_ok(result): {
+            sum_total = sum_total + unwrap_ok(result)
+        }
+    }
+    assert(sum_total > 0)
+    emit_measurement("option_result", start)
+
+    start = time_monotonic_us()
+    let region_total: i64 = 0
+    for i in range(0, 10000): {
+        with region scratch(4096): {
+            bytes = scratch.alloc_u8(128)
+            bytes[0] = 1
+            region_total = region_total + bytes[0]
+        }
+    }
+    assert(region_total == 10000)
+    emit_measurement("region_alloc", start)
+
+    request = alloc_u8(256)
+    request_size = http_copy_text(request, 0, "POST /model HTTP/1.1\r\nHost: cobra\r\nContent-Length: 5\r\nX-Test: yes\r\n\r\nhello")
+    request_meta = alloc_i64(12)
+    name_meta = alloc_i64(2)
+    value_meta = alloc_i64(2)
+    start = time_monotonic_us()
+    for i in range(0, 100000): {
+        parsed = http_request_parse(request, request_size, request_meta, name_meta, value_meta)
+        assert(is_ok(parsed))
+    }
+    emit_measurement("http_parse", start)
+
+    input_path = "/tmp/cobra_perf_baseline_input.bin"
+    output_path = "/tmp/cobra_perf_baseline_output.bin"
+    source = alloc_i64(4)
+    source[0] = 2
+    source[1] = 4
+    source[2] = 6
+    source[3] = 8
+    fs_write_file_bytes_checked(input_path, source, 32)
+    transform_buffer = alloc_i64(4)
+    start = time_monotonic_us()
+    for i in range(0, 10000): {
+        received = fs_read_file_checked(input_path, transform_buffer, 32)
+        assert(is_ok(received))
+        for j in range(0, 4): {
+            transform_buffer[j] = transform_buffer[j] + 1
+        }
+        written = fs_write_file_bytes_checked(output_path, transform_buffer, 32)
+        assert(is_ok(written))
+    }
+    emit_measurement("file_transform", start)
+
+    fs_remove(input_path)
+    fs_remove(output_path)
+    free(transform_buffer)
+    free(source)
+    free(value_meta)
+    free(name_meta)
+    free(request_meta)
+    free(request)
+    free(values)
+    return 0
+}

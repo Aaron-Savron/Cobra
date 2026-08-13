@@ -1,0 +1,9 @@
+# Frontend-only validation fixture: no assembly or linker step is required.
+
+def checked_value() -> i64: {
+    return 42
+}
+
+def main() -> i64: {
+    return checked_value()
+}

@@ -1,0 +1,6 @@
+import "modules/duplicate_a.cb"
+import "modules/duplicate_b.cb"
+
+def test_duplicate_module_symbols() -> i64: {
+    return 0
+}

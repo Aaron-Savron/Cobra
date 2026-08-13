@@ -1,0 +1,20 @@
+# Example 3: Clean & Fun Cobra Program! 
+
+def main():
+    print("Welcome to Cobra! Super clean & hyper-fast!")
+    
+    price = 25
+    quantity = 4
+    tax = 3
+    
+    # Super fun debug inspector: just add ? to any variable!
+    price?
+    quantity?
+    
+    total = (price * quantity) + tax
+    total?
+    
+    print("Final calculated total:")
+    print(total)
+    
+    return total

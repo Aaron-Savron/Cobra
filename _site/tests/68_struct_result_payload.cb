@@ -1,0 +1,7 @@
+struct ErrorInfo: {
+    code: i64,
+}
+
+def structured() -> Result[ErrorInfo, i64]: {
+    return err(1)
+}

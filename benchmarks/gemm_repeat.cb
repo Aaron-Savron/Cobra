@@ -1,0 +1,33 @@
+# Repeated in-process GEMM workload.
+# The process performs enough kernel work that startup is a small part of the
+# sample, while the final assertions prevent benchmark theater.
+
+def main(): {
+    input = alloc_f32(128)
+    weights = alloc_f32(512)
+    bias = alloc_f32(16)
+    matmul_output = alloc_f32(64)
+    dense_output = alloc_f32(64)
+
+    fill_f32(input, 1.0)
+    fill_f32(weights, 0.5)
+    fill_f32(bias, 1.0)
+
+    iterations = 2000
+    while iterations > 0: {
+        matmul_f32(input, weights, matmul_output, 4, 16, 32)
+        dense_f32(input, weights, bias, dense_output, 4, 16, 32)
+        iterations = iterations - 1
+    }
+
+    # Matmul outputs are 32 * 0.5 = 16; dense outputs are 17 after ReLU.
+    assert(sum_f32(matmul_output) == 1024)
+    assert(sum_f32(dense_output) == 1088)
+
+    free(input)
+    free(weights)
+    free(bias)
+    free(matmul_output)
+    free(dense_output)
+    return 0
+}

@@ -1,0 +1,11 @@
+struct RequestView: {
+    body: readonly []u8,
+}
+
+def invalid_owner_free(): {
+    body = alloc_u8(8)
+    let request: RequestView
+    request.body = body
+    free(body)
+    return 0
+}

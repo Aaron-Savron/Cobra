@@ -1,0 +1,107 @@
+# Auto-vectorized f32 kernels: index-pure loops over []f32 slices lower
+# directly to AVX2 (8 lanes) with no annotations, no builtins, no IR.
+# Loops that cannot be proven element-wise fall back to the checked
+# scalar lowering, so semantics never change - only speed does.
+
+# x[i] = x[i] * 2.0 + 1.0  ->  vmulps + vaddps, 8 lanes at a time
+def affine_scale(values: []f32): {
+    for i in len(values): {
+        values[i] = values[i] * 2.0 + 1.0
+    }
+    return 0
+}
+
+# if x[i] < 0.0: x[i] = 0.0  ->  vmaxps against zero (masked clamp)
+def relu(values: []f32): {
+    for i in len(values): {
+        if values[i] < 0.0: {
+            values[i] = 0.0
+        }
+    }
+    return 0
+}
+
+# Two masked clamps compose into one vector loop: vmaxps then vminps.
+def relu6(values: []f32): {
+    for i in len(values): {
+        if values[i] < 0.0: {
+            values[i] = 0.0
+        }
+        if values[i] > 6.0: {
+            values[i] = 6.0
+        }
+    }
+    return 0
+}
+
+# Two-buffer element-wise add: y[i] = y[i] + x[i]  ->  vaddps.
+def axpy_into(dst: []f32, src: []f32): {
+    for i in len(dst): {
+        dst[i] = dst[i] + src[i]
+    }
+    return 0
+}
+
+# NOT vectorized: reads values[i-1], a cross-iteration dependency.
+# The bounded analysis rejects it and the scalar loop keeps working.
+def prefix_shift(values: []f32): {
+    for i in len(values): {
+        if i > 0: {
+            values[i] = values[i] + values[i - 1]
+        }
+    }
+    return 0
+}
+
+def test_auto_vectorized_kernels(): {
+    # Affine: every 1.0 becomes 3.0 (16 elements, fully vectorized).
+    values = alloc_f32(16)
+    fill_f32(values, 1.0)
+    affine_scale(values)
+    assert(sum_f32(values) == 48)
+    free(values)
+
+    # ReLU: every -1.0 becomes 0.0.
+    values = alloc_f32(16)
+    fill_f32(values, -1.0)
+    relu(values)
+    assert(sum_f32(values) == 0)
+    free(values)
+
+    # ReLU6: every 8.0 clamps to 6.0.
+    values = alloc_f32(16)
+    fill_f32(values, 8.0)
+    relu6(values)
+    assert(sum_f32(values) == 96)
+    free(values)
+
+    # Two-buffer add: dst 1.0 + src 2.0 = 3.0 each.
+    dst = alloc_f32(8)
+    src = alloc_f32(8)
+    fill_f32(dst, 1.0)
+    fill_f32(src, 2.0)
+    axpy_into(dst, src)
+    assert(sum_f32(dst) == 24)
+    free(dst)
+    free(src)
+
+    # Scalar fallback keeps cross-iteration semantics: [1..8], sum 36.
+    values = alloc_f32(8)
+    fill_f32(values, 1.0)
+    prefix_shift(values)
+    assert(sum_f32(values) == 36)
+    free(values)
+
+    # Tail path: 10 elements = one 8-lane tile plus a 2-element scalar tail.
+    values = alloc_f32(10)
+    fill_f32(values, 1.0)
+    affine_scale(values)
+    assert(sum_f32(values) == 30)
+    free(values)
+
+    return 0
+}
+
+def main(): {
+    return test_auto_vectorized_kernels()
+}

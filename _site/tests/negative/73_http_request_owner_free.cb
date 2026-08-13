@@ -1,0 +1,9 @@
+def invalid_http_request_owner_free(): {
+    with region request_region: {
+        request = request_region.alloc_u8(64)
+        let body_view: []u8 = slice_u8(request, 0, 8)
+        free(request)
+        free(body_view)
+    }
+    return 0
+}

@@ -1,0 +1,276 @@
+# lib/nn.cb in action: every operation in the neural-network reference
+# library validated against hand-computed values, ending with a full
+# transformer encoder block forward pass. All of these functions are plain
+# Cobra code (see lib/nn.cb) composed on top of native AVX2 primitives -
+# matmul_f32, dense_f32, reductions, and auto-vectorized user loops.
+
+# softmax_rows_f32 on [[1,2],[3,4]]: each row sums to 1, and the softmax of
+# [1,2] is [0.2689, 0.7311].
+def test_softmax_rows(): {
+    p = alloc_f32(4)
+    p[0] = 1.0
+    p[1] = 2.0
+    p[2] = 3.0
+    p[3] = 4.0
+    softmax_rows_f32(p, 2)
+    s0 = p[0] + p[1]
+    s1 = p[2] + p[3]
+    assert(s0 > 0.999)
+    assert(s0 < 1.001)
+    assert(s1 > 0.999)
+    assert(s1 < 1.001)
+    assert(p[0] > 0.26)
+    assert(p[0] < 0.28)
+    assert(p[1] > 0.72)
+    assert(p[1] < 0.74)
+    free(p)
+    return 0
+}
+
+# Scaled dot-product attention with q = k = v = [[1,0,0],[0,1,0]].
+# Row 0 scores are [1/sqrt(3), 0] = [0.5774, 0], whose softmax is
+# [0.6405, 0.3595]; applying it to the value rows gives out[0] =
+# [0.6405, 0.3595, 0]. Row 1 is the mirror image.
+def test_attention(): {
+    q = alloc_f32(6)
+    k = alloc_f32(6)
+    v = alloc_f32(6)
+    p = alloc_f32(4)
+    kt = alloc_f32(6)
+    out = alloc_f32(6)
+    fill_f32(q, 0.0)
+    q[0] = 1.0
+    q[4] = 1.0
+    fill_f32(k, 0.0)
+    k[0] = 1.0
+    k[4] = 1.0
+    fill_f32(v, 0.0)
+    v[0] = 1.0
+    v[4] = 1.0
+    attention_forward(q, k, v, p, out, kt, 2, 3)
+    # Row 0: [0.6405, 0.3595, 0]; the attention weights sum to 1.
+    assert(out[0] > 0.639)
+    assert(out[0] < 0.642)
+    assert(out[1] > 0.358)
+    assert(out[1] < 0.361)
+    assert(out[2] == 0.0)
+    w0 = out[0] + out[1] + out[2]
+    assert(w0 > 0.999)
+    assert(w0 < 1.001)
+    # Row 1 is the mirror image.
+    assert(out[3] > 0.358)
+    assert(out[3] < 0.361)
+    assert(out[4] > 0.639)
+    assert(out[4] < 0.642)
+    assert(out[5] == 0.0)
+    free(q)
+    free(k)
+    free(v)
+    free(p)
+    free(kt)
+    free(out)
+    return 0
+}
+
+# layernorm_f32 on [1,2,3,4]: mean 2.5, variance 1.25, so the normalized
+# output is approximately [-1.342, -0.447, 0.447, 1.342] with mean ~ 0.
+def test_layernorm(): {
+    x = alloc_f32(4)
+    x[0] = 1.0
+    x[1] = 2.0
+    x[2] = 3.0
+    x[3] = 4.0
+    layernorm_f32(x)
+    mm = mean_f32(x)
+    assert(mm > -0.01)
+    assert(mm < 0.01)
+    assert(x[0] > -1.35)
+    assert(x[0] < -1.33)
+    assert(x[3] > 1.33)
+    assert(x[3] < 1.35)
+    free(x)
+    return 0
+}
+
+# embed_f32 gathers rows: ids [0,2,1] from a 3x2 table yield [1,2,5,6,3,4].
+def test_embed(): {
+    table = alloc_f32(6)
+    table[0] = 1.0
+    table[1] = 2.0
+    table[2] = 3.0
+    table[3] = 4.0
+    table[4] = 5.0
+    table[5] = 6.0
+    ids = alloc_i64(3)
+    ids[0] = 0
+    ids[1] = 2
+    ids[2] = 1
+    out = alloc_f32(6)
+    embed_f32(table, ids, out, 2, 3)
+    assert(out[0] == 1.0)
+    assert(out[1] == 2.0)
+    assert(out[2] == 5.0)
+    assert(out[3] == 6.0)
+    assert(out[4] == 3.0)
+    assert(out[5] == 4.0)
+    free(table)
+    free(ids)
+    free(out)
+    return 0
+}
+
+# conv2d_f32 on a 3x3 input [1..9] with a 2x2 identity-ish filter
+# [1,0,0,0], stride 1: the output is the top-left 2x2 corner [1,2,4,5].
+def test_conv(): {
+    input = alloc_f32(9)
+    input[0] = 1.0
+    input[1] = 2.0
+    input[2] = 3.0
+    input[3] = 4.0
+    input[4] = 5.0
+    input[5] = 6.0
+    input[6] = 7.0
+    input[7] = 8.0
+    input[8] = 9.0
+    w = alloc_f32(4)
+    b = alloc_f32(1)
+    col = alloc_f32(16)
+    out = alloc_f32(4)
+    fill_f32(w, 0.0)
+    w[0] = 1.0
+    fill_f32(b, 0.0)
+    conv2d_f32(input, w, b, col, out, 3, 3, 1, 2, 1, 1)
+    assert(out[0] == 1.0)
+    assert(out[1] == 2.0)
+    assert(out[2] == 4.0)
+    assert(out[3] == 5.0)
+    free(input)
+    free(w)
+    free(b)
+    free(col)
+    free(out)
+    return 0
+}
+
+# maxpool_f32 on 4x4 [1..16] with pool 2: each 2x2 block's max gives
+# [6,8,14,16].
+def test_maxpool(): {
+    input = alloc_f32(16)
+    fill_f32(input, 0.0)
+    input[0] = 1.0
+    input[1] = 2.0
+    input[2] = 3.0
+    input[3] = 4.0
+    input[4] = 5.0
+    input[5] = 6.0
+    input[6] = 7.0
+    input[7] = 8.0
+    input[8] = 9.0
+    input[9] = 10.0
+    input[10] = 11.0
+    input[11] = 12.0
+    input[12] = 13.0
+    input[13] = 14.0
+    input[14] = 15.0
+    input[15] = 16.0
+    out = alloc_f32(4)
+    maxpool_f32(input, out, 4, 4, 2)
+    assert(out[0] == 6.0)
+    assert(out[1] == 8.0)
+    assert(out[2] == 14.0)
+    assert(out[3] == 16.0)
+    free(input)
+    free(out)
+    return 0
+}
+
+# Activations and loss: sigmoid(0) = 0.5, gelu(0) = 0, gelu(1) ~ 0.8413,
+# and MSE over ([1,2], [3,4]) = 4.
+def test_activations_loss(): {
+    x = alloc_f32(2)
+    fill_f32(x, 0.0)
+    sigmoid_buf(x)
+    assert(x[0] > 0.499)
+    assert(x[0] < 0.501)
+    fill_f32(x, 0.0)
+    x[1] = 1.0
+    gelu_buf(x)
+    assert(x[0] == 0.0)
+    assert(x[1] > 0.84)
+    assert(x[1] < 0.85)
+    a = alloc_f32(2)
+    b = alloc_f32(2)
+    loss = alloc_f32(1)
+    a[0] = 1.0
+    a[1] = 2.0
+    b[0] = 3.0
+    b[1] = 4.0
+    mse_loss_f32(a, b, loss, 2)
+    assert(loss[0] > 3.999)
+    assert(loss[0] < 4.001)
+    free(x)
+    free(a)
+    free(b)
+    free(loss)
+    return 0
+}
+
+# A full transformer encoder block: self-attention -> layer norm -> MLP.
+# With zero MLP weights the block collapses to the bias broadcast, so
+# out[i] = b2[i mod 3] = [7,8,9,7,8,9] - a deterministic end-to-end check
+# that attention, normalization, and the dense path all ran correctly.
+def test_encoder_block(): {
+    x = alloc_f32(6)
+    p = alloc_f32(4)
+    kt = alloc_f32(6)
+    a = alloc_f32(6)
+    w1 = alloc_f32(12)
+    b1 = alloc_f32(4)
+    h = alloc_f32(8)
+    w2 = alloc_f32(12)
+    b2 = alloc_f32(3)
+    out = alloc_f32(6)
+    fill_f32(x, 0.0)
+    x[0] = 1.0
+    x[4] = 1.0
+    fill_f32(w1, 0.0)
+    fill_f32(b1, 0.0)
+    fill_f32(w2, 0.0)
+    b2[0] = 7.0
+    b2[1] = 8.0
+    b2[2] = 9.0
+    self_attn_block_f32(x, p, kt, a, w1, b1, h, w2, b2, out, 2, 3, 4)
+    assert(out[0] == 7.0)
+    assert(out[1] == 8.0)
+    assert(out[2] == 9.0)
+    assert(out[3] == 7.0)
+    assert(out[4] == 8.0)
+    assert(out[5] == 9.0)
+    # The attention + layer-norm path ran: the normalized buffer has mean ~ 0.
+    mm = mean_f32(a)
+    assert(mm > -0.01)
+    assert(mm < 0.01)
+    free(x)
+    free(p)
+    free(kt)
+    free(a)
+    free(w1)
+    free(b1)
+    free(h)
+    free(w2)
+    free(b2)
+    free(out)
+    return 0
+}
+
+def main(): {
+    test_softmax_rows()
+    test_attention()
+    test_layernorm()
+    test_embed()
+    test_conv()
+    test_maxpool()
+    test_activations_loss()
+    test_encoder_block()
+    return 0
+}

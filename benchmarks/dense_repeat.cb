@@ -1,0 +1,25 @@
+# Repeated preallocated dense_f32 workload.
+# Time the resulting binary externally; compilation is measured separately.
+
+def main(): {
+    input = alloc_f32(64)
+    weights = alloc_f32(8192)
+    bias = alloc_f32(128)
+    output = alloc_f32(128)
+    fill_f32(input, 1.0)
+    fill_f32(weights, 0.5)
+    fill_f32(bias, 1.0)
+
+    iterations = 1000
+    while iterations > 0: {
+        dense_f32(input, weights, bias, output, 1, 128, 64)
+        iterations = iterations - 1
+    }
+
+    assert(sum_f32(output) == 4224)
+    free(input)
+    free(weights)
+    free(bias)
+    free(output)
+    return 0
+}

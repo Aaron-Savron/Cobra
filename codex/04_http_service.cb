@@ -1,0 +1,24 @@
+def serve_once(port: i64) -> i64: {
+    let server: i64 = net_socket()
+    if server < 0 {
+        return 1
+    }
+    let bound: i64 = net_bind(server, port)
+    if bound != 0 {
+        net_close(server)
+        return 2
+    }
+    net_listen(server, 16)
+    let client: i64 = net_accept(server)
+    if client >= 0 {
+        let response: string = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+        net_send(client, response)
+        net_close(client)
+    }
+    net_close(server)
+    return 0
+}
+
+def main(): {
+    print("http service shape checked")
+}

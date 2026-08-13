@@ -1,0 +1,98 @@
+# Cross-feature typed-sum contract suite.
+# This file proves interactions before the filesystem and networking lanes move
+# from integer statuses to Result and Option.
+
+import "modules/checked.cb" as checked
+
+enum Outcome: {
+    Good,
+    Bad
+}
+
+def fail_at(index: i64, failure: i64) -> Result[i64, i64]: {
+    if index == failure: {
+        return err(31)
+    }
+    return ok(index)
+}
+
+def loop_region_result(limit: i64, failure: i64) -> Result[i64, i64]: {
+    with region scratch: {
+        work = scratch.alloc_f32(16)
+        fill_f32(work, 1.0)
+        total = 0
+        for i in limit: {
+            step = fail_at(i, failure)?
+            total = total + step
+        }
+        assert(work[15] == 1.0)
+        return ok(total)
+    }
+}
+
+def every_match_arm_returns(outcome: Outcome) -> Result[i64, i64]: {
+    match outcome: {
+        case Outcome.Good: {
+            return ok(41)
+        }
+        case Outcome.Bad: {
+            return err(42)
+        }
+    }
+}
+
+def typed_widths(value: i64) -> Result[i32, bool]: {
+    if value >= 0: {
+        return ok(7)
+    }
+    return err(true)
+}
+
+def module_chain(value: i64) -> Result[i64, i64]: {
+    received = checked.module_read(value)?
+    return ok(received + 1)
+}
+
+def parallel_fallback(values: []f32) -> Result[i64, i64]: {
+    total = 0
+    @parallel: {
+        for i in len(values): {
+            step = fail_at(i, -1)?
+            total = total + step
+        }
+    }
+    return ok(total)
+}
+
+def test_sum_interactions(): {
+    nested_ok = module_chain(4)
+    nested_err = module_chain(-1)
+    loop_ok = loop_region_result(4, -1)
+    loop_err = loop_region_result(4, 2)
+    good = every_match_arm_returns(Outcome.Good)
+    bad = every_match_arm_returns(Outcome.Bad)
+    width_ok = typed_widths(1)
+    width_err = typed_widths(-1)
+    values = [1.0, 1.0, 1.0, 1.0]
+    parallel_ok = parallel_fallback(values)
+
+    assert(is_ok(nested_ok))
+    assert(unwrap_ok(nested_ok) == 15)
+    assert(is_ok(nested_err) == 0)
+    assert(unwrap_err(nested_err) == 23)
+    assert(is_ok(loop_ok))
+    assert(unwrap_ok(loop_ok) == 6)
+    assert(is_ok(loop_err) == 0)
+    assert(unwrap_err(loop_err) == 31)
+    assert(is_ok(good))
+    assert(unwrap_ok(good) == 41)
+    assert(is_ok(bad) == 0)
+    assert(unwrap_err(bad) == 42)
+    assert(is_ok(width_ok))
+    assert(unwrap_ok(width_ok) == 7)
+    assert(is_ok(width_err) == 0)
+    assert(unwrap_err(width_err) == 1)
+    assert(is_ok(parallel_ok))
+    assert(unwrap_ok(parallel_ok) == 6)
+    return 0
+}

@@ -1,0 +1,9 @@
+struct RequestView: {
+    body: readonly []u8,
+}
+
+def invalid_view_return(body: []u8) -> RequestView: {
+    let request: RequestView
+    request.body = body
+    return request
+}

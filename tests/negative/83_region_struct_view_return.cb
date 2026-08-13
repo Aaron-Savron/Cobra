@@ -1,0 +1,12 @@
+struct RequestView: {
+    body: readonly []u8,
+}
+
+def invalid_region_view_return() -> RequestView: {
+    with region scratch(64): {
+        raw = scratch.alloc_u8(8)
+        let request: RequestView
+        request.body = raw
+        return request
+    }
+}

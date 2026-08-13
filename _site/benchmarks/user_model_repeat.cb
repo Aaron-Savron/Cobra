@@ -1,0 +1,52 @@
+# User-authored MLP workload.
+# GEMM is a base primitive; bias, ReLU, and the model composition remain
+# ordinary Cobra code so this measures the foundation users actually write.
+
+def mlp_forward(input: []f32, w1: []f32, b1: []f32, hidden: []f32,
+                w2: []f32, b2: []f32, output: []f32): {
+    matmul_f32(input, w1, hidden, 1, 32, 16)
+    for i in len(hidden): {
+        hidden[i] = hidden[i] + b1[i]
+        if hidden[i] < 0.0: {
+            hidden[i] = 0.0
+        }
+    }
+    matmul_f32(hidden, w2, output, 1, 8, 32)
+    for i in len(output): {
+        output[i] = output[i] + b2[i]
+    }
+    return 0
+}
+
+def main(): {
+    input = alloc_f32(16)
+    w1 = alloc_f32(512)
+    b1 = alloc_f32(32)
+    hidden = alloc_f32(32)
+    w2 = alloc_f32(256)
+    b2 = alloc_f32(8)
+    output = alloc_f32(8)
+
+    fill_f32(input, 1.0)
+    fill_f32(w1, 0.5)
+    fill_f32(b1, 0.0)
+    fill_f32(w2, 0.5)
+    fill_f32(b2, 0.0)
+
+    iterations = 1000
+    while iterations > 0: {
+        mlp_forward(input, w1, b1, hidden, w2, b2, output)
+        iterations = iterations - 1
+    }
+
+    # hidden = 16*0.5 = 8; output = 32*8*0.5 = 128; 8 outputs sum to 1024.
+    assert(sum_f32(output) == 1024.0)
+    free(input)
+    free(w1)
+    free(b1)
+    free(hidden)
+    free(w2)
+    free(b2)
+    free(output)
+    return 0
+}

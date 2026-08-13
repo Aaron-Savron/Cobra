@@ -1,0 +1,13 @@
+# Integer widths are not interchangeable inside a typed Result contract.
+
+def narrow_error(value: i64) -> Result[i64, i32]: {
+    if value < 0: {
+        return err(3)
+    }
+    return ok(value)
+}
+
+def bad_width(value: i64) -> Result[i64, i64]: {
+    received = narrow_error(value)?
+    return ok(received)
+}

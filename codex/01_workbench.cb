@@ -1,0 +1,34 @@
+struct AppConfig: {
+    retries: i64,
+    scale: f32,
+    enabled: bool
+}
+
+def test_config_and_collections(): {
+    let config: AppConfig
+    config.retries = 3
+    config.scale = 1.5
+    config.enabled = true
+
+    let values: list[i64] = [4, 8, 15]
+    append(values, 16)
+    assert(len(values) == 4)
+    assert(values[2] == 15)
+
+    let counts: dict[string]i64 = {"ok": 3, "failed": 1}
+    assert(counts["ok"] == 3)
+    assert(config.enabled)
+}
+
+def test_string_workflow(): {
+    let name: string = "cobra"
+    let message: string = "building with " + name
+    assert(contains(message, "cobra"))
+    assert(starts_with(message, "building"))
+    print(message)
+}
+
+def main(): {
+    test_config_and_collections()
+    test_string_workflow()
+}

@@ -1,0 +1,6 @@
+import "modules/math.cb" as math
+
+def test_manifest_dependency() -> i64: {
+    assert(math.module_add(20, 22) == 42)
+    return 0
+}

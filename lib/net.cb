@@ -1,0 +1,405 @@
+# Cobra Networking Library (lib/net.cb)
+# TCP sockets as userland Cobra on the libc ABI bridge. Checked operations use
+# scalar i64 descriptors and Result values. Raw net_* helpers remain available
+# for compatibility with existing low-level programs.
+#
+# Stable checked error codes:
+#   1 = generic network I/O failure
+#   2 = invalid argument
+#   3 = closed or invalid connection
+#   4 = address already in use
+#   5 = connection refused or failed
+#   6 = timeout
+#   7 = interrupted operation
+#
+# recv success with 0 means the peer closed its connection. send success always
+# returns the number of bytes accepted by the kernel, including short writes.
+
+import c "libc.so.6" (socket, bind, listen, accept, connect, send, recv,
+                      close, setsockopt, htons, ntohs, inet_addr, fcntl,
+                      getsockname, socketpair, __errno_location, memcpy)
+
+# Map Linux errno values to Cobra's stable network contract. The raw platform
+# number never crosses the public API.
+def net_classify_errno(code: i64) -> i64: {
+    if code == 9: {
+        return 3
+    }
+    if code == 32: {
+        return 3
+    }
+    if code == 107: {
+        return 3
+    }
+    if code == 22: {
+        return 2
+    }
+    if code == 98: {
+        return 4
+    }
+    if code == 111: {
+        return 5
+    }
+    if code == 110: {
+        return 6
+    }
+    if code == 4: {
+        return 7
+    }
+    return 1
+}
+
+# Read errno immediately after a failed libc operation and classify it.
+def net_last_error() -> i64: {
+    errno_ptr = __errno_location()
+    raw = alloc_i64(1)
+    memcpy(raw, errno_ptr, 4)
+    code = raw[0]
+    free(raw)
+    return net_classify_errno(code)
+}
+
+# IPv4 TCP socket descriptor, or -1.
+def net_socket() -> i64: {
+    return socket(2, 1, 0)
+}
+
+# Checked IPv4 TCP socket creation.
+def net_socket_checked() -> Result[i64, i64]: {
+    fd = socket(2, 1, 0)
+    if fd < 0: {
+        return err(net_last_error())
+    }
+    return ok(fd)
+}
+
+# Close a descriptor. Returns 0 on success.
+def net_close(fd: i64) -> i64: {
+    return close(fd)
+}
+
+# Checked close. Closing an already closed descriptor maps to error 3.
+def net_close_checked(fd: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    status = close(fd)
+    if status != 0: {
+        return err(net_last_error())
+    }
+    return ok(0)
+}
+
+# Allow immediate rebinding of the same port after close.
+def net_reuseaddr(fd: i64) -> i64: {
+    opt = alloc_i64(1)
+    opt[0] = 1
+    status = setsockopt(fd, 1, 2, opt, 4)
+    free(opt)
+    return status
+}
+
+# Checked SO_REUSEADDR setup.
+def net_reuseaddr_checked(fd: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    opt = alloc_i64(1)
+    opt[0] = 1
+    status = setsockopt(fd, 1, 2, opt, 4)
+    if status != 0: {
+        code = net_last_error()
+        free(opt)
+        return err(code)
+    }
+    free(opt)
+    return ok(0)
+}
+
+# Bind to 0.0.0.0:port. Returns 0 on success.
+def net_bind(fd: i64, port: i64) -> i64: {
+    addr = alloc_i64(2)
+    p = htons(port)
+    addr[0] = 2 + p * 65536
+    status = bind(fd, addr, 16)
+    free(addr)
+    return status
+}
+
+# Checked bind. Port zero asks the kernel to choose an available port.
+def net_bind_checked(fd: i64, port: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    if port < 0: {
+        return err(2)
+    }
+    if port > 65535: {
+        return err(2)
+    }
+    addr = alloc_i64(2)
+    p = htons(port)
+    addr[0] = 2 + p * 65536
+    status = bind(fd, addr, 16)
+    if status != 0: {
+        code = net_last_error()
+        free(addr)
+        return err(code)
+    }
+    free(addr)
+    return ok(0)
+}
+
+# Read the kernel-selected local port after binding port zero.
+def net_port_checked(fd: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    addr = alloc_i64(2)
+    length = alloc_i64(1)
+    length[0] = 16
+    status = getsockname(fd, addr, length)
+    if status != 0: {
+        code = net_last_error()
+        free(length)
+        free(addr)
+        return err(code)
+    }
+    shifted = addr[0] / 65536
+    network_port = shifted - (shifted / 65536) * 65536
+    port = ntohs(network_port)
+    free(length)
+    free(addr)
+    return ok(port)
+}
+
+# Listen with the given backlog. Returns 0 on success.
+def net_listen(fd: i64, backlog: i64) -> i64: {
+    return listen(fd, backlog)
+}
+
+def net_listen_checked(fd: i64, backlog: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    if backlog < 0: {
+        return err(2)
+    }
+    status = listen(fd, backlog)
+    if status != 0: {
+        return err(net_last_error())
+    }
+    return ok(0)
+}
+
+# Accept the next connection. Returns the client descriptor, or -1.
+def net_accept(fd: i64) -> i64: {
+    return accept(fd, 0, 0)
+}
+
+def net_accept_checked(fd: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    client = accept(fd, 0, 0)
+    if client < 0: {
+        return err(net_last_error())
+    }
+    return ok(client)
+}
+
+# Send a whole string. Returns bytes sent, or -1.
+def net_send(fd: i64, data: string) -> i64: {
+    return send(fd, data, len(data), 16384)
+}
+
+def net_send_checked(fd: i64, data: string) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    sent = send(fd, data, len(data), 16384)
+    if sent < 0: {
+        return err(net_last_error())
+    }
+    return ok(sent)
+}
+
+# Checked raw-buffer send for binary protocols.
+def net_send_buffer_checked(fd: i64, buf: []i64, bytes: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    if bytes < 0: {
+        return err(2)
+    }
+    cap = len(buf) * 8
+    if bytes > cap: {
+        bytes = cap
+    }
+    sent = send(fd, buf, bytes, 16384)
+    if sent < 0: {
+        return err(net_last_error())
+    }
+    return ok(sent)
+}
+
+# Receive up to max_bytes into the raw storage of buf. Returns bytes, or -1.
+def net_recv(fd: i64, buf: []i64, max_bytes: i64) -> i64: {
+    return recv(fd, buf, max_bytes, 0)
+}
+
+# Checked byte-buffer receive. []u8 is a one-byte indexed view.
+def net_recv_bytes_checked(fd: i64, buf: []u8, max_bytes: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    if max_bytes < 0: {
+        return err(2)
+    }
+    cap = len(buf)
+    if max_bytes > cap: {
+        max_bytes = cap
+    }
+    received = recv(fd, buf, max_bytes, 0)
+    if received < 0: {
+        return err(net_last_error())
+    }
+    return ok(received)
+}
+
+def net_recv_checked(fd: i64, buf: []i64, max_bytes: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    if max_bytes < 0: {
+        return err(2)
+    }
+    cap = len(buf) * 8
+    if max_bytes > cap: {
+        max_bytes = cap
+    }
+    received = recv(fd, buf, max_bytes, 0)
+    if received < 0: {
+        return err(net_last_error())
+    }
+    return ok(received)
+}
+
+# Checked byte-buffer send. A short positive write remains visible.
+def net_send_bytes_checked(fd: i64, buf: []u8, bytes: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    if bytes < 0: {
+        return err(2)
+    }
+    cap = len(buf)
+    if bytes > cap: {
+        bytes = cap
+    }
+    sent = send(fd, buf, bytes, 16384)
+    if sent < 0: {
+        return err(net_last_error())
+    }
+    return ok(sent)
+}
+
+# Connect to host:port. Returns 0 on success, -1 on error.
+def net_connect(fd: i64, host: string, port: i64) -> i64: {
+    addr = alloc_i64(2)
+    p = htons(port)
+    ip = inet_addr(host)
+    invalid_ip = 2147483647 + 2147483647 + 1
+    if ip == invalid_ip: {
+        free(addr)
+        return -1
+    }
+    addr[0] = 2 + p * 65536 + ip * 65536 * 65536
+    status = connect(fd, addr, 16)
+    free(addr)
+    return status
+}
+
+def net_connect_checked(fd: i64, host: string, port: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    if port < 0: {
+        return err(2)
+    }
+    if port > 65535: {
+        return err(2)
+    }
+    addr = alloc_i64(2)
+    p = htons(port)
+    ip = inet_addr(host)
+    invalid_ip = 2147483647 + 2147483647 + 1
+    if ip == invalid_ip: {
+        free(addr)
+        return err(2)
+    }
+    addr[0] = 2 + p * 65536 + ip * 65536 * 65536
+    status = connect(fd, addr, 16)
+    if status != 0: {
+        code = net_last_error()
+        free(addr)
+        return err(code)
+    }
+    free(addr)
+    return ok(0)
+}
+
+# Switch a descriptor to nonblocking mode. Returns 0 on success.
+def net_set_nonblocking(fd: i64) -> i64: {
+    flags = fcntl(fd, 3, 0)
+    if flags < 0: {
+        return -1
+    }
+    shifted = flags / 2048
+    bit = shifted - (shifted / 2) * 2
+    if bit == 0: {
+        flags = flags + 2048
+    }
+    return fcntl(fd, 4, flags)
+}
+
+def net_set_nonblocking_checked(fd: i64) -> Result[i64, i64]: {
+    if fd < 0: {
+        return err(2)
+    }
+    flags = fcntl(fd, 3, 0)
+    if flags < 0: {
+        return err(net_last_error())
+    }
+    shifted = flags / 2048
+    bit = shifted - (shifted / 2) * 2
+    if bit == 0: {
+        flags = flags + 2048
+    }
+    status = fcntl(fd, 4, flags)
+    if status < 0: {
+        return err(net_last_error())
+    }
+    return ok(0)
+}
+
+# Local full-duplex socket pair for deterministic tests and IPC primitives.
+def net_socket_pair_checked(handles: []i64) -> Result[i64, i64]: {
+    if len(handles) < 2: {
+        return err(2)
+    }
+    packed_handles = alloc_i64(1)
+    status = socketpair(1, 1, 0, packed_handles)
+    if status != 0: {
+        code = net_last_error()
+        free(packed_handles)
+        return err(code)
+    }
+    packed = packed_handles[0]
+    word_size = 2147483647 + 2147483647 + 2
+    high = packed / word_size
+    handles[0] = packed - high * word_size
+    handles[1] = high
+    free(packed_handles)
+    return ok(0)
+}

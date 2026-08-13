@@ -1,0 +1,59 @@
+# Memory contracts: invalid requests must fail without corrupting allocator state.
+
+def test_arena_rejects_invalid_sizes() -> i64: {
+    let state: ArenaState
+    assert(arena_create(state, 64) != 0)
+    assert(arena_alloc(state, -1) == 0)
+    assert(arena_alloc(state, 2147483647 * 4) == 0)
+    assert(arena_alloc(state, 32) != 0)
+    assert(arena_alloc(state, 40) == 0)
+    assert(arena_destroy(state) == 0)
+    assert(state.base == 0)
+    assert(state.cursor == 0)
+    assert(state.capacity == 0)
+    assert(arena_destroy(state) == 0)
+    return 0
+}
+
+def test_pool_rejects_invalid_shapes() -> i64: {
+    let state: PoolState
+    slots = alloc_i64(2)
+    assert(pool_create(state, slots, 0, 2) == 0)
+    assert(pool_create(state, slots, 16, 0) == 0)
+    short_slots = alloc_i64(1)
+    assert(pool_create(state, short_slots, 16, 2) == 0)
+    free(short_slots)
+    huge = 2147483647 * 2147483647
+    assert(pool_create(state, slots, huge, 3) == 0)
+    assert(mem_aligned_alloc(64, 3) == 0)
+    assert(mem_aligned_alloc(64, 8192) == 0)
+    free(slots)
+    return 0
+}
+
+def test_pool_rejects_bad_frees() -> i64: {
+    let state: PoolState
+    slots = alloc_i64(2)
+    assert(pool_create(state, slots, 16, 2) != 0)
+    short_slots = alloc_i64(1)
+    assert(pool_alloc(state, short_slots) == 0)
+    first = pool_alloc(state, slots)
+    assert(first != 0)
+    assert(pool_free(state, short_slots, first) == -1)
+    assert(pool_free(state, slots, first + 1) == -1)
+    foreign = alloc_i64(1)
+    foreign[0] = 7
+    assert(pool_free(state, slots, foreign[0]) == -1)
+    assert(pool_free(state, slots, first) == 0)
+    assert(pool_free(state, slots, first) == -1)
+    assert(pool_destroy(state) == 0)
+    assert(state.base == 0)
+    assert(state.block_size == 0)
+    assert(state.count == 0)
+    assert(state.free_top == 0)
+    assert(pool_destroy(state) == 0)
+    free(short_slots)
+    free(foreign)
+    free(slots)
+    return 0
+}

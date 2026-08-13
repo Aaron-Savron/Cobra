@@ -1,0 +1,6 @@
+import "modules/visibility.cb" as api
+
+def test_module_visibility(): {
+    assert(api.public_value() == 42)
+    return 0
+}

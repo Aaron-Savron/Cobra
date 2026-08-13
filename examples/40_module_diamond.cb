@@ -1,0 +1,7 @@
+import "modules/branch_a.cb"
+import "modules/branch_b.cb"
+
+def test_diamond_imports() -> i64: {
+    assert(branch_a() + branch_b() == 42)
+    return 0
+}

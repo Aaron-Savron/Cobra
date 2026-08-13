@@ -1,0 +1,6 @@
+def module_http_view_handler(request: HttpRequestView) -> Result[HttpResponseMeta, i64]: {
+    let response: HttpResponseMeta
+    response.status = 200
+    response.body_len = len(request.body)
+    return ok(response)
+}

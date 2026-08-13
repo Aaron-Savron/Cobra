@@ -1,0 +1,135 @@
+# Small checked HTTP/1.1 server.
+# It serves three no-body requests on port 18081, then exits. Request parsing,
+# response construction, and socket progress all use typed APIs.
+
+def serve_http_once(server: i64) -> i64 {
+    accepted = net_accept_checked(server)
+    if is_ok(accepted) == 0: {
+        return -1
+    }
+    let client: i64 = unwrap_ok(accepted)
+    request = alloc_u8(4096)
+    received = net_recv_bytes_checked(client, request, 4096)
+    if is_ok(received) == 0: {
+        net_close_checked(client)
+        free(request)
+        return -1
+    }
+    let request_size: i64 = unwrap_ok(received)
+
+    method = alloc_i64(2)
+    path = alloc_i64(2)
+    version = alloc_i64(2)
+    line = http_parse_request_line(request, request_size, method, path, version)
+    if is_ok(line) == 0: {
+        net_close_checked(client)
+        free(version)
+        free(path)
+        free(method)
+        free(request)
+        return -1
+    }
+    let line_start: i64 = unwrap_ok(line)
+
+    content_length = alloc_i64(1)
+    header_count = alloc_i64(1)
+    name = alloc_i64(2)
+    value = alloc_i64(2)
+    headers = http_parse_headers(request, request_size, line_start, content_length, header_count, name, value)
+    if is_ok(headers) == 0: {
+        net_close_checked(client)
+        free(value)
+        free(name)
+        free(header_count)
+        free(content_length)
+        free(version)
+        free(path)
+        free(method)
+        free(request)
+        return -1
+    }
+    if content_length[0] != 0: {
+        net_close_checked(client)
+        free(value)
+        free(name)
+        free(header_count)
+        free(content_length)
+        free(version)
+        free(path)
+        free(method)
+        free(request)
+        return -1
+    }
+
+    response_headers = alloc_u8(45)
+    http_copy_text(response_headers, 0, "Connection: close\r\nContent-Type: text/plain\r\n")
+    response_body = alloc_u8(17)
+    http_copy_text(response_body, 0, "Hello from Cobra\n")
+    response = alloc_u8(256)
+    built = http_build_response(200, response_headers, response_body, response)
+    if is_ok(built) == 0: {
+        net_close_checked(client)
+        free(response)
+        free(response_body)
+        free(response_headers)
+        free(value)
+        free(name)
+        free(header_count)
+        free(content_length)
+        free(version)
+        free(path)
+        free(method)
+        free(request)
+        return -1
+    }
+    let response_size: i64 = unwrap_ok(built)
+    progress = alloc_i64(1)
+    written = http_write_response(client, response, response_size, progress)
+    net_close_checked(client)
+
+    free(progress)
+    free(response)
+    free(response_body)
+    free(response_headers)
+    free(value)
+    free(name)
+    free(header_count)
+    free(content_length)
+    free(version)
+    free(path)
+    free(method)
+    free(request)
+    if is_ok(written) == 0: {
+        return -1
+    }
+    return 0
+}
+
+def main(): {
+    opened = net_socket_checked()
+    if is_ok(opened) == 0: {
+        return 1
+    }
+    let server: i64 = unwrap_ok(opened)
+    net_reuseaddr_checked(server)
+    bound = net_bind_checked(server, 18081)
+    if is_ok(bound) == 0: {
+        net_close_checked(server)
+        return 1
+    }
+    listening = net_listen_checked(server, 8)
+    if is_ok(listening) == 0: {
+        net_close_checked(server)
+        return 1
+    }
+    print("checked HTTP server on 18081")
+    served = 0
+    while served < 3: {
+        if serve_http_once(server) == 0: {
+            served = served + 1
+        }
+    }
+    net_close_checked(server)
+    print("served 3 checked requests")
+    return 0
+}

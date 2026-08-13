@@ -1,0 +1,39 @@
+# Example 4: Cobra v0.3 Control Flow, Loops, and Functions! 
+
+def multiply(x, y): {
+    return x * y
+}
+
+def main(): {
+    print("=== Cobra v0.3: Control Flow & Functions ===")
+    
+    # 1. Custom Function Call with Parameters
+    a = 12
+    b = 5
+    product = multiply(a, b)
+    product?
+    
+    # 2. If / Else Branching
+    if product > 50: {
+        print("Product is greater than 50!")
+    } else: {
+        print("Product is 50 or smaller.")
+    }
+        
+    # 3. While Loop with Inspector!
+    counter = 1
+    sum = 0
+    
+    print("=== Starting While Loop ===")
+    while counter <= 5: {
+        counter?
+        sum = sum + counter
+        counter = counter + 1
+    }
+        
+    sum?
+    print("Final calculated loop sum:")
+    print(sum)
+    
+    return sum
+}

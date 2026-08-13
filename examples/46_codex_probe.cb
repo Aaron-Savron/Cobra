@@ -1,0 +1,29 @@
+# A small Cobra probe: typed functions, comptime evaluation, arrays, loops,
+# and assertions in one native program.
+
+def square(value: i64) -> i64: {
+    return value * value
+}
+
+def sum_values(values: []i64) -> i64: {
+    let total: i64 = 0
+    for value in values: {
+        total = total + value
+    }
+    return total
+}
+
+def test_core_language(): {
+    let expected: i64 = @comptime(6 * 7)
+    let values = [1, 2, 3, 4]
+
+    assert(expected == 42)
+    assert(square(7) == 49)
+    assert(sum_values(values) == 10)
+    return 0
+}
+
+def main(): {
+    print("Cobra probe passed")
+    return 0
+}

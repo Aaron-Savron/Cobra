@@ -1,0 +1,13 @@
+struct RequestView: {
+    body: readonly []u8,
+}
+
+def invalid_extracted_view_after_scope() -> i64 {
+    let request: RequestView
+    with region scratch(64): {
+        raw = scratch.alloc_u8(8)
+        request.body = raw
+        let view: []u8 = request.body
+    }
+    return len(view)
+}

@@ -1,0 +1,7 @@
+struct RequestView: {
+    body: []u8,
+}
+
+def invalid_struct_view_payload() -> Result[RequestView, i64]: {
+    return err(12)
+}

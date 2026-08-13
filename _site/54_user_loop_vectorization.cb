@@ -1,0 +1,139 @@
+# User-loop auto-vectorization regression suite.
+#
+# Every index-pure `for i in len(buffer)` loop over f32 buffers lowers to
+# AVX2 automatically: eight lanes per iteration, zero stack traffic in the
+# vector body, and a bounds-checked scalar tail for the last 0-7 elements.
+# Loops the analysis cannot prove element-wise (accumulators, shifted
+# indices) fall back to the checked scalar loop unchanged. This file locks
+# in both behaviors so a future emitter change cannot silently change speed
+# or semantics.
+
+def scale_buffers(v: []f32, w: []f32, s: f32) -> i64: {
+    for i in len(v): {
+        w[i] = v[i] * s
+    }
+    return 0
+}
+
+def test_affine(): {
+    # values[i] * 2.0 + 1.0 fuses to a single vfmadd213ps per tile.
+    v = alloc_f32(64)
+    fill_f32(v, 1.0)
+    for i in len(v): {
+        v[i] = v[i] * 2.0 + 1.0
+    }
+    assert(v[0] == 3.0)
+    assert(v[63] == 3.0)
+    # Odd length exercises the scalar tail (37 -> 4 full tiles + 5 tail).
+    w = alloc_f32(37)
+    fill_f32(w, 1.0)
+    for i in len(w): {
+        w[i] = w[i] * 2.0 + 1.0
+    }
+    assert(w[36] == 3.0)
+    return 0
+}
+
+def test_relu(): {
+    v = alloc_f32(64)
+    fill_f32(v, -1.0)
+    for i in len(v): {
+        if v[i] < 0.0: {
+            v[i] = 0.0
+        }
+    }
+    assert(v[0] == 0.0)
+    assert(v[63] == 0.0)
+    # Mixed content: negatives clamp, positives survive untouched.
+    for i in len(v): {
+        if i < 32: {
+            v[i] = 2.5
+        }
+    }
+    for i in len(v): {
+        if v[i] < 0.0: {
+            v[i] = 0.0
+        }
+    }
+    assert(v[0] == 2.5)
+    assert(v[40] == 0.0)
+    return 0
+}
+
+def test_relu6(): {
+    v = alloc_f32(40)
+    for i in len(v): {
+        if i < 10: { v[i] = -3.0 }
+        if i >= 10: {
+            if i < 20: { v[i] = 7.0 }
+            if i >= 20: { v[i] = -1.0 }
+        }
+    }
+    # Two clamps in one vectorized body: vmaxps then vminps per tile.
+    for i in len(v): {
+        if v[i] < 0.0: { v[i] = 0.0 }
+        if v[i] > 6.0: { v[i] = 6.0 }
+    }
+    assert(v[0] == 0.0)
+    assert(v[10] == 6.0)
+    assert(v[39] == 0.0)
+    return 0
+}
+
+def test_multibuf(): {
+    v = alloc_f32(50)
+    w = alloc_f32(50)
+    fill_f32(v, 1.0)
+    scale_buffers(v, w, 3.5)
+    assert(w[0] == 3.5)
+    assert(w[49] == 3.5)
+    return 0
+}
+
+def test_accumulator(): {
+    # A scalar accumulator is not element-wise; this must stay checked
+    # scalar and still produce the exact same result.
+    v = alloc_f32(16)
+    fill_f32(v, 1.0)
+    let total: f32 = 0.0
+    for i in len(v): {
+        total = total + v[i]
+    }
+    assert(total == 16.0)
+    return 0
+}
+
+def test_shift(): {
+    # A non-current index (v[i-1]) defeats vectorization; correctness
+    # comes from the scalar path.
+    v = alloc_f32(16)
+    fill_f32(v, 1.0)
+    for i in range(1, len(v)): {
+        v[i] = v[i] + v[i-1]
+    }
+    assert(v[15] == 16.0)
+    return 0
+}
+
+def test_nested_expr(): {
+    # Nested non-leaf subexpressions spill through per-level scratch slots;
+    # the result must match the scalar path exactly.
+    v = alloc_f32(16)
+    w = alloc_f32(16)
+    z = alloc_f32(16)
+    fill_f32(v, 1.0)
+    fill_f32(w, 1.0)
+    fill_f32(z, 1.0)
+    for i in len(v): {
+        v[i] = (v[i] + (w[i] + 1.0)) + (z[i] + 2.0)
+    }
+    assert(v[0] == 6.0)
+    assert(v[15] == 6.0)
+    # v is now 6.0 everywhere: (6 + (1 + (1 + 3))) * 2 = 22
+    for i in len(v): {
+        v[i] = (v[i] + (w[i] + (z[i] + 3.0))) * 2.0
+    }
+    assert(v[0] == 22.0)
+    assert(v[15] == 22.0)
+    return 0
+}

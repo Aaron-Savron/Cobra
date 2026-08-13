@@ -1,0 +1,23 @@
+# Memory-bound @parallel kernel. One read plus one write per element, AVX2
+# vectorized. Scaling here is limited by DRAM bandwidth, not core count;
+# the run measures the honest number.
+
+def par_affine(values: []f32): {
+    @parallel: {
+        for i in len(values): {
+            values[i] = values[i] * 2.0 + 1.0
+        }
+    }
+    return 0
+}
+
+def main(): {
+    n = 33554432
+    a = alloc_f32(n)
+    fill_f32(a, 1.0)
+    for r in range(30): {
+        par_affine(a)
+    }
+    print(sum_f32(a))
+    return 0
+}

@@ -1,0 +1,27 @@
+# Mutable scalar structs use an explicit out parameter. The callee writes
+# directly into caller-owned frame storage.
+def arena_init(state: out ArenaState, base: i64, capacity: i64) -> void {
+    state.base = base
+    state.cursor = 0
+    state.capacity = capacity
+}
+
+def arena_take(state: out ArenaState, size: i64) -> i64 {
+    if state.cursor + size > state.capacity {
+        return 0
+    }
+    result = state.base + state.cursor
+    state.cursor = state.cursor + size
+    return result
+}
+
+def test_mutable_struct_state() -> i64: {
+    let state: ArenaState
+    arena_init(state, 4096, 128)
+    first = arena_take(state, 16)
+    second = arena_take(state, 8)
+    assert(first == 4096)
+    assert(second == 4112)
+    assert(state.cursor == 24)
+    return 0
+}

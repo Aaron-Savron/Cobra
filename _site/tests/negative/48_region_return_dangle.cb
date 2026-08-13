@@ -1,0 +1,9 @@
+# A region releases its backing store at scope exit, so a returned buffer
+# pointing into it would dangle as soon as the caller receives it.
+def broken() -> []f32: {
+    with region scratch: {
+        a = scratch.alloc_f32(16)
+        return a
+    }
+    return a
+}
