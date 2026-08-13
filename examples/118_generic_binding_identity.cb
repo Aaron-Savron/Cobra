@@ -1,0 +1,9 @@
+def same_type[T](left: T, right: T) -> i64: {
+    return 1
+}
+
+def test_generic_binding_identity() -> i64: {
+    assert(same_type(10, 20) == 1)
+    assert(same_type(30, 40) == 1)
+    return 0
+}

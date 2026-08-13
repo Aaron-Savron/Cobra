@@ -64,6 +64,9 @@ emit examples/105_generic_structs.cb "$work/generic-structs.s"
 emit examples/106_generic_struct_module.cb "$work/generic-struct-module.s"
 emit examples/107_generic_borrowed_views.cb "$work/generic-borrowed-views.s"
 emit examples/108_generic_borrowed_view_module.cb "$work/generic-borrowed-view-module.s"
+emit examples/116_generic_view_functions.cb "$work/generic-view-functions.s"
+emit examples/117_generic_view_function_module.cb "$work/generic-view-function-module.s"
+emit examples/118_generic_binding_identity.cb "$work/generic-binding-identity.s"
 
 maybe=$(body "$work/sums.s" maybe_value)
 checked=$(body "$work/sums.s" checked_value)
@@ -105,6 +108,13 @@ generic_borrowed_f32=$(body "$work/generic-borrowed-views.s" view_len_f32)
 generic_borrowed_u8=$(body "$work/generic-borrowed-views.s" view_len_u8)
 generic_borrowed_calls=$(body "$work/generic-borrowed-views.s" test_generic_borrowed_views)
 generic_borrowed_module_calls=$(body "$work/generic-borrowed-view-module.s" test_generic_borrowed_view_module)
+generic_view_count_i64=$(body "$work/generic-view-functions.s" count__i64)
+generic_view_count_f32=$(body "$work/generic-view-functions.s" count__f32)
+generic_view_count_u8=$(body "$work/generic-view-functions.s" count__u8)
+generic_view_calls=$(body "$work/generic-view-functions.s" test_generic_view_functions)
+generic_view_module_calls=$(body "$work/generic-view-function-module.s" test_generic_view_function_module)
+generic_binding=$(body "$work/generic-binding-identity.s" test_generic_binding_identity)
+generic_binding_i64=$(body "$work/generic-binding-identity.s" same_type__i64)
 
 # Scalar values, enums, and sums stay in native registers/frame slots. They do
 # not allocate a heap object or enter a runtime type dispatcher.
@@ -264,6 +274,47 @@ if [ "$(grep -Ec 'call[[:space:]]+module_view_len_i64@PLT' <<<"$generic_borrowed
 fi
 require_text "module generic borrowed f32 call" "$generic_borrowed_module_calls" 'call[[:space:]]+module_view_len_f32@PLT'
 require_text "module generic borrowed u8 call" "$generic_borrowed_module_calls" 'call[[:space:]]+module_view_len_u8@PLT'
+
+# Generic functions over borrowed generic-view structs reuse the same
+# specialized packed layout and one-pointer struct ABI as direct View calls.
+for generic_view_body in "$generic_view_count_i64" "$generic_view_count_f32" "$generic_view_count_u8"; do
+    require_text "generic view struct field pointer" "$generic_view_body" 'mov rax, QWORD PTR \[rsi\+0\]'
+    require_text "generic view struct field length" "$generic_view_body" 'mov rax, QWORD PTR \[rsi\+8\]'
+    forbid_text "generic view struct runtime dispatch" "$generic_view_body" 'call[[:space:]]+cobra_'
+done
+require_text "generic view i64 call" "$generic_view_calls" 'call[[:space:]]+count__i64@PLT'
+require_text "generic view f32 call" "$generic_view_calls" 'call[[:space:]]+count__f32@PLT'
+require_text "generic view u8 call" "$generic_view_calls" 'call[[:space:]]+count__u8@PLT'
+if [ "$(grep -Ec 'call[[:space:]]+count__i64@PLT' <<<"$generic_view_calls")" -ne 2 ]; then
+    printf '%s\n' 'contract failed: repeated generic View i64 specialization was not reused' >&2
+    exit 1
+fi
+if grep -Eq '^count:' "$work/generic-view-functions.s"; then
+    printf '%s\n' 'contract failed: unspecialized or malformed generic View symbols were emitted' >&2
+    exit 1
+fi
+if [ "$(grep -Ec '^count__(i64|f32|u8):' "$work/generic-view-functions.s")" -ne 3 ]; then
+    printf '%s\n' 'contract failed: generic View specializations were duplicated or missing' >&2
+    exit 1
+fi
+require_text "module generic view i64 call" "$generic_view_module_calls" 'call[[:space:]]+module_count__i64@PLT'
+require_text "module generic view f32 call" "$generic_view_module_calls" 'call[[:space:]]+module_count__f32@PLT'
+require_text "module generic view u8 call" "$generic_view_module_calls" 'call[[:space:]]+module_count__u8@PLT'
+if [ "$(grep -Ec 'call[[:space:]]+module_count__i64@PLT' <<<"$generic_view_module_calls")" -ne 2 ] ||
+   [ "$(grep -Ec '^module_count__(i64|f32|u8):' "$work/generic-view-function-module.s")" -ne 3 ]; then
+    printf '%s\n' 'contract failed: module generic View specialization reuse is incorrect' >&2
+    exit 1
+fi
+
+# Repeated occurrences of T in one signature must bind to one canonical scalar
+# argument and reuse one specialization independently of generated spelling.
+require_text "repeated generic binding calls" "$generic_binding" 'call[[:space:]]+same_type__i64@PLT'
+if [ "$(grep -Ec 'call[[:space:]]+same_type__i64@PLT' <<<"$generic_binding")" -ne 2 ] ||
+   [ "$(grep -Ec '^same_type__i64:' "$work/generic-binding-identity.s")" -ne 1 ]; then
+    printf '%s\n' 'contract failed: repeated generic binding specialization was duplicated or missing' >&2
+    exit 1
+fi
+forbid_text "repeated generic binding runtime dispatch" "$generic_binding_i64" 'call[[:space:]]+cobra_'
 
 # A simple match is compares and branches, not a boxed state machine.
 require_text "enum compare" "$phase" 'cmp[[:space:]]'

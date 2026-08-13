@@ -1,0 +1,16 @@
+struct View[T]: {
+    data: readonly []T,
+}
+
+def bad_heap[T](view: View[T]) -> i64: {
+    heap saved: View[T] = view
+    return 0
+}
+
+def use_bad_heap() -> i64 {
+    data = alloc_i64(1)
+    let view: View[i64]
+    view.data = data
+    bad_heap(view)
+    return 0
+}

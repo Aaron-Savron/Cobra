@@ -105,6 +105,26 @@ int main(void) {
                                  COBRA_OWNERSHIP_VALUE,
                                  COBRA_MUTABILITY_DEFAULT, -1));
 
+    /* Nested generic composition reuses the same recursive substitution and
+       remains independent of the generated specialization spelling. */
+    CobraType *outer_template = cobra_type_named(&generic_struct_arena,
+                                                  COBRA_TYPE_STRUCT, "Outer");
+    assert(outer_template);
+    assert(cobra_type_add_generic_arg(outer_template, struct_parameter));
+    assert(cobra_type_add_field(outer_template, "inner", box_template,
+                                COBRA_OWNERSHIP_VALUE,
+                                COBRA_MUTABILITY_DEFAULT, -1));
+    CobraType *outer_i64 = cobra_type_instantiate_struct(&generic_struct_arena,
+                                                         outer_template, struct_parameter,
+                                                         i64, "Outer__i64");
+    CobraType *outer_i64_alias = cobra_type_instantiate_struct(&generic_struct_arena,
+                                                               outer_template, struct_parameter,
+                                                               i64, "Outer_spelling_independent");
+    assert(outer_i64 && outer_i64_alias && outer_i64 == outer_i64_alias);
+    assert(outer_i64->fields[0].type == box_i64);
+    assert(outer_i64->fields[0].offset == 0 && outer_i64->size == 8);
+    assert(outer_i64->template_origin == outer_template);
+
     /* Generic borrowed-field structs substitute the element while preserving
        the field's borrowed/readonly contract and two-word slice layout. */
     CobraType *view_parameter = cobra_type_make(&generic_struct_arena,

@@ -1,0 +1,26 @@
+struct View[T]: {
+    data: readonly []T,
+}
+
+def count[T](view: View[T]) -> i64: {
+    return len(view.data)
+}
+
+def test_generic_view_functions() -> i64: {
+    data_i64 = alloc_i64(3)
+    let view_i64: View[i64]
+    view_i64.data = data_i64
+    assert(count(view_i64) == 3)
+    assert(count(view_i64) == 3)
+
+    data_f32 = alloc_f32(5)
+    let view_f32: View[f32]
+    view_f32.data = data_f32
+    assert(count(view_f32) == 5)
+
+    data_u8 = alloc_u8(7)
+    let view_u8: View[u8]
+    view_u8.data = data_u8
+    assert(count(view_u8) == 7)
+    return 0
+}

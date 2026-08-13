@@ -318,7 +318,7 @@ static bool equal_type(const CobraType *left, const CobraType *right,
     if (left == right) return true;
     if (!left || !right || left->kind != right->kind ||
         left->ownership != right->ownership || left->mutability != right->mutability ||
-        left->region_id != right->region_id || strcmp(left->name, right->name) != 0 ||
+        left->region_id != right->region_id ||
         left->generic_arg_count != right->generic_arg_count ||
         left->field_count != right->field_count) return false;
 
@@ -327,6 +327,16 @@ static bool equal_type(const CobraType *left, const CobraType *right,
     }
     if (*pair_count >= COBRA_TYPE_EQUAL_PAIRS) return false;
     pairs[(*pair_count)++] = (TypePair){left, right};
+
+    if (left->template_origin && right->template_origin) {
+        if (!equal_type(left->template_origin, right->template_origin, pairs, pair_count)) return false;
+    } else if (!left->template_origin && !right->template_origin) {
+        if (strcmp(left->name, right->name) != 0) return false;
+    } else if (left->kind == COBRA_TYPE_STRUCT || right->kind == COBRA_TYPE_STRUCT) {
+        /* Struct specialization identity is provenance-sensitive. A generated
+           name must never make a struct equal to an unrelated declaration. */
+        return false;
+    }
 
     for (size_t i = 0; i < left->generic_arg_count; i++) {
         if (!equal_type(left->generic_args[i], right->generic_args[i], pairs, pair_count)) return false;
@@ -428,9 +438,82 @@ static bool scalar_generic_argument(const CobraType *type) {
     }
 }
 
-static bool slice_type_kind(CobraTypeKind kind) {
+bool cobra_type_is_scalar(const CobraType *type) {
+    return scalar_generic_argument(type);
+}
+
+bool cobra_type_is_slice_kind(CobraTypeKind kind) {
     return kind == COBRA_TYPE_SLICE || kind == COBRA_TYPE_SLICE_F32 ||
            kind == COBRA_TYPE_SLICE_U8;
+}
+
+bool cobra_type_is_borrowed_view(const CobraType *type) {
+    if (!type || type->kind != COBRA_TYPE_STRUCT || !type->finalized ||
+        type->generic_arg_count != 1 || type->field_count != 1) return false;
+    const CobraTypeField *field = &type->fields[0];
+    return field->ownership == COBRA_OWNERSHIP_BORROWED &&
+           field->mutability == COBRA_MUTABILITY_READONLY &&
+           field->region_id == -1 && field->type &&
+           cobra_type_is_slice_kind(field->type->kind) &&
+           field->type->generic_arg_count == 1 &&
+           scalar_generic_argument(field->type->generic_args[0]) &&
+           scalar_generic_argument(type->generic_args[0]) &&
+           field->type->generic_args[0]->kind == type->generic_args[0]->kind;
+}
+
+static bool generic_template_identity(const CobraType *pattern,
+                                      const CobraType *origin) {
+    if (!pattern || !origin || pattern->kind != COBRA_TYPE_STRUCT ||
+        origin->kind != COBRA_TYPE_STRUCT || strcmp(pattern->name, origin->name) != 0 ||
+        pattern->generic_arg_count != origin->generic_arg_count ||
+        pattern->ownership != origin->ownership ||
+        pattern->mutability != origin->mutability || pattern->region_id != origin->region_id)
+        return false;
+    for (size_t i = 0; i < pattern->generic_arg_count; i++) {
+        const CobraType *left = pattern->generic_args[i];
+        const CobraType *right = origin->generic_args[i];
+        if (left->kind == COBRA_TYPE_GENERIC_PARAM && right->kind == COBRA_TYPE_GENERIC_PARAM) {
+            if (strcmp(left->name, right->name) != 0) return false;
+        } else if (!cobra_type_equal(left, right)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool cobra_type_bind_generic(const CobraType *pattern, const CobraType *actual,
+                             const CobraType *parameter, const CobraType **binding) {
+    if (!pattern || !actual || !parameter || !binding) return false;
+    if (pattern == parameter) {
+        if (!scalar_generic_argument(actual)) return false;
+        if (!*binding) {
+            *binding = actual;
+            return true;
+        }
+        return cobra_type_equal(*binding, actual);
+    }
+    if (cobra_type_is_slice_kind(pattern->kind) && cobra_type_is_slice_kind(actual->kind)) {
+        if (pattern->generic_arg_count != actual->generic_arg_count) return false;
+    } else if (pattern->kind == COBRA_TYPE_STRUCT && actual->kind == COBRA_TYPE_STRUCT) {
+        /* A concrete specialization carries its originating canonical template.
+           Never infer identity from the generated View__i64 spelling: a spoofed
+           named struct has no template_origin and cannot bind here. */
+        if (!generic_template_identity(pattern, actual->template_origin) ||
+            !cobra_type_is_borrowed_view(actual) ||
+            pattern->generic_arg_count != actual->generic_arg_count) return false;
+    } else if (pattern->kind != actual->kind ||
+               pattern->generic_arg_count != actual->generic_arg_count) {
+        return false;
+    }
+    for (size_t i = 0; i < pattern->generic_arg_count; i++) {
+        if (!cobra_type_bind_generic(pattern->generic_args[i], actual->generic_args[i],
+                                     parameter, binding)) return false;
+    }
+    return true;
+}
+
+static bool slice_type_kind(CobraTypeKind kind) {
+    return cobra_type_is_slice_kind(kind);
 }
 
 static CobraTypeKind slice_kind_for_element(CobraTypeKind element) {
@@ -440,13 +523,172 @@ static CobraTypeKind slice_kind_for_element(CobraTypeKind element) {
     return COBRA_TYPE_UNKNOWN;
 }
 
-static bool type_contains_parameter(const CobraType *type, const CobraType *parameter) {
-    if (!type || !parameter) return false;
-    if (type == parameter) return true;
+static const CobraType *binding_value(const CobraType *type,
+                                      const CobraTypeBinding *bindings,
+                                      size_t binding_count) {
+    if (!type || !bindings) return NULL;
+    for (size_t i = 0; i < binding_count; i++) {
+        if (bindings[i].parameter == type) return bindings[i].argument;
+    }
+    return NULL;
+}
+
+static bool type_has_binding(const CobraType *type,
+                             const CobraTypeBinding *bindings,
+                             size_t binding_count) {
+    if (!type) return false;
+    if (binding_value(type, bindings, binding_count)) return true;
     for (size_t i = 0; i < type->generic_arg_count; i++) {
-        if (type_contains_parameter(type->generic_args[i], parameter)) return true;
+        if (type_has_binding(type->generic_args[i], bindings, binding_count)) return true;
+    }
+    for (size_t i = 0; i < type->field_count; i++) {
+        if (type_has_binding(type->fields[i].type, bindings, binding_count)) return true;
     }
     return false;
+}
+
+static bool immutable_nested_struct(const CobraType *type) {
+    if (!type || type->kind != COBRA_TYPE_STRUCT || !type->finalized) return false;
+    for (size_t i = 0; i < type->field_count; i++) {
+        const CobraTypeField *field = &type->fields[i];
+        if (field->ownership != COBRA_OWNERSHIP_VALUE ||
+            field->mutability != COBRA_MUTABILITY_DEFAULT || field->region_id != -1)
+            return false;
+        if (!scalar_generic_argument(field->type) && !immutable_nested_struct(field->type))
+            return false;
+    }
+    return true;
+}
+
+static bool substituted_field_allowed(const CobraTypeField *source,
+                                      const CobraType *field_type,
+                                      const CobraTypeBinding *bindings,
+                                      size_t binding_count) {
+    if (!source || !field_type) return false;
+    if (source->ownership == COBRA_OWNERSHIP_VALUE &&
+        source->mutability == COBRA_MUTABILITY_DEFAULT && source->region_id == -1) {
+        return scalar_generic_argument(field_type) || immutable_nested_struct(field_type);
+    }
+    return source->ownership == COBRA_OWNERSHIP_BORROWED &&
+           source->mutability == COBRA_MUTABILITY_READONLY && source->region_id == -1 &&
+           /* A borrowed field is part of this generic lane only when its
+              element contract actually carries the substituted parameter. */
+           type_has_binding(source->type, bindings, binding_count) &&
+           slice_type_kind(field_type->kind) && field_type->generic_arg_count == 1 &&
+           scalar_generic_argument(field_type->generic_args[0]);
+}
+
+static void derived_specialization_name(const CobraType *type,
+                                         const CobraType *argument,
+                                         char *out, size_t capacity) {
+    if (!out || capacity == 0) return;
+    if (!type || type->kind != COBRA_TYPE_STRUCT || !type->name[0] || !argument) {
+        if (out && capacity) out[0] = '\0';
+        return;
+    }
+    snprintf(out, capacity, "%.46s__%.15s", type->name, cobra_type_kind_name(argument->kind));
+}
+
+static CobraType *intern_finalized_type(CobraTypeArena *arena, CobraType *candidate);
+
+static CobraType *substitute_recursive(CobraTypeArena *arena,
+                                       const CobraType *type,
+                                       const CobraTypeBinding *bindings,
+                                       size_t binding_count,
+                                       const char *name_override,
+                                       bool top_level) {
+    if (!arena || !type) return NULL;
+    const CobraType *bound = binding_value(type, bindings, binding_count);
+    if (bound) return (CobraType *)bound;
+    if (type->kind == COBRA_TYPE_GENERIC_PARAM) {
+        type_error(arena, "generic parameter '%s' remains unresolved", type->name);
+        return NULL;
+    }
+    if (!type_has_binding(type, bindings, binding_count)) return (CobraType *)type;
+
+    const CobraType *arguments[COBRA_MAX_TYPE_ARGS] = {0};
+    for (size_t i = 0; i < type->generic_arg_count; i++) {
+        arguments[i] = substitute_recursive(arena, type->generic_args[i], bindings,
+                                            binding_count, NULL, false);
+        if (!arguments[i]) return NULL;
+    }
+
+    CobraTypeKind kind = type->kind;
+    if (slice_type_kind(kind)) {
+        if (type->ownership != COBRA_OWNERSHIP_BORROWED ||
+            type->mutability != COBRA_MUTABILITY_READONLY ||
+            type->generic_arg_count != 1 ||
+            !scalar_generic_argument(arguments[0])) {
+            type_error(arena, "generic slices must remain borrowed readonly scalar views");
+            return NULL;
+        }
+        CobraTypeKind inferred = slice_kind_for_element(arguments[0]->kind);
+        if (inferred == COBRA_TYPE_UNKNOWN ||
+            (kind != COBRA_TYPE_SLICE && kind != inferred)) {
+            type_error(arena, "generic slice element does not match its ABI kind");
+            return NULL;
+        }
+        kind = inferred;
+    }
+
+    char nested_name[COBRA_MAX_IDENT_LEN] = "";
+    const char *name = type->name[0] ? type->name : NULL;
+    if (type->kind == COBRA_TYPE_STRUCT) {
+        if (top_level && name_override && name_override[0]) name = name_override;
+        else if (!top_level) {
+            derived_specialization_name(type, arguments[0], nested_name, sizeof(nested_name));
+            if (nested_name[0]) name = nested_name;
+        }
+    }
+    CobraType *candidate = cobra_type_named(arena, kind, name);
+    if (!candidate) {
+        type_error(arena, "could not allocate canonical generic specialization");
+        return NULL;
+    }
+    candidate->template_origin = type->template_origin ? type->template_origin : type;
+    candidate->ownership = type->ownership;
+    candidate->mutability = type->mutability;
+    candidate->region_id = type->region_id;
+    for (size_t i = 0; i < type->generic_arg_count; i++) {
+        if (!cobra_type_add_generic_arg(candidate, arguments[i])) {
+            type_error(arena, "generic specialization has too many type arguments");
+            return NULL;
+        }
+    }
+    for (size_t i = 0; i < type->field_count; i++) {
+        const CobraTypeField *source = &type->fields[i];
+        const CobraType *field_type = substitute_recursive(arena, source->type, bindings,
+                                                            binding_count, NULL, false);
+        if (!field_type || !substituted_field_allowed(source, field_type,
+                                                        bindings, binding_count)) {
+            type_error(arena, "generic field '%s' has an unsupported ownership or ABI contract",
+                       source->name);
+            return NULL;
+        }
+        if (!cobra_type_add_field(candidate, source->name, field_type,
+                                  source->ownership, source->mutability,
+                                  source->region_id)) return NULL;
+    }
+    if (!cobra_type_validate(arena, candidate)) return NULL;
+    return intern_finalized_type(arena, candidate);
+}
+
+CobraType *cobra_type_substitute(CobraTypeArena *arena,
+                                 const CobraType *template_type,
+                                 const CobraTypeBinding *bindings,
+                                 size_t binding_count,
+                                 const char *specialized_name) {
+    if (!arena || !template_type || !bindings || binding_count == 0) return NULL;
+    for (size_t i = 0; i < binding_count; i++) {
+        if (!bindings[i].parameter || bindings[i].parameter->kind != COBRA_TYPE_GENERIC_PARAM ||
+            !bindings[i].argument || !scalar_generic_argument(bindings[i].argument)) {
+            type_error(arena, "generic substitution requires scalar arguments and placeholders");
+            return NULL;
+        }
+    }
+    arena->error[0] = '\0';
+    return substitute_recursive(arena, template_type, bindings, binding_count,
+                                specialized_name, true);
 }
 
 static CobraType *intern_finalized_type(CobraTypeArena *arena, CobraType *candidate) {
@@ -464,73 +706,8 @@ CobraType *cobra_type_instantiate(CobraTypeArena *arena,
                                   const CobraType *parameter,
                                   const CobraType *argument) {
     if (!arena || !template_type || !parameter || !argument) return NULL;
-    if (parameter->kind != COBRA_TYPE_GENERIC_PARAM) {
-        type_error(arena, "generic substitution requires a generic parameter placeholder");
-        return NULL;
-    }
-    if (!scalar_generic_argument(argument)) {
-        type_error(arena, "generic substitution requires a scalar argument");
-        return NULL;
-    }
-
-    bool is_sum = template_type->kind == COBRA_TYPE_OPTION ||
-                  template_type->kind == COBRA_TYPE_RESULT;
-    bool is_slice = slice_type_kind(template_type->kind);
-    if (!is_sum && !is_slice) {
-        type_error(arena, "this generic slice only instantiates Option, Result, or readonly slices");
-        return NULL;
-    }
-    if (is_slice && (template_type->mutability != COBRA_MUTABILITY_READONLY ||
-                     template_type->ownership != COBRA_OWNERSHIP_BORROWED)) {
-        type_error(arena, "generic slice parameters must be borrowed and readonly");
-        return NULL;
-    }
-
-    size_t required = template_type->kind == COBRA_TYPE_RESULT ? 2 : 1;
-    if (template_type->generic_arg_count != required ||
-        !type_contains_parameter(template_type, parameter)) {
-        type_error(arena, "generic parameter is not present in the template type");
-        return NULL;
-    }
-
-    const CobraType *components[2] = {0};
-    for (size_t i = 0; i < required; i++) {
-        const CobraType *component = template_type->generic_args[i];
-        components[i] = component == parameter ? argument : component;
-        if (components[i]->kind == COBRA_TYPE_GENERIC_PARAM) {
-            type_error(arena, "generic instantiation leaves an unresolved parameter");
-            return NULL;
-        }
-    }
-
-    CobraTypeKind instantiated_kind = template_type->kind;
-    if (is_slice) {
-        CobraTypeKind element_kind = components[0]->kind;
-        CobraTypeKind inferred_kind = slice_kind_for_element(element_kind);
-        if (inferred_kind == COBRA_TYPE_UNKNOWN) {
-            type_error(arena, "readonly generic slices currently support []i64, []f32, and []u8");
-            return NULL;
-        }
-        if (template_type->kind != COBRA_TYPE_SLICE &&
-            template_type->kind != inferred_kind) {
-            type_error(arena, "generic slice element does not match its ABI kind");
-            return NULL;
-        }
-        instantiated_kind = inferred_kind;
-    }
-
-    CobraType *candidate = cobra_type_make(
-        arena, instantiated_kind, template_type->name,
-        components[0], required == 2 ? components[1] : NULL,
-        NULL, NULL,
-        template_type->ownership, template_type->mutability,
-        template_type->region_id);
-    if (!candidate) {
-        type_error(arena, "could not construct instantiated generic descriptor");
-        return NULL;
-    }
-    if (!cobra_type_validate(arena, candidate)) return NULL;
-    return intern_finalized_type(arena, candidate);
+    CobraTypeBinding binding = {parameter, argument};
+    return cobra_type_substitute(arena, template_type, &binding, 1, NULL);
 }
 
 CobraType *cobra_type_instantiate_struct(CobraTypeArena *arena,
@@ -540,86 +717,8 @@ CobraType *cobra_type_instantiate_struct(CobraTypeArena *arena,
                                          const char *specialized_name) {
     if (!arena || !template_type || !parameter || !argument ||
         !specialized_name || !specialized_name[0]) return NULL;
-    if (template_type->kind != COBRA_TYPE_STRUCT ||
-        parameter->kind != COBRA_TYPE_GENERIC_PARAM ||
-        !scalar_generic_argument(argument) ||
-        template_type->generic_arg_count != 1 ||
-        template_type->generic_args[0] != parameter) {
-        type_error(arena, "generic struct substitution requires one scalar parameter");
-        return NULL;
-    }
-    if (template_type->field_count == 0) {
-        type_error(arena, "generic struct '%s' has no fields", template_type->name);
-        return NULL;
-    }
-
-    for (size_t i = 0; i < arena->count; i++) {
-        CobraType *existing = &arena->nodes[i];
-        if (existing->kind != COBRA_TYPE_STRUCT ||
-            strcmp(existing->name, specialized_name) != 0 ||
-            !existing->finalized) continue;
-        if (cobra_type_equal(existing, template_type)) return existing;
-        /* The candidate has not been built yet, so a same-name finalized
-           descriptor is only reusable after the full field shape is checked
-           below. Keep the collision check after construction. */
-    }
-
-    CobraType *candidate = cobra_type_named(arena, COBRA_TYPE_STRUCT, specialized_name);
-    if (!candidate || !cobra_type_add_generic_arg(candidate, argument)) {
-        type_error(arena, "could not construct generic struct specialization");
-        return NULL;
-    }
-    for (size_t i = 0; i < template_type->field_count; i++) {
-        const CobraTypeField *source = &template_type->fields[i];
-        const CobraType *field_type = source->type == parameter ? argument : source->type;
-        bool borrowed_slice = false;
-        if (source->type && slice_type_kind(source->type->kind) &&
-            source->type->generic_arg_count == 1 &&
-            source->type->generic_args[0] == parameter) {
-            if (source->ownership != COBRA_OWNERSHIP_BORROWED ||
-                source->mutability != COBRA_MUTABILITY_READONLY ||
-                source->region_id != -1) {
-                type_error(arena,
-                           "generic slice field '%s' must be borrowed and readonly",
-                           source->name);
-                return NULL;
-            }
-            field_type = cobra_type_instantiate(arena, source->type,
-                                                parameter, argument);
-            borrowed_slice = field_type != NULL;
-        }
-        bool valid_scalar = field_type && field_type->kind != COBRA_TYPE_GENERIC_PARAM &&
-                            scalar_generic_argument(field_type) &&
-                            source->ownership == COBRA_OWNERSHIP_VALUE &&
-                            source->mutability == COBRA_MUTABILITY_DEFAULT &&
-                            source->region_id == -1;
-        if (!valid_scalar && !borrowed_slice) {
-            type_error(arena,
-                       "generic struct field '%s' must be an immutable scalar or readonly borrowed slice",
-                       source->name);
-            return NULL;
-        }
-        if (!cobra_type_add_field(candidate, source->name, field_type,
-                                  source->ownership, source->mutability,
-                                  source->region_id)) {
-            type_error(arena, "generic struct '%s' has too many fields",
-                       template_type->name);
-            return NULL;
-        }
-    }
-    if (!cobra_type_validate(arena, candidate)) return NULL;
-    for (size_t i = 0; i < arena->count; i++) {
-        CobraType *existing = &arena->nodes[i];
-        if (existing == candidate || !existing->finalized ||
-            existing->kind != COBRA_TYPE_STRUCT ||
-            strcmp(existing->name, specialized_name) != 0) continue;
-        if (cobra_type_equal(existing, candidate)) return existing;
-        type_error(arena,
-                   "generic struct specialization name collision for '%s'",
-                   specialized_name);
-        return NULL;
-    }
-    return intern_finalized_type(arena, candidate);
+    CobraTypeBinding binding = {parameter, argument};
+    return cobra_type_substitute(arena, template_type, &binding, 1, specialized_name);
 }
 
 bool cobra_type_validate(CobraTypeArena *arena, const CobraType *type) {

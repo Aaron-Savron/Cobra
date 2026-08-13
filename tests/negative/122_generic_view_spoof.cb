@@ -1,0 +1,17 @@
+struct View[T]: {
+    data: readonly []T,
+}
+
+struct View__i64: {
+    value: i64,
+}
+
+def count[T](view: View[T]) -> i64: {
+    return len(view.data)
+}
+
+def test_generic_view_spoof() -> i64: {
+    let fake: View__i64
+    assert(count(fake) == 0)
+    return 0
+}

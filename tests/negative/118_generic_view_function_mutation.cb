@@ -1,0 +1,16 @@
+struct View[T]: {
+    data: readonly []T,
+}
+
+def bad_mutation[T](view: View[T]) -> i64: {
+    view.data[0] = 1
+    return 0
+}
+
+def use_bad_mutation() -> i64 {
+    data = alloc_i64(1)
+    let view: View[i64]
+    view.data = data
+    bad_mutation(view)
+    return 0
+}

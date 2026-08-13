@@ -245,6 +245,11 @@ typedef enum {
 typedef struct CobraType CobraType;
 
 typedef struct {
+    const CobraType *parameter;
+    const CobraType *argument;
+} CobraTypeBinding;
+
+typedef struct {
     char name[COBRA_MAX_IDENT_LEN];
     const CobraType *type;
     size_t offset;
@@ -269,6 +274,9 @@ struct CobraType {
     size_t size;
     size_t alignment;
     bool finalized;
+    /* Originating template for a specialization. Generated names are symbols
+       only; canonical identity uses this origin plus substituted arguments. */
+    const CobraType *template_origin;
     /* Set while cobra_type_struct_layout is populating this node, so a
        by-value self or mutual reference during population is detected as a
        cycle instead of recursing forever. */
@@ -292,6 +300,15 @@ CobraType *cobra_type_make(CobraTypeArena *arena, CobraTypeKind kind, const char
                            CobraOwnershipKind ownership, CobraMutabilityKind mutability,
                            int region_id);
 bool cobra_type_add_generic_arg(CobraType *type, const CobraType *argument);
+/* Recursively substitute canonical generic metadata, preserving ownership,
+   mutability, region origin, field layout, ABI finalization, and interning.
+   The current source lane supplies one binding, but the operation is binding
+   list-shaped so later generic parameters do not need another type system. */
+CobraType *cobra_type_substitute(CobraTypeArena *arena,
+                                 const CobraType *template_type,
+                                 const CobraTypeBinding *bindings,
+                                 size_t binding_count,
+                                 const char *specialized_name);
 /* Instantiate one scalar generic parameter in an Option[T] or Result[T, E]
    descriptor. The returned descriptor is finalized, immutable through the
    canonical mutators, and interned against equivalent instantiated types. */
@@ -322,6 +339,11 @@ const char *cobra_type_kind_name(CobraTypeKind kind);
    mirrors the direct emitter's GPR-slot accounting: XMM-class scalars use zero
    GPR slots, slices use two, lists three, dicts two, and indirect sums one. */
 int cobra_type_abi_slots(const CobraType *type);
+bool cobra_type_is_scalar(const CobraType *type);
+bool cobra_type_is_slice_kind(CobraTypeKind kind);
+bool cobra_type_is_borrowed_view(const CobraType *type);
+bool cobra_type_bind_generic(const CobraType *pattern, const CobraType *actual,
+                             const CobraType *parameter, const CobraType **binding);
 
 /* Recursive Descent Parser */
 typedef struct ASTNode ASTNode;
@@ -385,6 +407,10 @@ struct ASTNode {
     /* Specialized clones point back to their generic declaration so recursion
        and duplicate specialization checks remain explicit in IR. */
     const ASTNode *specialized_from;
+    /* Canonical arguments identify a specialization; the generated function
+       name is only an assembly symbol and must not decide reuse. */
+    size_t specialization_arg_count;
+    const CobraType *specialization_args[COBRA_MAX_TYPE_ARGS];
     /* Only the AST_PROGRAM node owns this arena. Child nodes keep descriptors
        from it but leave this pointer NULL. */
     CobraTypeArena *canonical_arena;

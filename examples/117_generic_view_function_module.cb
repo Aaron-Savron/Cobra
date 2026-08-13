@@ -1,0 +1,20 @@
+import "modules/generic_view_function_helpers.cb"
+
+def test_generic_view_function_module() -> i64: {
+    data_i64 = alloc_i64(2)
+    let view_i64: ModuleView[i64]
+    view_i64.data = data_i64
+    assert(module_count(view_i64) == 2)
+    assert(module_count(view_i64) == 2)
+
+    data_f32 = alloc_f32(4)
+    let view_f32: ModuleView[f32]
+    view_f32.data = data_f32
+    assert(module_count(view_f32) == 4)
+
+    data_u8 = alloc_u8(6)
+    let view_u8: ModuleView[u8]
+    view_u8.data = data_u8
+    assert(module_count(view_u8) == 6)
+    return 0
+}

@@ -1,0 +1,7 @@
+struct ModuleView[T]: {
+    data: readonly []T,
+}
+
+pub def module_count[T](view: ModuleView[T]) -> i64: {
+    return len(view.data)
+}

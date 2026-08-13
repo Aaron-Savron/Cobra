@@ -799,58 +799,29 @@ static ASTNode *find_function(IRContext *ctx, const char *name) {
 }
 
 static bool generic_scalar_argument(const CobraType *type) {
-    if (!type) return false;
-    switch (type->kind) {
-        case COBRA_TYPE_I32:
-        case COBRA_TYPE_I64:
-        case COBRA_TYPE_U8:
-        case COBRA_TYPE_U32:
-        case COBRA_TYPE_U64:
-        case COBRA_TYPE_F32:
-        case COBRA_TYPE_BOOL:
-        case COBRA_TYPE_ENUM:
-            return true;
-        default:
-            return false;
-    }
+    return cobra_type_is_scalar(type);
 }
 
 static bool generic_slice_kind(CobraTypeKind kind) {
-    return kind == COBRA_TYPE_SLICE || kind == COBRA_TYPE_SLICE_F32 ||
-           kind == COBRA_TYPE_SLICE_U8;
+    return cobra_type_is_slice_kind(kind);
 }
 
 static bool bind_generic_type(const CobraType *pattern, const CobraType *actual,
                               const CobraType *parameter,
                               const CobraType **binding) {
-    if (!pattern || !actual || !parameter || !binding) return false;
-    if (pattern == parameter) {
-        if (!generic_scalar_argument(actual)) return false;
-        if (!*binding) {
-            *binding = actual;
-            return true;
-        }
-        return cobra_type_equal(*binding, actual);
-    }
-    /* The generic slice template uses the ABI-neutral SLICE kind, while a
-       concrete argument carries its element-specific kind (SLICE_F32 or
-       SLICE_U8). Match that family by canonical element identity rather than
-       by the storage-kind spelling. */
-    if (generic_slice_kind(pattern->kind) && generic_slice_kind(actual->kind)) {
-        if (pattern->generic_arg_count != actual->generic_arg_count) return false;
-    } else if (pattern->kind != actual->kind ||
-               pattern->generic_arg_count != actual->generic_arg_count) {
-        return false;
-    }
-    for (size_t i = 0; i < pattern->generic_arg_count; i++) {
-        if (!bind_generic_type(pattern->generic_args[i], actual->generic_args[i],
-                               parameter, binding)) return false;
-    }
-    return true;
+    /* Generic identity, including template origin and borrowed-view contracts,
+       belongs to the canonical type graph. IR only supplies the call-site
+       pattern and receives the inferred binding. */
+    return cobra_type_bind_generic(pattern, actual, parameter, binding);
 }
 
 static bool type_contains_generic_type(const CobraType *type,
                                        const CobraType *parameter);
+static const CobraType *specialize_struct_reference(IRContext *ctx,
+                                                     const CobraType *requested,
+                                                     const CobraType *parameter,
+                                                     const CobraType *argument,
+                                                     ASTNode *use_site);
 
 static const CobraType *specialize_canonical_type(IRContext *ctx,
                                                    const CobraType *type,
@@ -862,6 +833,10 @@ static const CobraType *specialize_canonical_type(IRContext *ctx,
          generic_slice_kind(type->kind)) &&
         type_contains_generic_type(type, parameter)) {
         return cobra_type_instantiate(ctx->canonical_arena, type, parameter, argument);
+    }
+    if (type->kind == COBRA_TYPE_STRUCT && type->generic_arg_count > 0 &&
+        type_contains_generic_type(type, parameter)) {
+        return specialize_struct_reference(ctx, type, parameter, argument, NULL);
     }
     return type;
 }
@@ -917,13 +892,15 @@ static ASTNode *clone_ast_tree(const ASTNode *source) {
 }
 
 static ASTNode *find_specialization(IRContext *ctx, ASTNode *generic,
-                                    const char *name) {
-    if (!ctx || !ctx->root || !generic || !name) return NULL;
+                                    const CobraType *argument) {
+    if (!ctx || !ctx->root || !generic || !argument) return NULL;
     for (size_t i = 0; i < ctx->root->child_count; i++) {
         ASTNode *candidate = ctx->root->children[i];
         if (candidate->type == AST_FUNCTION &&
             candidate->specialized_from == generic &&
-            strcmp(candidate->name, name) == 0) return candidate;
+            candidate->specialization_arg_count == 1 &&
+            candidate->specialization_args[0] &&
+            cobra_type_equal(candidate->specialization_args[0], argument)) return candidate;
     }
     return NULL;
 }
@@ -941,11 +918,13 @@ static ASTNode *specialize_generic_function(IRContext *ctx, ASTNode *generic,
     char specialized_name[COBRA_MAX_IDENT_LEN];
     snprintf(specialized_name, sizeof(specialized_name), "%.47s__%s",
              generic->name, cobra_type_kind_name(argument->kind));
-    ASTNode *existing = find_specialization(ctx, generic, specialized_name);
+    ASTNode *existing = find_specialization(ctx, generic, argument);
     if (existing) return existing;
     ASTNode *name_collision = find_function(ctx, specialized_name);
     if (name_collision) {
-        if (name_collision->specialized_from == generic) return name_collision;
+        /* Reuse was already decided by canonical specialization arguments.
+           Reaching this branch means the symbol spelling collides with a
+           different specialization or user function. */
         ir_error(ctx, generic, "generic specialization name collides with an existing function");
         return NULL;
     }
@@ -959,6 +938,8 @@ static ASTNode *specialize_generic_function(IRContext *ctx, ASTNode *generic,
     memset(specialized->generic_param_names, 0, sizeof(specialized->generic_param_names));
     memset(specialized->generic_param_types, 0, sizeof(specialized->generic_param_types));
     specialized->specialized_from = generic;
+    specialized->specialization_arg_count = 1;
+    specialized->specialization_args[0] = argument;
     specialize_ast_tree(ctx, specialized, generic->generic_param_types[0], argument);
     for (size_t i = 0; i < specialized->child_count; i++) {
         ASTNode *param = specialized->children[i];
@@ -993,6 +974,8 @@ static const char *generic_struct_suffix(const CobraType *argument) {
    canonical layout and never needs to understand generic placeholders. */
 static const CobraType *specialize_struct_reference(IRContext *ctx,
                                                      const CobraType *requested,
+                                                     const CobraType *parameter,
+                                                     const CobraType *argument,
                                                      ASTNode *use_site) {
     if (!ctx || !requested || requested->kind != COBRA_TYPE_STRUCT ||
         requested->generic_arg_count == 0) return requested;
@@ -1010,8 +993,9 @@ static const CobraType *specialize_struct_reference(IRContext *ctx,
         ir_error(ctx, use_site, "generic struct template is not declared with one type parameter");
         return NULL;
     }
-    const CobraType *argument = requested->generic_args[0];
-    if (!generic_scalar_argument(argument)) {
+    const CobraType *requested_argument = requested->generic_args[0];
+    if (parameter && requested_argument == parameter) requested_argument = argument;
+    if (!generic_scalar_argument(requested_argument)) {
         ir_error(ctx, use_site, "generic struct arguments must be scalar types");
         return NULL;
     }
@@ -1024,10 +1008,10 @@ static const CobraType *specialize_struct_reference(IRContext *ctx,
 
     char specialized_name[COBRA_MAX_IDENT_LEN];
     snprintf(specialized_name, sizeof(specialized_name), "%.46s__%.15s",
-             template_decl->name, generic_struct_suffix(argument));
-    const CobraType *specialized = cobra_type_instantiate_struct(
-        ctx->canonical_arena, template_type, template_decl->generic_param_types[0],
-        argument, specialized_name);
+             template_decl->name, generic_struct_suffix(requested_argument));
+    CobraTypeBinding binding = {template_decl->generic_param_types[0], requested_argument};
+    const CobraType *specialized = cobra_type_substitute(
+        ctx->canonical_arena, template_type, &binding, 1, specialized_name);
     if (!specialized) {
         const char *reason = ctx->canonical_arena->error[0]
             ? ctx->canonical_arena->error : "generic struct specialization is unsupported";
@@ -1079,7 +1063,7 @@ static void specialize_struct_types_in_tree(IRContext *ctx, ASTNode *node) {
         !node->canonical_type->finalized) {
         const CobraType *specialized = specialize_struct_reference(ctx,
                                                                     node->canonical_type,
-                                                                    node);
+                                                                    NULL, NULL, node);
         if (specialized) {
             node->canonical_type = specialized;
             node->declared_type = COBRA_TYPE_STRUCT;

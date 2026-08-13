@@ -1,0 +1,15 @@
+struct View[T]: {
+    data: readonly []T,
+}
+
+def bad_count[T](view: View[T]) -> View[T]: {
+    return view
+}
+
+def use_bad() -> i64 {
+    data = alloc_i64(1)
+    let view: View[i64]
+    view.data = data
+    bad_count(view)
+    return 0
+}

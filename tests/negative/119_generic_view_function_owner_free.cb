@@ -1,0 +1,15 @@
+struct View[T]: {
+    data: readonly []T,
+}
+
+def count[T](view: View[T]) -> i64: {
+    return len(view.data)
+}
+
+def bad_owner_free() -> i64 {
+    data = alloc_i64(1)
+    let view: View[i64]
+    view.data = data
+    free(data)
+    return count(view)
+}

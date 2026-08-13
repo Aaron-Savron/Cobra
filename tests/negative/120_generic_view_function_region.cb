@@ -1,0 +1,16 @@
+struct View[T]: {
+    data: readonly []T,
+}
+
+def count[T](view: View[T]) -> i64: {
+    return len(view.data)
+}
+
+def bad_region() -> i64 {
+    let view: View[i64]
+    with region scratch(64): {
+        data = scratch.alloc_i64(1)
+        view.data = data
+    }
+    return count(view)
+}

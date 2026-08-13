@@ -1,0 +1,17 @@
+struct View[T]: {
+    data: readonly []T,
+}
+
+struct Box[T]: {
+    value: T,
+}
+
+def count[T](view: View[T]) -> i64: {
+    return len(view.data)
+}
+
+def bad_mismatch() -> i64 {
+    let box: Box[i64]
+    box.value = 1
+    return count(box)
+}
