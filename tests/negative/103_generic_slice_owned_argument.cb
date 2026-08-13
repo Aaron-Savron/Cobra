@@ -1,0 +1,8 @@
+def readonly_len[T](values: readonly []T) -> i64: {
+    return len(values)
+}
+
+def test_owned_generic_slice_argument() -> i64: {
+    let values: list[i64] = [1, 2]
+    return readonly_len(values)
+}

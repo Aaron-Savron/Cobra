@@ -250,10 +250,23 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
            while parsing; it is never represented as a named struct. */
         const CobraType *generic = parser_generic_param(parser, parser->current_token.text);
         if (generic) {
-            if (slice || tensor) {
-                fprintf(stderr, "%s:%d:%d: error: scalar generic parameters cannot be used as slice or tensor element types\n",
+            if (tensor) {
+                fprintf(stderr, "%s:%d:%d: error: scalar generic parameters cannot be used as tensor element types\n",
                         parser->source_file, parser->current_token.line, parser->current_token.col);
                 exit(1);
+            }
+            if (slice) {
+                if (qualifier != 1) {
+                    fprintf(stderr, "%s:%d:%d: error: generic slices require an explicit readonly qualifier\n",
+                            parser->source_file, parser->current_token.line, parser->current_token.col);
+                    exit(1);
+                }
+                if (owner) {
+                    parser_set_canonical(parser, owner, COBRA_TYPE_SLICE, qualifier,
+                                         generic, NULL, NULL, NULL);
+                }
+                advance_token(parser);
+                return COBRA_TYPE_SLICE;
             }
             if (qualifier != 0) {
                 fprintf(stderr, "%s:%d:%d: error: generic parameters cannot carry ownership qualifiers\n",

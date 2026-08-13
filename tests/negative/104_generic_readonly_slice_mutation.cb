@@ -1,0 +1,12 @@
+def mutate_values[T](values: readonly []T) -> i64: {
+    values[0] = 1
+    free(values)
+    return len(values)
+}
+
+def test_generic_readonly_slice_mutation() -> i64: {
+    let values: []i64 = alloc_i64(2)
+    let length = mutate_values(values)
+    free(values)
+    return length
+}

@@ -1,0 +1,3 @@
+def writable_values[T](values: []T) -> i64: {
+    return len(values)
+}

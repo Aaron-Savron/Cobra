@@ -428,6 +428,18 @@ static bool scalar_generic_argument(const CobraType *type) {
     }
 }
 
+static bool slice_type_kind(CobraTypeKind kind) {
+    return kind == COBRA_TYPE_SLICE || kind == COBRA_TYPE_SLICE_F32 ||
+           kind == COBRA_TYPE_SLICE_U8;
+}
+
+static CobraTypeKind slice_kind_for_element(CobraTypeKind element) {
+    if (element == COBRA_TYPE_F32) return COBRA_TYPE_SLICE_F32;
+    if (element == COBRA_TYPE_U8) return COBRA_TYPE_SLICE_U8;
+    if (element == COBRA_TYPE_I64) return COBRA_TYPE_SLICE;
+    return COBRA_TYPE_UNKNOWN;
+}
+
 static bool type_contains_parameter(const CobraType *type, const CobraType *parameter) {
     if (!type || !parameter) return false;
     if (type == parameter) return true;
@@ -457,18 +469,27 @@ CobraType *cobra_type_instantiate(CobraTypeArena *arena,
         return NULL;
     }
     if (!scalar_generic_argument(argument)) {
-        type_error(arena, "this generic slice only accepts scalar arguments");
+        type_error(arena, "generic substitution requires a scalar argument");
         return NULL;
     }
-    if (template_type->kind != COBRA_TYPE_OPTION &&
-        template_type->kind != COBRA_TYPE_RESULT) {
-        type_error(arena, "this generic slice only instantiates Option or Result");
+
+    bool is_sum = template_type->kind == COBRA_TYPE_OPTION ||
+                  template_type->kind == COBRA_TYPE_RESULT;
+    bool is_slice = slice_type_kind(template_type->kind);
+    if (!is_sum && !is_slice) {
+        type_error(arena, "this generic slice only instantiates Option, Result, or readonly slices");
         return NULL;
     }
+    if (is_slice && (template_type->mutability != COBRA_MUTABILITY_READONLY ||
+                     template_type->ownership != COBRA_OWNERSHIP_BORROWED)) {
+        type_error(arena, "generic slice parameters must be borrowed and readonly");
+        return NULL;
+    }
+
     size_t required = template_type->kind == COBRA_TYPE_RESULT ? 2 : 1;
     if (template_type->generic_arg_count != required ||
         !type_contains_parameter(template_type, parameter)) {
-        type_error(arena, "generic parameter is not present in the Option or Result template");
+        type_error(arena, "generic parameter is not present in the template type");
         return NULL;
     }
 
@@ -481,8 +502,25 @@ CobraType *cobra_type_instantiate(CobraTypeArena *arena,
             return NULL;
         }
     }
+
+    CobraTypeKind instantiated_kind = template_type->kind;
+    if (is_slice) {
+        CobraTypeKind element_kind = components[0]->kind;
+        CobraTypeKind inferred_kind = slice_kind_for_element(element_kind);
+        if (inferred_kind == COBRA_TYPE_UNKNOWN) {
+            type_error(arena, "readonly generic slices currently support []i64, []f32, and []u8");
+            return NULL;
+        }
+        if (template_type->kind != COBRA_TYPE_SLICE &&
+            template_type->kind != inferred_kind) {
+            type_error(arena, "generic slice element does not match its ABI kind");
+            return NULL;
+        }
+        instantiated_kind = inferred_kind;
+    }
+
     CobraType *candidate = cobra_type_make(
-        arena, template_type->kind, template_type->name,
+        arena, instantiated_kind, template_type->name,
         components[0], required == 2 ? components[1] : NULL,
         NULL, NULL,
         template_type->ownership, template_type->mutability,

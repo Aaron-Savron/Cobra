@@ -1,0 +1,3 @@
+pub def module_readonly_len[T](values: readonly []T) -> i64: {
+    return len(values)
+}

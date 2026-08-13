@@ -58,6 +58,8 @@ emit examples/92_module_visibility.cb "$work/modules.s"
 emit examples/100_array_slice_coercion.cb "$work/array-coercion.s"
 emit examples/100_generic_functions.cb "$work/generic-functions.s"
 emit examples/101_generic_module.cb "$work/generic-module.s"
+emit examples/103_generic_readonly_slices.cb "$work/generic-slices.s"
+emit examples/104_generic_readonly_slice_module.cb "$work/generic-slice-module.s"
 
 maybe=$(body "$work/sums.s" maybe_value)
 checked=$(body "$work/sums.s" checked_value)
@@ -82,6 +84,10 @@ generic_i64=$(body "$work/generic-functions.s" unwrap_or__i64)
 generic_f32=$(body "$work/generic-functions.s" unwrap_or__f32)
 generic_calls=$(body "$work/generic-functions.s" test_generic_functions)
 generic_module_calls=$(body "$work/generic-module.s" test_generic_module_boundary)
+generic_slice_i64=$(body "$work/generic-slices.s" readonly_len__i64)
+generic_slice_f32=$(body "$work/generic-slices.s" readonly_len__f32)
+generic_slice_calls=$(body "$work/generic-slices.s" test_generic_readonly_slices)
+generic_slice_module_calls=$(body "$work/generic-slice-module.s" test_generic_readonly_slice_module)
 
 # Scalar values, enums, and sums stay in native registers/frame slots. They do
 # not allocate a heap object or enter a runtime type dispatcher.
@@ -162,6 +168,27 @@ if [ "$(grep -Ec 'call[[:space:]]+module_unwrap_or__i64@PLT' <<<"$generic_module
     exit 1
 fi
 require_text "module f32 specialization" "$generic_module_calls" 'call[[:space:]]+module_unwrap_or__f32@PLT'
+
+# Readonly generic slices preserve the pointer-plus-length ABI after scalar
+# substitution. The specialization remains borrowed, and repeated module calls
+# reuse one i64 clone rather than producing duplicate functions.
+for slice_body in "$generic_slice_i64" "$generic_slice_f32"; do
+    require_text "generic slice pointer" "$slice_body" 'mov[[:space:]]+QWORD PTR \[rbp-[0-9]+\], rdi'
+    require_text "generic slice length" "$slice_body" 'mov[[:space:]]+QWORD PTR \[rbp-[0-9]+\], rsi'
+    forbid_text "generic slice runtime dispatch" "$slice_body" 'call[[:space:]]+cobra_'
+done
+require_text "generic i64 slice call" "$generic_slice_calls" 'call[[:space:]]+readonly_len__i64@PLT'
+require_text "generic f32 slice call" "$generic_slice_calls" 'call[[:space:]]+readonly_len__f32@PLT'
+if [ "$(grep -Ec '^readonly_len__i64:' "$work/generic-slices.s")" -ne 1 ] ||
+   [ "$(grep -Ec '^readonly_len__f32:' "$work/generic-slices.s")" -ne 1 ]; then
+    printf '%s\n' 'contract failed: readonly slice specializations were duplicated or missing' >&2
+    exit 1
+fi
+if [ "$(grep -Ec 'call[[:space:]]+module_readonly_len__i64@PLT' <<<"$generic_slice_module_calls")" -ne 2 ]; then
+    printf '%s\n' 'contract failed: repeated readonly slice module specialization was not reused' >&2
+    exit 1
+fi
+require_text "module readonly f32 slice" "$generic_slice_module_calls" 'call[[:space:]]+module_readonly_len__f32@PLT'
 
 # A simple match is compares and branches, not a boxed state machine.
 require_text "enum compare" "$phase" 'cmp[[:space:]]'

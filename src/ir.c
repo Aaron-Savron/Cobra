@@ -815,6 +815,11 @@ static bool generic_scalar_argument(const CobraType *type) {
     }
 }
 
+static bool generic_slice_kind(CobraTypeKind kind) {
+    return kind == COBRA_TYPE_SLICE || kind == COBRA_TYPE_SLICE_F32 ||
+           kind == COBRA_TYPE_SLICE_U8;
+}
+
 static bool bind_generic_type(const CobraType *pattern, const CobraType *actual,
                               const CobraType *parameter,
                               const CobraType **binding) {
@@ -827,8 +832,16 @@ static bool bind_generic_type(const CobraType *pattern, const CobraType *actual,
         }
         return cobra_type_equal(*binding, actual);
     }
-    if (pattern->kind != actual->kind ||
-        pattern->generic_arg_count != actual->generic_arg_count) return false;
+    /* The generic slice template uses the ABI-neutral SLICE kind, while a
+       concrete argument carries its element-specific kind (SLICE_F32 or
+       SLICE_U8). Match that family by canonical element identity rather than
+       by the storage-kind spelling. */
+    if (generic_slice_kind(pattern->kind) && generic_slice_kind(actual->kind)) {
+        if (pattern->generic_arg_count != actual->generic_arg_count) return false;
+    } else if (pattern->kind != actual->kind ||
+               pattern->generic_arg_count != actual->generic_arg_count) {
+        return false;
+    }
     for (size_t i = 0; i < pattern->generic_arg_count; i++) {
         if (!bind_generic_type(pattern->generic_args[i], actual->generic_args[i],
                                parameter, binding)) return false;
@@ -845,7 +858,8 @@ static const CobraType *specialize_canonical_type(IRContext *ctx,
                                                    const CobraType *argument) {
     if (!type) return NULL;
     if (type == parameter) return argument;
-    if ((type->kind == COBRA_TYPE_OPTION || type->kind == COBRA_TYPE_RESULT) &&
+    if ((type->kind == COBRA_TYPE_OPTION || type->kind == COBRA_TYPE_RESULT ||
+         generic_slice_kind(type->kind)) &&
         type_contains_generic_type(type, parameter)) {
         return cobra_type_instantiate(ctx->canonical_arena, type, parameter, argument);
     }
@@ -867,12 +881,13 @@ static void specialize_ast_tree(IRContext *ctx, ASTNode *node,
                                 const CobraType *argument) {
     if (!node) return;
     if (node->canonical_type) {
+        bool contains_parameter = type_contains_generic_type(node->canonical_type, parameter);
         node->canonical_type = specialize_canonical_type(ctx, node->canonical_type,
                                                          parameter, argument);
         if (node->canonical_type) {
-            if (node->declared_type == COBRA_TYPE_GENERIC_PARAM)
+            if (contains_parameter && node->declared_type != COBRA_TYPE_UNTYPED)
                 node->declared_type = node->canonical_type->kind;
-            if (node->value_type == COBRA_TYPE_GENERIC_PARAM)
+            if (contains_parameter && node->value_type != COBRA_TYPE_UNTYPED)
                 node->value_type = node->canonical_type->kind;
             if (!cobra_type_validate(ctx->canonical_arena, node->canonical_type))
                 ir_error(ctx, node, "generic specialization has no valid ABI representation");
@@ -2054,6 +2069,11 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                         IRLocal *local = find_local_entry(ctx, node->children[0]->name);
                         if (local && local->region_backed) {
                             ir_error(ctx, node, "cannot free a region-backed buffer; the region releases it");
+                        } else if (local &&
+                                   (local->flow_mutability == COBRA_MUTABILITY_READONLY ||
+                                    (local->canonical_type &&
+                                     local->canonical_type->ownership == COBRA_OWNERSHIP_BORROWED))) {
+                            ir_error(ctx, node, "cannot free a borrowed readonly buffer");
                         } else {
                             if (local && (local->type == COBRA_TYPE_LIST || local->type == COBRA_TYPE_DICT) && !local->owned)
                                 ir_error(ctx, node, "cannot free a borrowed collection parameter");
@@ -3109,6 +3129,11 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                     IRLocal *local = find_local_entry(ctx, node->children[0]->name);
                     if (local && local->region_backed) {
                         ir_error(ctx, node, "cannot free a region-backed buffer; the region releases it");
+                    } else if (local &&
+                               (local->flow_mutability == COBRA_MUTABILITY_READONLY ||
+                                (local->canonical_type &&
+                                 local->canonical_type->ownership == COBRA_OWNERSHIP_BORROWED))) {
+                        ir_error(ctx, node, "cannot free a borrowed readonly buffer");
                     } else if (!local || (!is_slice_type(local->type) && !is_collection_type(local->type)) ||
                         (!local->owned && !local->borrowed_from[0])) {
                         ir_error(ctx, node, "free requires an owned collection, buffer, or a named tensor view");

@@ -68,6 +68,27 @@ int main(void) {
     assert(cobra_type_error(instantiated_result) == i32);
     assert(instantiated_result->abi == COBRA_ABI_SUM_INDIRECT);
 
+    /* Readonly generic slices keep the borrowed pointer-plus-length ABI while
+       selecting an element-specific storage kind during substitution. */
+    CobraType *readonly_slice_template = cobra_type_make(
+        &arena, COBRA_TYPE_SLICE, NULL, parameter, NULL, NULL, NULL,
+        COBRA_OWNERSHIP_BORROWED, COBRA_MUTABILITY_READONLY, -1);
+    assert(readonly_slice_template);
+    CobraType *readonly_f32 = cobra_type_instantiate(&arena,
+                                                     readonly_slice_template,
+                                                     parameter, f32);
+    CobraType *same_readonly_f32 = cobra_type_instantiate(&arena,
+                                                          readonly_slice_template,
+                                                          parameter, f32);
+    assert(readonly_f32 && same_readonly_f32);
+    assert(readonly_f32 == same_readonly_f32);
+    assert(readonly_f32->kind == COBRA_TYPE_SLICE_F32);
+    assert(cobra_type_element(readonly_f32) == f32);
+    assert(readonly_f32->ownership == COBRA_OWNERSHIP_BORROWED);
+    assert(readonly_f32->mutability == COBRA_MUTABILITY_READONLY);
+    assert(readonly_f32->abi == COBRA_ABI_SLICE);
+    assert(readonly_f32->size == 16);
+
     static CobraTypeArena generic_negative;
     cobra_type_arena_init(&generic_negative);
     CobraType *negative_param = cobra_type_make(&generic_negative,
@@ -86,7 +107,7 @@ int main(void) {
                                                COBRA_MUTABILITY_DEFAULT, -1);
     assert(!cobra_type_instantiate(&generic_negative, negative_template,
                                    negative_param, list_argument));
-    assert(strstr(generic_negative.error, "scalar arguments") != NULL);
+    assert(strstr(generic_negative.error, "scalar argument") != NULL);
 
     CobraType *list = cobra_type_new(&arena, COBRA_TYPE_LIST);
     assert(list && cobra_type_add_generic_arg(list, f32));

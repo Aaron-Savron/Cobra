@@ -1,0 +1,17 @@
+import "modules/generic_slice_helpers.cb"
+
+def test_generic_readonly_slice_module() -> i64: {
+    let integers: []i64 = alloc_i64(5)
+    let floats: []f32 = alloc_f32(6)
+
+    let first = module_readonly_len(integers)
+    let second = module_readonly_len(integers)
+    let third = module_readonly_len(floats)
+
+    assert(first == 5)
+    assert(second == 5)
+    assert(third == 6)
+    free(integers)
+    free(floats)
+    return 0
+}

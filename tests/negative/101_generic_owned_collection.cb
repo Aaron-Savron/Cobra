@@ -1,0 +1,3 @@
+def list_values[T](values: list[T]) -> i64: {
+    return 0
+}

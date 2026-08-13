@@ -1,0 +1,19 @@
+def readonly_len[T](values: readonly []T) -> i64: {
+    return len(values)
+}
+
+def test_generic_readonly_slices() -> i64: {
+    let integers: []i64 = alloc_i64(3)
+    let floats: []f32 = alloc_f32(4)
+
+    let integer_length = readonly_len(integers)
+    let repeated_length = readonly_len(integers)
+    let float_length = readonly_len(floats)
+
+    assert(integer_length == 3)
+    assert(repeated_length == 3)
+    assert(float_length == 4)
+    free(integers)
+    free(floats)
+    return 0
+}
