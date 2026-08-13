@@ -53,10 +53,23 @@ static CobraTypeKind token_to_type(TokenType type) {
 
 static bool expect(Parser *parser, TokenType type, const char *err_msg);
 
+static const CobraType *parser_generic_param(Parser *parser, const char *name) {
+    if (!parser || !name || !name[0]) return NULL;
+    for (size_t i = 0; i < parser->generic_param_count; i++) {
+        if (strcmp(parser->generic_param_names[i], name) == 0)
+            return parser->generic_param_types[i];
+    }
+    return NULL;
+}
+
 static const CobraType *parser_component_type(Parser *parser, CobraTypeKind kind,
                                                 const char *name) {
     if (!parser || !parser->canonical_arena || kind == COBRA_TYPE_UNTYPED ||
         kind == COBRA_TYPE_UNKNOWN) return NULL;
+    if (kind == COBRA_TYPE_STRUCT && name && name[0]) {
+        const CobraType *generic = parser_generic_param(parser, name);
+        if (generic) return generic;
+    }
     return cobra_type_make(parser->canonical_arena, kind,
                            name && name[0] ? name : NULL,
                            NULL, NULL, NULL, NULL,
@@ -233,6 +246,24 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
     }
 
     if (match(parser, TOKEN_IDENTIFIER)) {
+        /* A generic type parameter is resolved to its canonical placeholder
+           while parsing; it is never represented as a named struct. */
+        const CobraType *generic = parser_generic_param(parser, parser->current_token.text);
+        if (generic) {
+            if (slice || tensor) {
+                fprintf(stderr, "%s:%d:%d: error: scalar generic parameters cannot be used as slice or tensor element types\n",
+                        parser->source_file, parser->current_token.line, parser->current_token.col);
+                exit(1);
+            }
+            if (qualifier != 0) {
+                fprintf(stderr, "%s:%d:%d: error: generic parameters cannot carry ownership qualifiers\n",
+                        parser->source_file, parser->current_token.line, parser->current_token.col);
+                exit(1);
+            }
+            if (owner) owner->canonical_type = generic;
+            advance_token(parser);
+            return COBRA_TYPE_GENERIC_PARAM;
+        }
         /* A plain identifier in type position is a user-defined struct type.
            Its qualified identity is constructed directly from the token; no
            AST type-name mirror is needed. */
@@ -1217,6 +1248,47 @@ static ASTNode *parse_function(Parser *parser) {
 
     ASTNode *fn_node = parser_create_node_at(parser, AST_FUNCTION, fn_name, function_token);
 
+    size_t previous_generic_count = parser->generic_param_count;
+    parser->generic_param_count = 0;
+    if (match(parser, TOKEN_LBRACKET)) {
+        advance_token(parser);
+        while (!match(parser, TOKEN_RBRACKET)) {
+            if (parser->generic_param_count >= 1 ||
+                !match(parser, TOKEN_IDENTIFIER)) {
+                fprintf(stderr, "%s:%d:%d: error: generic functions currently require exactly one identifier type parameter\n",
+                        parser->source_file, parser->current_token.line, parser->current_token.col);
+                exit(1);
+            }
+            const char *name = parser->current_token.text;
+            for (size_t i = 0; i < parser->generic_param_count; i++) {
+                if (strcmp(parser->generic_param_names[i], name) == 0) {
+                    fprintf(stderr, "%s:%d:%d: error: duplicate generic parameter '%s'\n",
+                            parser->source_file, parser->current_token.line,
+                            parser->current_token.col, name);
+                    exit(1);
+                }
+            }
+            size_t index = parser->generic_param_count++;
+            snprintf(parser->generic_param_names[index], COBRA_MAX_IDENT_LEN, "%.63s", name);
+            parser->generic_param_types[index] = cobra_type_make(parser->canonical_arena,
+                                                                  COBRA_TYPE_GENERIC_PARAM,
+                                                                  name, NULL, NULL, NULL, NULL,
+                                                                  COBRA_OWNERSHIP_VALUE,
+                                                                  COBRA_MUTABILITY_DEFAULT, -1);
+            snprintf(fn_node->generic_param_names[index], COBRA_MAX_IDENT_LEN, "%.63s", name);
+            fn_node->generic_param_types[index] = parser->generic_param_types[index];
+            advance_token(parser);
+            if (match(parser, TOKEN_COMMA)) advance_token(parser);
+            else if (!match(parser, TOKEN_RBRACKET)) {
+                fprintf(stderr, "%s:%d:%d: error: expected ',' or ']' after generic parameter\n",
+                        parser->source_file, parser->current_token.line, parser->current_token.col);
+                exit(1);
+            }
+        }
+        fn_node->generic_param_count = parser->generic_param_count;
+        expect(parser, TOKEN_RBRACKET, "Expected ']' after generic parameters");
+    }
+
     expect(parser, TOKEN_LPAREN, "Expected '(' after function name");
     
     // Parse parameters: def foo(a: i64, b: i64) -> i64:
@@ -1290,6 +1362,7 @@ static ASTNode *parse_function(Parser *parser) {
         }
     }
 
+    parser->generic_param_count = previous_generic_count;
     return fn_node;
 }
 

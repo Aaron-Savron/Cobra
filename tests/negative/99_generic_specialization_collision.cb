@@ -1,0 +1,11 @@
+def collide[T](value: T) -> T: {
+    return value
+}
+
+def collide__i64(value: i64) -> i64: {
+    return value
+}
+
+def test_generic_specialization_collision() -> i64: {
+    return collide(1)
+}

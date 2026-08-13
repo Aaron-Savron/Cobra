@@ -1,0 +1,6 @@
+pub def module_unwrap_or[T](value: Option[T], fallback: T) -> T: {
+    if is_some(value): {
+        return unwrap(value)
+    }
+    return fallback
+}

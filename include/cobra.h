@@ -369,6 +369,14 @@ struct ASTNode {
     /* Canonical type attached during parsing or IR inference. Descriptors are
        immutable after construction; the AST only borrows the arena node. */
     const CobraType *canonical_type;
+    /* Source-level generic functions currently support one scalar parameter.
+       The placeholder descriptors are owned by the program canonical arena. */
+    size_t generic_param_count;
+    char generic_param_names[COBRA_MAX_TYPE_ARGS][COBRA_MAX_IDENT_LEN];
+    const CobraType *generic_param_types[COBRA_MAX_TYPE_ARGS];
+    /* Specialized clones point back to their generic declaration so recursion
+       and duplicate specialization checks remain explicit in IR. */
+    const ASTNode *specialized_from;
     /* Only the AST_PROGRAM node owns this arena. Child nodes keep descriptors
        from it but leave this pointer NULL. */
     CobraTypeArena *canonical_arena;
@@ -419,6 +427,9 @@ typedef struct {
     Token current_token;
     char source_file[COBRA_MAX_SOURCE_PATH];
     CobraTypeArena *canonical_arena;
+    size_t generic_param_count;
+    char generic_param_names[COBRA_MAX_TYPE_ARGS][COBRA_MAX_IDENT_LEN];
+    const CobraType *generic_param_types[COBRA_MAX_TYPE_ARGS];
 } Parser;
 
 void parser_init(Parser *parser, const char *source);

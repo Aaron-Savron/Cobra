@@ -1,0 +1,7 @@
+def recurse[T](value: T) -> T: {
+    return recurse(value)
+}
+
+def test_recursive_generic_call() -> i64: {
+    return recurse(1)
+}

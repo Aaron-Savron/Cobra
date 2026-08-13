@@ -1,0 +1,3 @@
+def pair[T, U](value: T) -> T: {
+    return value
+}

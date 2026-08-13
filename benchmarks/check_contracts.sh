@@ -56,6 +56,8 @@ emit examples/70_http_typed_api.cb "$work/http.s"
 emit examples/90_recursive_struct_layout.cb "$work/nested-structs.s"
 emit examples/92_module_visibility.cb "$work/modules.s"
 emit examples/100_array_slice_coercion.cb "$work/array-coercion.s"
+emit examples/100_generic_functions.cb "$work/generic-functions.s"
+emit examples/101_generic_module.cb "$work/generic-module.s"
 
 maybe=$(body "$work/sums.s" maybe_value)
 checked=$(body "$work/sums.s" checked_value)
@@ -76,6 +78,10 @@ http=$(body "$work/http.s" parse_request_checked)
 nested=$(body "$work/nested-structs.s" box_score)
 modules=$(cat "$work/modules.s")
 array_coercion=$(body "$work/array-coercion.s" test_array_to_readonly_slice)
+generic_i64=$(body "$work/generic-functions.s" unwrap_or__i64)
+generic_f32=$(body "$work/generic-functions.s" unwrap_or__f32)
+generic_calls=$(body "$work/generic-functions.s" test_generic_functions)
+generic_module_calls=$(body "$work/generic-module.s" test_generic_module_boundary)
 
 # Scalar values, enums, and sums stay in native registers/frame slots. They do
 # not allocate a heap object or enter a runtime type dispatcher.
@@ -127,6 +133,35 @@ require_text "array view pointer" "$array_coercion" 'mov[[:space:]]+rdi, QWORD P
 require_text "array view length" "$array_coercion" 'mov[[:space:]]+rsi, QWORD PTR \[rbp-[0-9]+\]'
 require_text "array view call" "$array_coercion" 'call[[:space:]]+readonly_sum@PLT'
 forbid_text "array view allocator" "$array_coercion" 'call[[:space:]]+(malloc|calloc|realloc|free|memcpy|memmove)@PLT'
+
+# Scalar source-level generics specialize before lowering. Each specialization
+# uses the substituted ABI class, repeated calls reuse one canonical clone, and
+# the generic declaration itself never reaches native output.
+require_text "generic i64 parameter ABI" "$generic_i64" 'mov[[:space:]]+QWORD PTR \[rbp-[0-9]+\], rsi'
+require_text "generic i64 scalar return" "$generic_i64" 'mov[[:space:]]+rax, QWORD PTR \[rbp-[0-9]+\]'
+require_text "generic f32 parameter ABI" "$generic_f32" 'movss[[:space:]]+DWORD PTR \[rbp-[0-9]+\], xmm0'
+require_text "generic f32 scalar return" "$generic_f32" 'movss[[:space:]]+xmm0, DWORD PTR \[rbp-[0-9]+\]'
+require_text "generic i64 call specialization" "$generic_calls" 'call[[:space:]]+unwrap_or__i64@PLT'
+require_text "generic f32 call specialization" "$generic_calls" 'call[[:space:]]+unwrap_or__f32@PLT'
+if grep -Eq '^unwrap_or:' "$work/generic-functions.s"; then
+    printf '%s\n' 'contract failed: unspecialized generic function was emitted' >&2
+    exit 1
+fi
+if [ "$(grep -Ec '^unwrap_or__i64:' "$work/generic-functions.s")" -ne 1 ] ||
+   [ "$(grep -Ec '^unwrap_or__f32:' "$work/generic-functions.s")" -ne 1 ]; then
+    printf '%s\n' 'contract failed: local generic specializations were duplicated or missing' >&2
+    exit 1
+fi
+if [ "$(grep -Ec '^module_unwrap_or__i64:' "$work/generic-module.s")" -ne 1 ] ||
+   [ "$(grep -Ec '^module_unwrap_or__f32:' "$work/generic-module.s")" -ne 1 ]; then
+    printf '%s\n' 'contract failed: module generic specializations were duplicated or missing' >&2
+    exit 1
+fi
+if [ "$(grep -Ec 'call[[:space:]]+module_unwrap_or__i64@PLT' <<<"$generic_module_calls")" -ne 2 ]; then
+    printf '%s\n' 'contract failed: repeated module generic specialization was not reused' >&2
+    exit 1
+fi
+require_text "module f32 specialization" "$generic_module_calls" 'call[[:space:]]+module_unwrap_or__f32@PLT'
 
 # A simple match is compares and branches, not a boxed state machine.
 require_text "enum compare" "$phase" 'cmp[[:space:]]'

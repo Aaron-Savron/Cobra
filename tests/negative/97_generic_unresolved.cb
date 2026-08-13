@@ -1,0 +1,7 @@
+def default_value[T](fallback: i64) -> i64: {
+    return fallback
+}
+
+def test_unresolved_generic_call() -> i64: {
+    return default_value(7)
+}

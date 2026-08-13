@@ -3446,7 +3446,8 @@ static bool generate(ASTNode *root, const char *path, TargetPlatform target, boo
     fputc(10, f);
     fputs(".text", f);
     fputc(10, f);
-    for (size_t i = 0; i < root->child_count; i++) { ASTNode *fn = root->children[i];        if (fn->type == AST_FUNCTION && !(test_mode && !strncmp(fn->name, "main", 4)) &&
+    for (size_t i = 0; i < root->child_count; i++) { ASTNode *fn = root->children[i];        if (fn->type == AST_FUNCTION && fn->generic_param_count == 0 &&
+            !(test_mode && !strncmp(fn->name, "main", 4)) &&
             (!g_portable_cpu || !codegen_is_nn_function(fn) ||
              codegen_nn_function_is_reachable(root, fn)))
             emit_function(&cg, fn); }

@@ -1,0 +1,16 @@
+import "modules/generic_helpers.cb"
+
+def test_generic_module_boundary() -> i64: {
+    let first: Option[i64] = some(11)
+    let second: Option[i64] = some(13)
+    let third: Option[f32] = some(17.0)
+
+    let first_value = module_unwrap_or(first, 0)
+    let second_value = module_unwrap_or(second, 0)
+    let third_value: f32 = module_unwrap_or(third, 0.0)
+
+    assert(first_value == 11)
+    assert(second_value == 13)
+    assert(third_value == 17.0)
+    return 0
+}

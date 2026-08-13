@@ -1,0 +1,9 @@
+def identity[T](value: T) -> T: {
+    return value
+}
+
+def test_composite_generic_call() -> i64: {
+    let values: list[i64] = [1, 2]
+    let value = identity(values)
+    return value
+}

@@ -1,4 +1,9 @@
-# Generic functions are intentionally not part of the current sum ABI.
-def unwrap_or[T](value: Option[T], fallback: T) -> T: {
-    return fallback
+def result_wrap[T](value: T) -> Result[T, i64]: {
+    return ok(value)
+}
+
+def test_generic_result_composite() -> i64: {
+    let values: list[i64] = [1, 2]
+    let result = result_wrap(values)
+    return result
 }

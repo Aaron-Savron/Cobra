@@ -1,0 +1,17 @@
+def unwrap_or[T](value: Option[T], fallback: T) -> T: {
+    if is_some(value): {
+        return unwrap(value)
+    }
+    return fallback
+}
+
+def test_generic_functions() -> i64: {
+    let option_i64: Option[i64] = some(7)
+    value_i64 = unwrap_or(option_i64, 9)
+    assert(value_i64 == 7)
+
+    let option_f32: Option[f32] = some(3.0)
+    let value_f32: f32 = unwrap_or(option_f32, 4.0)
+    assert(value_f32 == 3.0)
+    return 0
+}

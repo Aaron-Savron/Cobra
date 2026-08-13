@@ -78,6 +78,7 @@ typedef struct {
     int next_region_id;
     int region_depth;
     CobraTypeArena *canonical_arena;
+    ASTNode *current_function;
 } IRContext;
 
 static const char *canonical_type_name(const CobraType *type) {
@@ -123,6 +124,7 @@ static const char *type_name(CobraTypeKind type) {
         case COBRA_TYPE_NONE: return "none";
         case COBRA_TYPE_OPTION: return "Option[T]";
         case COBRA_TYPE_RESULT: return "Result[T,E]";
+        case COBRA_TYPE_GENERIC_PARAM: return "T";
         case COBRA_TYPE_ENUM: return "enum";
         case COBRA_TYPE_STRUCT: return "struct";
         case COBRA_TYPE_UNTYPED: return "untyped";
@@ -794,6 +796,164 @@ static ASTNode *find_function(IRContext *ctx, const char *name) {
         if (child->type == AST_FUNCTION && strcmp(child->name, name) == 0) return child;
     }
     return NULL;
+}
+
+static bool generic_scalar_argument(const CobraType *type) {
+    if (!type) return false;
+    switch (type->kind) {
+        case COBRA_TYPE_I32:
+        case COBRA_TYPE_I64:
+        case COBRA_TYPE_U8:
+        case COBRA_TYPE_U32:
+        case COBRA_TYPE_U64:
+        case COBRA_TYPE_F32:
+        case COBRA_TYPE_BOOL:
+        case COBRA_TYPE_ENUM:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool bind_generic_type(const CobraType *pattern, const CobraType *actual,
+                              const CobraType *parameter,
+                              const CobraType **binding) {
+    if (!pattern || !actual || !parameter || !binding) return false;
+    if (pattern == parameter) {
+        if (!generic_scalar_argument(actual)) return false;
+        if (!*binding) {
+            *binding = actual;
+            return true;
+        }
+        return cobra_type_equal(*binding, actual);
+    }
+    if (pattern->kind != actual->kind ||
+        pattern->generic_arg_count != actual->generic_arg_count) return false;
+    for (size_t i = 0; i < pattern->generic_arg_count; i++) {
+        if (!bind_generic_type(pattern->generic_args[i], actual->generic_args[i],
+                               parameter, binding)) return false;
+    }
+    return true;
+}
+
+static bool type_contains_generic_type(const CobraType *type,
+                                       const CobraType *parameter);
+
+static const CobraType *specialize_canonical_type(IRContext *ctx,
+                                                   const CobraType *type,
+                                                   const CobraType *parameter,
+                                                   const CobraType *argument) {
+    if (!type) return NULL;
+    if (type == parameter) return argument;
+    if ((type->kind == COBRA_TYPE_OPTION || type->kind == COBRA_TYPE_RESULT) &&
+        type_contains_generic_type(type, parameter)) {
+        return cobra_type_instantiate(ctx->canonical_arena, type, parameter, argument);
+    }
+    return type;
+}
+
+static bool type_contains_generic_type(const CobraType *type,
+                                       const CobraType *parameter) {
+    if (!type || !parameter) return false;
+    if (type == parameter) return true;
+    for (size_t i = 0; i < type->generic_arg_count; i++) {
+        if (type_contains_generic_type(type->generic_args[i], parameter)) return true;
+    }
+    return false;
+}
+
+static void specialize_ast_tree(IRContext *ctx, ASTNode *node,
+                                const CobraType *parameter,
+                                const CobraType *argument) {
+    if (!node) return;
+    if (node->canonical_type) {
+        node->canonical_type = specialize_canonical_type(ctx, node->canonical_type,
+                                                         parameter, argument);
+        if (node->canonical_type) {
+            if (node->declared_type == COBRA_TYPE_GENERIC_PARAM)
+                node->declared_type = node->canonical_type->kind;
+            if (node->value_type == COBRA_TYPE_GENERIC_PARAM)
+                node->value_type = node->canonical_type->kind;
+            if (!cobra_type_validate(ctx->canonical_arena, node->canonical_type))
+                ir_error(ctx, node, "generic specialization has no valid ABI representation");
+        }
+    }
+    for (size_t i = 0; i < node->child_count; i++)
+        specialize_ast_tree(ctx, node->children[i], parameter, argument);
+}
+
+static ASTNode *clone_ast_tree(const ASTNode *source) {
+    if (!source) return NULL;
+    ASTNode *copy = ast_create_node(source->type, source->name);
+    if (!copy) return NULL;
+    *copy = *source;
+    copy->children = NULL;
+    copy->child_count = 0;
+    copy->child_capacity = 0;
+    for (size_t i = 0; i < source->child_count; i++) {
+        ASTNode *child = clone_ast_tree(source->children[i]);
+        if (!child) {
+            ast_free(copy);
+            return NULL;
+        }
+        ast_add_child(copy, child);
+    }
+    return copy;
+}
+
+static ASTNode *find_specialization(IRContext *ctx, ASTNode *generic,
+                                    const char *name) {
+    if (!ctx || !ctx->root || !generic || !name) return NULL;
+    for (size_t i = 0; i < ctx->root->child_count; i++) {
+        ASTNode *candidate = ctx->root->children[i];
+        if (candidate->type == AST_FUNCTION &&
+            candidate->specialized_from == generic &&
+            strcmp(candidate->name, name) == 0) return candidate;
+    }
+    return NULL;
+}
+
+static ASTNode *specialize_generic_function(IRContext *ctx, ASTNode *generic,
+                                             const CobraType *argument) {
+    if (!ctx || !generic || generic->generic_param_count != 1 ||
+        !generic->generic_param_types[0] || !generic_scalar_argument(argument)) return NULL;
+    if (ctx->current_function &&
+        (ctx->current_function == generic ||
+         ctx->current_function->specialized_from == generic)) {
+        ir_error(ctx, generic, "recursive generic instantiation is not supported");
+        return NULL;
+    }
+    char specialized_name[COBRA_MAX_IDENT_LEN];
+    snprintf(specialized_name, sizeof(specialized_name), "%.47s__%s",
+             generic->name, cobra_type_kind_name(argument->kind));
+    ASTNode *existing = find_specialization(ctx, generic, specialized_name);
+    if (existing) return existing;
+    ASTNode *name_collision = find_function(ctx, specialized_name);
+    if (name_collision) {
+        if (name_collision->specialized_from == generic) return name_collision;
+        ir_error(ctx, generic, "generic specialization name collides with an existing function");
+        return NULL;
+    }
+    ASTNode *specialized = clone_ast_tree(generic);
+    if (!specialized) {
+        ir_error(ctx, generic, "could not clone generic function specialization");
+        return NULL;
+    }
+    snprintf(specialized->name, sizeof(specialized->name), "%.63s", specialized_name);
+    specialized->generic_param_count = 0;
+    memset(specialized->generic_param_names, 0, sizeof(specialized->generic_param_names));
+    memset(specialized->generic_param_types, 0, sizeof(specialized->generic_param_types));
+    specialized->specialized_from = generic;
+    specialize_ast_tree(ctx, specialized, generic->generic_param_types[0], argument);
+    for (size_t i = 0; i < specialized->child_count; i++) {
+        ASTNode *param = specialized->children[i];
+        if (param->type == AST_PARAM &&
+            (param->declared_type == COBRA_TYPE_GENERIC_PARAM || !param->canonical_type)) {
+            ir_error(ctx, param, "generic specialization left an unresolved parameter type");
+        }
+    }
+    ast_add_child(ctx->root, specialized);
+    return specialized;
 }
 
 static bool canonical_call_compatible(const CobraType *expected, const CobraType *actual) {
@@ -1580,6 +1740,46 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
         }
         case AST_FUNC_CALL: {
             ASTNode *called_function = find_function(ctx, node->name);
+            if (called_function && called_function->generic_param_count > 0) {
+                if (called_function->generic_param_count != 1) {
+                    ir_error(ctx, node, "generic functions currently require exactly one type parameter");
+                    called_function = NULL;
+                } else {
+                    const CobraType *binding = NULL;
+                    bool valid = true;
+                    size_t argument_index = 0;
+                    for (size_t i = 0; i < called_function->child_count; i++) {
+                        ASTNode *param = called_function->children[i];
+                        if (param->type != AST_PARAM) continue;
+                        if (argument_index >= node->child_count) {
+                            valid = false;
+                            break;
+                        }
+                        ASTNode *argument = node->children[argument_index++];
+                        infer_expr(argument, ctx);
+                        if (!bind_generic_type(param->canonical_type,
+                                               argument->canonical_type,
+                                               called_function->generic_param_types[0],
+                                               &binding)) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if (argument_index != node->child_count || !binding) valid = false;
+                    if (!valid) {
+                        ir_error(ctx, node, "generic call has an ambiguous, mismatched, or unsupported type argument");
+                        called_function = NULL;
+                    } else {
+                        ASTNode *specialized = specialize_generic_function(ctx, called_function, binding);
+                        if (!specialized) {
+                            called_function = NULL;
+                        } else {
+                            snprintf(node->name, sizeof(node->name), "%.63s", specialized->name);
+                            called_function = specialized;
+                        }
+                    }
+                }
+            }
             if (called_function && !function_visible_from(node, called_function)) {
                 char message[180];
                 snprintf(message, sizeof(message), "function '%s' is private to its module", node->name);
@@ -3022,9 +3222,10 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
 
     for (size_t i = 0; i < root->child_count; i++) {
         ASTNode *function = root->children[i];
-        if (function->type != AST_FUNCTION) continue;
+        if (function->type != AST_FUNCTION || function->generic_param_count > 0) continue;
 
         IRContext ctx = {0};
+        ctx.current_function = function;
         ctx.root = root;
         ctx.canonical_arena = root->canonical_arena;
         ctx.return_type = function->declared_type;

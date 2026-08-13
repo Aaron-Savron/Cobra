@@ -1,0 +1,8 @@
+def choose[T](left: T, right: T) -> T: {
+    return left
+}
+
+def test_ambiguous_generic_call() -> i64: {
+    let value = choose(1, 2.0)
+    return value
+}
