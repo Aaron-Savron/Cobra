@@ -203,6 +203,7 @@ typedef enum {
     COBRA_TYPE_NONE,         /* the none literal */
     COBRA_TYPE_OPTION,       /* native tagged optional scalar value */
     COBRA_TYPE_RESULT,       /* native tagged success/error scalar value */
+    COBRA_TYPE_GENERIC_PARAM,/* canonical placeholder used during instantiation */
     COBRA_TYPE_ENUM,         /* integer-backed unit enum (type_name holds name) */
     COBRA_TYPE_STRUCT,       /* user-defined struct type (type_name holds name) */
     COBRA_TYPE_UNKNOWN
@@ -291,6 +292,13 @@ CobraType *cobra_type_make(CobraTypeArena *arena, CobraTypeKind kind, const char
                            CobraOwnershipKind ownership, CobraMutabilityKind mutability,
                            int region_id);
 bool cobra_type_add_generic_arg(CobraType *type, const CobraType *argument);
+/* Instantiate one scalar generic parameter in an Option[T] or Result[T, E]
+   descriptor. The returned descriptor is finalized, immutable through the
+   canonical mutators, and interned against equivalent instantiated types. */
+CobraType *cobra_type_instantiate(CobraTypeArena *arena,
+                                  const CobraType *template_type,
+                                  const CobraType *parameter,
+                                  const CobraType *argument);
 const CobraType *cobra_type_element(const CobraType *type);
 const CobraType *cobra_type_error(const CobraType *type);
 const CobraType *cobra_type_key(const CobraType *type);

@@ -21,6 +21,9 @@ dist/
 .env
 .cobra-site-check/
 
+# Local agent instructions
+agents.md
+
 # Python tooling caches
 __pycache__/
 *.pyc

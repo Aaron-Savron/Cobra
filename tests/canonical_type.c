@@ -8,9 +8,10 @@ int main(void) {
     static CobraTypeArena arena;
     cobra_type_arena_init(&arena);
 
+    CobraType *i32 = cobra_type_new(&arena, COBRA_TYPE_I32);
     CobraType *i64 = cobra_type_new(&arena, COBRA_TYPE_I64);
     CobraType *f32 = cobra_type_new(&arena, COBRA_TYPE_F32);
-    assert(i64 && f32);
+    assert(i32 && i64 && f32);
 
     CobraType *option_a = cobra_type_new(&arena, COBRA_TYPE_OPTION);
     CobraType *option_b = cobra_type_new(&arena, COBRA_TYPE_OPTION);
@@ -31,6 +32,61 @@ int main(void) {
     assert(cobra_type_error(result) == f32);
     assert(result->abi == COBRA_ABI_SUM_INDIRECT);
     assert(result->size == COBRA_NATIVE_SUM_TAG_SIZE + 2 * COBRA_NATIVE_SUM_SCALAR_SIZE);
+
+    /* Narrow generic-instantiation milestone: one canonical placeholder can
+       specialize scalar Option and Result descriptors. Instantiation finalizes
+       the ABI and interns equivalent results in the same arena. */
+    CobraType *parameter = cobra_type_make(&arena, COBRA_TYPE_GENERIC_PARAM, "T",
+                                           NULL, NULL, NULL, NULL,
+                                           COBRA_OWNERSHIP_VALUE,
+                                           COBRA_MUTABILITY_DEFAULT, -1);
+    CobraType *option_template = cobra_type_make(&arena, COBRA_TYPE_OPTION, NULL,
+                                                 parameter, NULL, NULL, NULL,
+                                                 COBRA_OWNERSHIP_VALUE,
+                                                 COBRA_MUTABILITY_DEFAULT, -1);
+    assert(parameter && option_template);
+    CobraType *instantiated_option = cobra_type_instantiate(&arena, option_template,
+                                                             parameter, i64);
+    CobraType *same_option = cobra_type_instantiate(&arena, option_template,
+                                                    parameter, i64);
+    assert(instantiated_option && same_option);
+    assert(instantiated_option == same_option);
+    assert(instantiated_option->finalized);
+    assert(cobra_type_element(instantiated_option) == i64);
+    assert(instantiated_option->abi == COBRA_ABI_SUM_INDIRECT);
+    assert(!cobra_type_add_generic_arg(instantiated_option, f32));
+
+    CobraType *result_template = cobra_type_make(&arena, COBRA_TYPE_RESULT, NULL,
+                                                 parameter, i32, NULL, NULL,
+                                                 COBRA_OWNERSHIP_VALUE,
+                                                 COBRA_MUTABILITY_DEFAULT, -1);
+    assert(result_template);
+    CobraType *instantiated_result = cobra_type_instantiate(&arena, result_template,
+                                                            parameter, f32);
+    assert(instantiated_result && instantiated_result->finalized);
+    assert(cobra_type_element(instantiated_result)->kind == COBRA_TYPE_F32);
+    assert(cobra_type_error(instantiated_result) == i32);
+    assert(instantiated_result->abi == COBRA_ABI_SUM_INDIRECT);
+
+    static CobraTypeArena generic_negative;
+    cobra_type_arena_init(&generic_negative);
+    CobraType *negative_param = cobra_type_make(&generic_negative,
+                                                COBRA_TYPE_GENERIC_PARAM, "T",
+                                                NULL, NULL, NULL, NULL,
+                                                COBRA_OWNERSHIP_VALUE,
+                                                COBRA_MUTABILITY_DEFAULT, -1);
+    CobraType *negative_template = cobra_type_make(&generic_negative,
+                                                   COBRA_TYPE_OPTION, NULL,
+                                                   negative_param, NULL, NULL, NULL,
+                                                   COBRA_OWNERSHIP_VALUE,
+                                                   COBRA_MUTABILITY_DEFAULT, -1);
+    CobraType *list_argument = cobra_type_make(&generic_negative, COBRA_TYPE_LIST, NULL,
+                                               i64, NULL, NULL, NULL,
+                                               COBRA_OWNERSHIP_VALUE,
+                                               COBRA_MUTABILITY_DEFAULT, -1);
+    assert(!cobra_type_instantiate(&generic_negative, negative_template,
+                                   negative_param, list_argument));
+    assert(strstr(generic_negative.error, "scalar arguments") != NULL);
 
     CobraType *list = cobra_type_new(&arena, COBRA_TYPE_LIST);
     assert(list && cobra_type_add_generic_arg(list, f32));

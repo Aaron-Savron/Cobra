@@ -116,6 +116,7 @@ const char *cobra_type_kind_name(CobraTypeKind kind) {
         case COBRA_TYPE_NONE: return "none";
         case COBRA_TYPE_OPTION: return "Option";
         case COBRA_TYPE_RESULT: return "Result";
+        case COBRA_TYPE_GENERIC_PARAM: return "generic parameter";
         case COBRA_TYPE_ENUM: return "enum";
         case COBRA_TYPE_STRUCT: return "struct";
         case COBRA_TYPE_UNKNOWN: return "unknown";
@@ -197,6 +198,10 @@ static size_t scalar_size(CobraTypeKind kind, CobraAbiKind *abi, size_t *alignme
     if (alignment) *alignment = 8;
     if (kind == COBRA_TYPE_VOID) {
         if (abi) *abi = COBRA_ABI_VOID;
+        return 0;
+    }
+    if (kind == COBRA_TYPE_GENERIC_PARAM) {
+        if (abi) *abi = COBRA_ABI_INVALID;
         return 0;
     }
     if (kind == COBRA_TYPE_F32) {
@@ -286,7 +291,11 @@ static bool finalize_type(CobraTypeArena *arena, CobraType *type,
         size = 8;
         alignment = 8;
     } else if (size == 0 && type->kind != COBRA_TYPE_UNTYPED) {
-        type_error(arena, "type '%s' has no ABI representation", cobra_type_kind_name(type->kind));
+        if (type->kind == COBRA_TYPE_GENERIC_PARAM)
+            type_error(arena, "generic parameter '%s' must be instantiated before ABI lowering",
+                       type->name[0] ? type->name : "<unnamed>");
+        else
+            type_error(arena, "type '%s' has no ABI representation", cobra_type_kind_name(type->kind));
         return false;
     }
 
@@ -400,6 +409,90 @@ CobraType *cobra_type_make(CobraTypeArena *arena, CobraTypeKind kind, const char
     if (key && !cobra_type_add_generic_arg(type, key)) return NULL;
     if (value && !cobra_type_add_generic_arg(type, value)) return NULL;
     return type;
+}
+
+static bool scalar_generic_argument(const CobraType *type) {
+    if (!type) return false;
+    switch (type->kind) {
+        case COBRA_TYPE_I32:
+        case COBRA_TYPE_I64:
+        case COBRA_TYPE_U8:
+        case COBRA_TYPE_U32:
+        case COBRA_TYPE_U64:
+        case COBRA_TYPE_F32:
+        case COBRA_TYPE_BOOL:
+        case COBRA_TYPE_ENUM:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool type_contains_parameter(const CobraType *type, const CobraType *parameter) {
+    if (!type || !parameter) return false;
+    if (type == parameter) return true;
+    for (size_t i = 0; i < type->generic_arg_count; i++) {
+        if (type_contains_parameter(type->generic_args[i], parameter)) return true;
+    }
+    return false;
+}
+
+static CobraType *intern_finalized_type(CobraTypeArena *arena, CobraType *candidate) {
+    if (!arena || !candidate) return NULL;
+    for (size_t i = 0; i < arena->count; i++) {
+        CobraType *existing = &arena->nodes[i];
+        if (existing == candidate || !existing->finalized) continue;
+        if (cobra_type_equal(existing, candidate)) return existing;
+    }
+    return candidate;
+}
+
+CobraType *cobra_type_instantiate(CobraTypeArena *arena,
+                                  const CobraType *template_type,
+                                  const CobraType *parameter,
+                                  const CobraType *argument) {
+    if (!arena || !template_type || !parameter || !argument) return NULL;
+    if (parameter->kind != COBRA_TYPE_GENERIC_PARAM) {
+        type_error(arena, "generic substitution requires a generic parameter placeholder");
+        return NULL;
+    }
+    if (!scalar_generic_argument(argument)) {
+        type_error(arena, "this generic slice only accepts scalar arguments");
+        return NULL;
+    }
+    if (template_type->kind != COBRA_TYPE_OPTION &&
+        template_type->kind != COBRA_TYPE_RESULT) {
+        type_error(arena, "this generic slice only instantiates Option or Result");
+        return NULL;
+    }
+    size_t required = template_type->kind == COBRA_TYPE_RESULT ? 2 : 1;
+    if (template_type->generic_arg_count != required ||
+        !type_contains_parameter(template_type, parameter)) {
+        type_error(arena, "generic parameter is not present in the Option or Result template");
+        return NULL;
+    }
+
+    const CobraType *components[2] = {0};
+    for (size_t i = 0; i < required; i++) {
+        const CobraType *component = template_type->generic_args[i];
+        components[i] = component == parameter ? argument : component;
+        if (components[i]->kind == COBRA_TYPE_GENERIC_PARAM) {
+            type_error(arena, "generic instantiation leaves an unresolved parameter");
+            return NULL;
+        }
+    }
+    CobraType *candidate = cobra_type_make(
+        arena, template_type->kind, template_type->name,
+        components[0], required == 2 ? components[1] : NULL,
+        NULL, NULL,
+        template_type->ownership, template_type->mutability,
+        template_type->region_id);
+    if (!candidate) {
+        type_error(arena, "could not construct instantiated generic descriptor");
+        return NULL;
+    }
+    if (!cobra_type_validate(arena, candidate)) return NULL;
+    return intern_finalized_type(arena, candidate);
 }
 
 bool cobra_type_validate(CobraTypeArena *arena, const CobraType *type) {
