@@ -4,6 +4,19 @@
 #include <stdio.h>
 #include <string.h>
 
+static CobraType *substitute_one(CobraTypeArena *arena, const CobraType *template_type,
+                                 const CobraType *parameter, const CobraType *argument) {
+    CobraTypeBinding binding = {parameter, argument};
+    return cobra_type_substitute(arena, template_type, &binding, 1, NULL);
+}
+
+static CobraType *substitute_one_named(CobraTypeArena *arena, const CobraType *template_type,
+                                       const CobraType *parameter, const CobraType *argument,
+                                       const char *specialized_name) {
+    CobraTypeBinding binding = {parameter, argument};
+    return cobra_type_substitute(arena, template_type, &binding, 1, specialized_name);
+}
+
 int main(void) {
     static CobraTypeArena arena;
     cobra_type_arena_init(&arena);
@@ -45,9 +58,9 @@ int main(void) {
                                                  COBRA_OWNERSHIP_VALUE,
                                                  COBRA_MUTABILITY_DEFAULT, -1);
     assert(parameter && option_template);
-    CobraType *instantiated_option = cobra_type_instantiate(&arena, option_template,
+    CobraType *instantiated_option = substitute_one(&arena, option_template,
                                                              parameter, i64);
-    CobraType *same_option = cobra_type_instantiate(&arena, option_template,
+    CobraType *same_option = substitute_one(&arena, option_template,
                                                     parameter, i64);
     assert(instantiated_option && same_option);
     assert(instantiated_option == same_option);
@@ -61,7 +74,7 @@ int main(void) {
                                                  COBRA_OWNERSHIP_VALUE,
                                                  COBRA_MUTABILITY_DEFAULT, -1);
     assert(result_template);
-    CobraType *instantiated_result = cobra_type_instantiate(&arena, result_template,
+    CobraType *instantiated_result = substitute_one(&arena, result_template,
                                                             parameter, f32);
     assert(instantiated_result && instantiated_result->finalized);
     assert(cobra_type_element(instantiated_result)->kind == COBRA_TYPE_F32);
@@ -84,13 +97,13 @@ int main(void) {
     assert(cobra_type_add_field(box_template, "value", struct_parameter,
                                 COBRA_OWNERSHIP_VALUE,
                                 COBRA_MUTABILITY_DEFAULT, -1));
-    CobraType *box_i64 = cobra_type_instantiate_struct(&generic_struct_arena,
+    CobraType *box_i64 = substitute_one_named(&generic_struct_arena,
                                                        box_template, struct_parameter,
                                                        i64, "Box__i64");
-    CobraType *same_box_i64 = cobra_type_instantiate_struct(&generic_struct_arena,
+    CobraType *same_box_i64 = substitute_one_named(&generic_struct_arena,
                                                             box_template, struct_parameter,
                                                             i64, "Box__i64");
-    CobraType *box_f32 = cobra_type_instantiate_struct(&generic_struct_arena,
+    CobraType *box_f32 = substitute_one_named(&generic_struct_arena,
                                                        box_template, struct_parameter,
                                                        f32, "Box__f32");
     assert(box_i64 && same_box_i64 && box_f32);
@@ -114,10 +127,10 @@ int main(void) {
     assert(cobra_type_add_field(outer_template, "inner", box_template,
                                 COBRA_OWNERSHIP_VALUE,
                                 COBRA_MUTABILITY_DEFAULT, -1));
-    CobraType *outer_i64 = cobra_type_instantiate_struct(&generic_struct_arena,
+    CobraType *outer_i64 = substitute_one_named(&generic_struct_arena,
                                                          outer_template, struct_parameter,
                                                          i64, "Outer__i64");
-    CobraType *outer_i64_alias = cobra_type_instantiate_struct(&generic_struct_arena,
+    CobraType *outer_i64_alias = substitute_one_named(&generic_struct_arena,
                                                                outer_template, struct_parameter,
                                                                i64, "Outer_spelling_independent");
     assert(outer_i64 && outer_i64_alias && outer_i64 == outer_i64_alias);
@@ -144,10 +157,10 @@ int main(void) {
     assert(cobra_type_add_field(view_template, "data", view_slice,
                                 COBRA_OWNERSHIP_BORROWED,
                                 COBRA_MUTABILITY_READONLY, -1));
-    CobraType *view_i64 = cobra_type_instantiate_struct(&generic_struct_arena,
+    CobraType *view_i64 = substitute_one_named(&generic_struct_arena,
                                                         view_template, view_parameter,
                                                         i64, "View__i64");
-    CobraType *same_view_i64 = cobra_type_instantiate_struct(&generic_struct_arena,
+    CobraType *same_view_i64 = substitute_one_named(&generic_struct_arena,
                                                              view_template, view_parameter,
                                                              i64, "View__i64");
     assert(view_i64 && same_view_i64 && view_i64 == same_view_i64);
@@ -159,16 +172,31 @@ int main(void) {
     assert(view_i64->fields[0].mutability == COBRA_MUTABILITY_READONLY);
     assert(view_i64->fields[0].region_id == -1);
 
+    /* A borrowed View[T] nested inside another by-value generic struct is
+       intentionally outside this frozen ownership contract. It must fail at
+       canonical substitution rather than silently losing the view owner. */
+    CobraType *view_holder = cobra_type_named(&generic_struct_arena,
+                                               COBRA_TYPE_STRUCT, "ViewHolder");
+    assert(view_holder);
+    assert(cobra_type_add_generic_arg(view_holder, view_parameter));
+    assert(cobra_type_add_field(view_holder, "view", view_template,
+                                COBRA_OWNERSHIP_VALUE,
+                                COBRA_MUTABILITY_DEFAULT, -1));
+    CobraTypeBinding view_holder_binding = {view_parameter, i64};
+    assert(!cobra_type_substitute(&generic_struct_arena, view_holder,
+                                  &view_holder_binding, 1, "ViewHolder__i64"));
+    assert(strstr(generic_struct_arena.error, "unsupported ownership or ABI contract") != NULL);
+
     /* Readonly generic slices keep the borrowed pointer-plus-length ABI while
        selecting an element-specific storage kind during substitution. */
     CobraType *readonly_slice_template = cobra_type_make(
         &arena, COBRA_TYPE_SLICE, NULL, parameter, NULL, NULL, NULL,
         COBRA_OWNERSHIP_BORROWED, COBRA_MUTABILITY_READONLY, -1);
     assert(readonly_slice_template);
-    CobraType *readonly_f32 = cobra_type_instantiate(&arena,
+    CobraType *readonly_f32 = substitute_one(&arena,
                                                      readonly_slice_template,
                                                      parameter, f32);
-    CobraType *same_readonly_f32 = cobra_type_instantiate(&arena,
+    CobraType *same_readonly_f32 = substitute_one(&arena,
                                                           readonly_slice_template,
                                                           parameter, f32);
     assert(readonly_f32 && same_readonly_f32);
@@ -196,9 +224,54 @@ int main(void) {
                                                i64, NULL, NULL, NULL,
                                                COBRA_OWNERSHIP_VALUE,
                                                COBRA_MUTABILITY_DEFAULT, -1);
-    assert(!cobra_type_instantiate(&generic_negative, negative_template,
-                                   negative_param, list_argument));
+    assert(!substitute_one(&generic_negative, negative_template,
+                            negative_param, list_argument));
     assert(strstr(generic_negative.error, "scalar argument") != NULL);
+
+    /* The public substitution operation intentionally rejects multiple
+       bindings until multi-parameter specialization has a complete identity,
+       naming, and ABI contract. */
+    CobraType *second_param = cobra_type_make(&generic_negative,
+                                              COBRA_TYPE_GENERIC_PARAM, "U",
+                                              NULL, NULL, NULL, NULL,
+                                              COBRA_OWNERSHIP_VALUE,
+                                              COBRA_MUTABILITY_DEFAULT, -1);
+    CobraTypeBinding multiple_bindings[2] = {
+        {negative_param, i64}, {second_param, f32}
+    };
+    assert(second_param);
+    assert(!cobra_type_substitute(&generic_negative, negative_template,
+                                  multiple_bindings, 2, NULL));
+    assert(strstr(generic_negative.error, "exactly one binding") != NULL);
+
+    /* A generic specialization must detect by-value recursive templates before
+       allocating an unbounded chain of generated descriptors. */
+    static CobraTypeArena specialization_cycle;
+    cobra_type_arena_init(&specialization_cycle);
+    CobraType *cycle_param = cobra_type_make(&specialization_cycle,
+                                             COBRA_TYPE_GENERIC_PARAM, "T",
+                                             NULL, NULL, NULL, NULL,
+                                             COBRA_OWNERSHIP_VALUE,
+                                             COBRA_MUTABILITY_DEFAULT, -1);
+    CobraType *cycle_template = cobra_type_named(&specialization_cycle,
+                                                  COBRA_TYPE_STRUCT, "Recursive");
+    assert(cycle_param && cycle_template);
+    assert(cobra_type_add_generic_arg(cycle_template, cycle_param));
+    assert(cobra_type_add_field(cycle_template, "next", cycle_template,
+                                COBRA_OWNERSHIP_VALUE,
+                                COBRA_MUTABILITY_DEFAULT, -1));
+    CobraTypeBinding cycle_binding = {cycle_param, i64};
+    assert(!cobra_type_substitute(&specialization_cycle, cycle_template,
+                                  &cycle_binding, 1, "Recursive__i64"));
+    assert(strstr(specialization_cycle.error, "recursive generic specialization") != NULL);
+
+    /* Canonical arenas fail closed rather than returning a descriptor outside
+       their fixed storage contract. */
+    static CobraTypeArena exhausted;
+    cobra_type_arena_init(&exhausted);
+    for (size_t i = 0; i < COBRA_MAX_TYPE_NODES; i++)
+        assert(cobra_type_new(&exhausted, COBRA_TYPE_I64) != NULL);
+    assert(cobra_type_new(&exhausted, COBRA_TYPE_I64) == NULL);
 
     CobraType *list = cobra_type_new(&arena, COBRA_TYPE_LIST);
     assert(list && cobra_type_add_generic_arg(list, f32));

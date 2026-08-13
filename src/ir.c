@@ -1,6 +1,8 @@
 #include "../include/cobra.h"
 #include <limits.h>
 
+#define COBRA_IR_TYPE_RECURSION_LIMIT 128
+
 typedef struct {
     char name[COBRA_MAX_IDENT_LEN];
     CobraTypeKind type;
@@ -832,7 +834,8 @@ static const CobraType *specialize_canonical_type(IRContext *ctx,
     if ((type->kind == COBRA_TYPE_OPTION || type->kind == COBRA_TYPE_RESULT ||
          generic_slice_kind(type->kind)) &&
         type_contains_generic_type(type, parameter)) {
-        return cobra_type_instantiate(ctx->canonical_arena, type, parameter, argument);
+        CobraTypeBinding binding = {parameter, argument};
+        return cobra_type_substitute(ctx->canonical_arena, type, &binding, 1, NULL);
     }
     if (type->kind == COBRA_TYPE_STRUCT && type->generic_arg_count > 0 &&
         type_contains_generic_type(type, parameter)) {
@@ -1159,8 +1162,29 @@ static bool node_is_typed_declaration(const ASTNode *node) {
            node->declared_type != COBRA_TYPE_UNTYPED;
 }
 
+static bool canonical_contains_generic(const CobraType *type, size_t depth) {
+    if (!type || depth >= COBRA_IR_TYPE_RECURSION_LIMIT) return false;
+    if (type->kind == COBRA_TYPE_GENERIC_PARAM) return true;
+    for (size_t i = 0; i < type->generic_arg_count; i++) {
+        if (canonical_contains_generic(type->generic_args[i], depth + 1)) return true;
+    }
+    for (size_t i = 0; i < type->field_count; i++) {
+        if (canonical_contains_generic(type->fields[i].type, depth + 1)) return true;
+    }
+    return false;
+}
+
 static void check_canonical_tree(IRContext *ctx, ASTNode *node) {
     if (!ctx || !node) return;
+    if (node->canonical_type && canonical_contains_generic(node->canonical_type, 0)) {
+        fprintf(stderr,
+                "%s:%d:%d: internal error: unresolved generic parameter reached IR/codegen at '%s'\n",
+                node->source_file[0] ? node->source_file : "<source>",
+                node->source_line > 0 ? node->source_line : 1,
+                node->source_col > 0 ? node->source_col : 1,
+                node->name[0] ? node->name : "<anonymous>");
+        exit(EXIT_FAILURE);
+    }
     if (node_is_typed_declaration(node) && !node->canonical_type) {
         /* Every explicitly typed declaration must carry canonical metadata
            after inference. Losing it is a compiler invariant violation, not a

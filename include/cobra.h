@@ -302,28 +302,14 @@ CobraType *cobra_type_make(CobraTypeArena *arena, CobraTypeKind kind, const char
 bool cobra_type_add_generic_arg(CobraType *type, const CobraType *argument);
 /* Recursively substitute canonical generic metadata, preserving ownership,
    mutability, region origin, field layout, ABI finalization, and interning.
-   The current source lane supplies one binding, but the operation is binding
-   list-shaped so later generic parameters do not need another type system. */
+   The current contract is exactly one scalar binding; multi-parameter
+   substitution is intentionally rejected until the specialization model is
+   extended. */
 CobraType *cobra_type_substitute(CobraTypeArena *arena,
                                  const CobraType *template_type,
                                  const CobraTypeBinding *bindings,
                                  size_t binding_count,
                                  const char *specialized_name);
-/* Instantiate one scalar generic parameter in an Option[T] or Result[T, E]
-   descriptor. The returned descriptor is finalized, immutable through the
-   canonical mutators, and interned against equivalent instantiated types. */
-CobraType *cobra_type_instantiate(CobraTypeArena *arena,
-                                  const CobraType *template_type,
-                                  const CobraType *parameter,
-                                  const CobraType *argument);
-/* Instantiate a one-parameter immutable struct template. Scalar fields and
-   readonly borrowed scalar slices are finalized, packed-layout checked, and
-   interned by name and field shape; owned and mutable fields are rejected. */
-CobraType *cobra_type_instantiate_struct(CobraTypeArena *arena,
-                                         const CobraType *template_type,
-                                         const CobraType *parameter,
-                                         const CobraType *argument,
-                                         const char *specialized_name);
 const CobraType *cobra_type_element(const CobraType *type);
 const CobraType *cobra_type_error(const CobraType *type);
 const CobraType *cobra_type_key(const CobraType *type);

@@ -10,6 +10,11 @@ typedef struct {
     const CobraType *right;
 } TypePair;
 
+typedef struct {
+    const CobraType *stack[COBRA_TYPE_RECURSION_LIMIT];
+    size_t depth;
+} SubstitutionState;
+
 static void type_error(CobraTypeArena *arena, const char *format, ...) {
     if (!arena || arena->error[0] != '\0') return;
     va_list args;
@@ -596,7 +601,8 @@ static CobraType *substitute_recursive(CobraTypeArena *arena,
                                        const CobraTypeBinding *bindings,
                                        size_t binding_count,
                                        const char *name_override,
-                                       bool top_level) {
+                                       bool top_level,
+                                       const SubstitutionState *state) {
     if (!arena || !type) return NULL;
     const CobraType *bound = binding_value(type, bindings, binding_count);
     if (bound) return (CobraType *)bound;
@@ -605,11 +611,24 @@ static CobraType *substitute_recursive(CobraTypeArena *arena,
         return NULL;
     }
     if (!type_has_binding(type, bindings, binding_count)) return (CobraType *)type;
+    if (!state || state->depth >= COBRA_TYPE_RECURSION_LIMIT) {
+        type_error(arena, "generic specialization exceeds recursion depth");
+        return NULL;
+    }
+    for (size_t i = 0; i < state->depth; i++) {
+        if (state->stack[i] == type) {
+            type_error(arena, "recursive generic specialization includes '%s'",
+                       type->name[0] ? type->name : cobra_type_kind_name(type->kind));
+            return NULL;
+        }
+    }
+    SubstitutionState next_state = *state;
+    next_state.stack[next_state.depth++] = type;
 
     const CobraType *arguments[COBRA_MAX_TYPE_ARGS] = {0};
     for (size_t i = 0; i < type->generic_arg_count; i++) {
         arguments[i] = substitute_recursive(arena, type->generic_args[i], bindings,
-                                            binding_count, NULL, false);
+                                            binding_count, NULL, false, &next_state);
         if (!arguments[i]) return NULL;
     }
 
@@ -658,7 +677,8 @@ static CobraType *substitute_recursive(CobraTypeArena *arena,
     for (size_t i = 0; i < type->field_count; i++) {
         const CobraTypeField *source = &type->fields[i];
         const CobraType *field_type = substitute_recursive(arena, source->type, bindings,
-                                                            binding_count, NULL, false);
+                                                            binding_count, NULL, false,
+                                                            &next_state);
         if (!field_type || !substituted_field_allowed(source, field_type,
                                                         bindings, binding_count)) {
             type_error(arena, "generic field '%s' has an unsupported ownership or ABI contract",
@@ -687,8 +707,13 @@ CobraType *cobra_type_substitute(CobraTypeArena *arena,
         }
     }
     arena->error[0] = '\0';
+    if (binding_count != 1) {
+        type_error(arena, "canonical substitution currently requires exactly one binding");
+        return NULL;
+    }
+    SubstitutionState state = {{0}, 0};
     return substitute_recursive(arena, template_type, bindings, binding_count,
-                                specialized_name, true);
+                                specialized_name, true, &state);
 }
 
 static CobraType *intern_finalized_type(CobraTypeArena *arena, CobraType *candidate) {
@@ -699,26 +724,6 @@ static CobraType *intern_finalized_type(CobraTypeArena *arena, CobraType *candid
         if (cobra_type_equal(existing, candidate)) return existing;
     }
     return candidate;
-}
-
-CobraType *cobra_type_instantiate(CobraTypeArena *arena,
-                                  const CobraType *template_type,
-                                  const CobraType *parameter,
-                                  const CobraType *argument) {
-    if (!arena || !template_type || !parameter || !argument) return NULL;
-    CobraTypeBinding binding = {parameter, argument};
-    return cobra_type_substitute(arena, template_type, &binding, 1, NULL);
-}
-
-CobraType *cobra_type_instantiate_struct(CobraTypeArena *arena,
-                                         const CobraType *template_type,
-                                         const CobraType *parameter,
-                                         const CobraType *argument,
-                                         const char *specialized_name) {
-    if (!arena || !template_type || !parameter || !argument ||
-        !specialized_name || !specialized_name[0]) return NULL;
-    CobraTypeBinding binding = {parameter, argument};
-    return cobra_type_substitute(arena, template_type, &binding, 1, specialized_name);
 }
 
 bool cobra_type_validate(CobraTypeArena *arena, const CobraType *type) {
