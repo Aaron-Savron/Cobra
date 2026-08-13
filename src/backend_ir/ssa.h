@@ -31,6 +31,9 @@
 typedef uint32_t SsaValueRef;
 typedef uint32_t SsaInstRef;
 typedef uint32_t SsaBlockRef;
+typedef uint32_t HirBlockRef;
+
+#define HIR_BLOCK_NONE ((HirBlockRef)0)
 
 #define SSA_VALUE_NONE ((SsaValueRef)0)
 #define SSA_INST_NONE  ((SsaInstRef)0)
@@ -77,6 +80,14 @@ typedef enum {
     SSA_EFFECT_CALL
 } SsaEffect;
 
+/* The first memory model is deliberately explicit about its limitation: it
+   uses integer indices into the evaluator's slot array, not native pointers.
+   Real pointer/address-space lowering is a later backend milestone. */
+typedef enum {
+    SSA_ADDRESS_INTEGER_SLOT = 0,
+    SSA_ADDRESS_NATIVE_POINTER
+} SsaAddressKind;
+
 typedef struct {
     SsaValueKind kind;
     const CobraType *type;      /* canonical, finalized                */
@@ -101,6 +112,10 @@ typedef struct {
     uint32_t edge2_start;       /* edge args for target2               */
     uint32_t edge2_count;
     SsaEffect effect;
+    SsaAddressKind address_kind; /* load/store address interpretation   */
+    uint32_t memory_width;       /* bytes; scalar prototype uses 8       */
+    uint32_t memory_alignment;  /* bytes; scalar prototype uses 8       */
+    uint32_t address_space;     /* 0 = evaluator slot space             */
     char callee[BIR_MAX_CALLEE_NAME]; /* for SSA_OP_CALL               */
     int source_line;
     int source_col;
@@ -162,6 +177,7 @@ struct HirExpr {
     HirExprKind kind;
     int64_t const_i64;
     uint32_t local;           /* for LOCAL                              */
+    const CobraType *type;    /* canonical type owned by the backend module */
     SsaOpcode binop;          /* for BINOP                              */
     char callee[BIR_MAX_CALLEE_NAME]; /* for CALL                      */
     HirExpr **args;
@@ -191,23 +207,23 @@ typedef enum {
 
 typedef struct {
     HirTermKind kind;
-    SsaBlockRef target;       /* JUMP target / BRANCH then             */
-    SsaBlockRef target2;      /* BRANCH else                           */
+    HirBlockRef target;       /* JUMP target / BRANCH then             */
+    HirBlockRef target2;      /* BRANCH else                           */
     HirExpr *cond;            /* BRANCH condition                      */
     HirExpr *ret_expr;        /* RETURN value (NULL = bare return)     */
 } HirTerm;
 
 typedef struct {
-    SsaBlockRef id;
+    HirBlockRef id;
     char name[32];
     HirStmt *stmts;
     size_t stmt_count;
     size_t stmt_cap;
     HirTerm term;
-    SsaBlockRef *preds;
+    HirBlockRef *preds;
     size_t pred_count;
     size_t pred_cap;
-    SsaBlockRef *succs;
+    HirBlockRef *succs;
     size_t succ_count;
     size_t succ_cap;
     bool is_entry;
@@ -217,6 +233,7 @@ typedef struct {
 
 typedef struct {
     char name[BIR_MAX_CALLEE_NAME];
+    const CobraType *type;      /* canonical type owned by the HIR module */
     bool is_param;
     int source_line;
     int source_col;
@@ -225,7 +242,8 @@ typedef struct {
 typedef struct {
     char name[BIR_MAX_CALLEE_NAME];
     size_t param_count;
-    const CobraType *return_type; /* i64 or void                        */
+    const CobraType *param_types[BIR_MAX_PARAMS];
+    const CobraType *return_type; /* currently i64, bool, or void       */
     HirLocal locals[BIR_MAX_LOCALS];
     size_t local_count;
     HirBlock *blocks;          /* block 0 is entry                     */
@@ -241,6 +259,9 @@ typedef struct {
     char name[BIR_MAX_CALLEE_NAME];
     SsaBlockRef entry;
     size_t param_count;
+    const CobraType *param_types[BIR_MAX_PARAMS];
+    CobraAbiKind param_abi[BIR_MAX_PARAMS];
+    CobraAbiKind return_abi;
     /* Function-parameter SSA values, in declaration order. Kept here because
        the module value pool is shared across functions and a value-scan would
        bind the wrong function's parameters. */
@@ -253,6 +274,9 @@ typedef struct {
     SsaArena arena;
     /* Heap-allocated: CobraTypeArena embeds a 2048-entry node array (~6.7 MB),
        far too large to embed by value in a stack-allocated module. */
+    /* The backend owns this arena and imports only the supported canonical
+       scalar descriptors from the frontend AST; HIR and SSA never retain
+       pointers into the parser's arena. */
     CobraTypeArena *type_arena;
     const CobraType *type_i64;
     const CobraType *type_void;
@@ -293,6 +317,10 @@ bool bir_set_return(SsaArena *arena, SsaBlockRef block, SsaValueRef value,
 
 /* Low-level function registration (used by the HIR pipeline and by direct
    SSA unit tests). params may be NULL when the function has no parameters. */
+bool bir_declare_function(BackendIrModule *module, const char *name,
+                           size_t param_count,
+                           const CobraType *const *param_types,
+                           const CobraType *return_type, bool has_return);
 bool bir_register_function_info(BackendIrModule *module, const char *name,
                                 SsaBlockRef entry, size_t param_count,
                                 const SsaValueRef *params,

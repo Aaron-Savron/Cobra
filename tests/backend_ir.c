@@ -61,22 +61,38 @@ static void differential(const char *name, const char *source, int64_t expected)
     int64_t ssa_result = 0;
     char err[512] = {0};
     bool ssa_ok = pipeline_run(program, "main", &ssa_result, err, sizeof(err));
-    if (host_ok != ssa_ok) {
+    checks++;
+    if (!host_ok || !ssa_ok) {
         failures++;
-        checks++;
-        fprintf(stderr, "FAIL %s: interpreter=%d backend=%d (%s)\n",
+        fprintf(stderr, "FAIL %s: expected success, interpreter=%d backend=%d (%s)\n",
                 name, host_ok, ssa_ok, err);
-    } else if (host_ok) {
-        checks++;
-        if (host_result != ssa_result || (int64_t)host_result != expected) {
-            failures++;
-            fprintf(stderr, "FAIL %s: host=%d ssa=%lld expected=%lld\n",
-                    name, host_result, (long long)ssa_result,
-                    (long long)expected);
-        }
-    } else {
-        checks++;
-        fprintf(stderr, "note: %s rejected by both engines (%s)\n", name, err);
+    } else if (host_result != ssa_result || (int64_t)host_result != expected) {
+        failures++;
+        fprintf(stderr, "FAIL %s: host=%d ssa=%lld expected=%lld\n",
+                name, host_result, (long long)ssa_result,
+                (long long)expected);
+    }
+    ast_free(program);
+}
+
+/* Rejection cases are separate from successful differential cases: both
+   engines must reject, and the backend must report the expected diagnostic
+   class rather than passing merely because execution did not happen. */
+static void differential_rejected(const char *name, const char *source,
+                                  const char *expected_reason) {
+    ASTNode *program = parse_program(source);
+    CHECK(program != NULL);
+    if (!program) return;
+    int host_result = 0;
+    bool host_ok = interpreter_run_function(program, "main", &host_result);
+    int64_t ssa_result = 0;
+    char err[512] = {0};
+    bool ssa_ok = pipeline_run(program, "main", &ssa_result, err, sizeof(err));
+    checks++;
+    if (host_ok || ssa_ok || !strstr(err, expected_reason)) {
+        failures++;
+        fprintf(stderr, "FAIL %s: expected rejection '%s', interpreter=%d backend=%d (%s)\n",
+                name, expected_reason, host_ok, ssa_ok, err);
     }
     ast_free(program);
 }
@@ -178,10 +194,12 @@ static void test_differential(void) {
                  "  }\n"
                  "  return 0\n", 100);
 
-    differential_body("read before assignment on a path",
+    differential_rejected("read before assignment on a path",
+                 "def main() -> i64: {\n"
                  "  x = 0\n"
                  "  if x == 1: { y = 5 }\n"
-                 "  return y\n", 0);
+                 "  return y\n"
+                 "}\n", "read before assignment");
 }
 
 /* Differential test over a single main() body (wraps it in a function). */
@@ -432,6 +450,20 @@ static void test_generic_rejected(void) {
     }
 }
 
+static void test_typed_call_rejected(void) {
+    ASTNode *program = parse_program(
+        "def takes(x: i64) -> i64: { return x }\n"
+        "def main() -> i64: { return takes(true) }\n");
+    CHECK(program != NULL);
+    if (!program) return;
+    BackendIrModule module;
+    bir_module_init(&module, "<unit:typed_call>");
+    CHECK(!bir_build_program(&module, program));
+    CHECK(strstr(module.error, "wrong type") != NULL);
+    bir_module_free(&module);
+    ast_free(program);
+}
+
 static void test_nonfinalized_type_rejected(void) {
     BackendIrModule module;
     bir_module_init(&module, "<unit:unfinalized>");
@@ -510,6 +542,7 @@ int main(void) {
     test_arity_mismatch_rejected();
     test_use_before_def_rejected();
     test_generic_rejected();
+    test_typed_call_rejected();
     test_nonfinalized_type_rejected();
     test_unknown_callee_rejected();
     test_printer_deterministic();

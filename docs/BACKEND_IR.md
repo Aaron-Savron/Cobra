@@ -1,9 +1,9 @@
 # Backend IR Design
 
-This document describes the first backend-IR foundation: a typed, flat,
-arena-backed SSA representation with an explicit CFG, built as a separate,
-isolated component. It is deliberately **not** wired into the existing
-direct-to-assembly pipeline yet. The current `CobraIR` (src/ir.c) remains a
+This document describes the first backend-IR foundation: a flat,
+arena-backed SSA representation with an explicit CFG and an i64/bool-typed
+HIR subset, built as a separate, isolated component. It is deliberately **not**
+wired into the existing direct-to-assembly pipeline yet. The current `CobraIR` (src/ir.c) remains a
 validation pass over the AST and is untouched; codegen continues to consume
 the AST directly.
 
@@ -11,7 +11,7 @@ the AST directly.
 Cobra source
   -> tokens (lexer)
   -> syntax AST (parser)
-  -> typed HIR / explicit CFG with mutable source locals   <-- new
+  -> scalar-typed HIR / explicit CFG with mutable source locals <-- new
   -> block-argument SSA                                    <-- new
   -> [verifier, textual dump, evaluator]                   <-- new
   -> existing IR validation / native codegen (unchanged)
@@ -21,16 +21,20 @@ Cobra source
 
 Two layers exist for two different jobs.
 
-**Typed HIR (CFG).** The HIR is the semantic CFG that a source program is
-lowered into. It keeps *source-level mutable locals*: a local is a named
-slot, assignments write slots, expressions read slots, and control flow is
+**Scalar-typed HIR (CFG).** The HIR is the semantic CFG that a source program
+is lowered into. Its locals and expressions carry canonical descriptors from
+the backend module's own finalized type arena. The current subset supports
+i64 and bool values only; it is not yet a general typed HIR for slices,
+structs, or other Cobra types. It keeps *source-level mutable locals*: a
+local is a named slot, assignments write slots, expressions read slots, and
+control flow is
 explicit blocks with jumps, conditional branches, and returns. No value
 versioning happens here. The HIR builder consumes the existing AST produced
 by the parser and accepts a deliberately small subset:
 
-- scalar (`i64`) locals via `let`/`var`/`const` and implicit `x = expr`;
+- scalar (`i64`/`bool`) locals via `let`/`var`/`const` and implicit `x = expr`;
 - assignments to scalar locals;
-- integer arithmetic and comparisons;
+- i64 arithmetic and bool-producing comparisons;
 - `if`/`else`;
 - `while` loops;
 - `for` loops over a scalar bound (`for i in n`), over `range(a, b)`, and over
@@ -95,12 +99,12 @@ The instruction set is intentionally minimal and scalar:
 
 | Opcode      | Operands          | Result | Notes                            |
 |-------------|-------------------|--------|----------------------------------|
-| `const`     | —                 | i64    | constant materialization         |
-| `param`     | —                 | i64    | function parameter (entry block) |
-| `block_arg` | —                 | i64    | block parameter (join value)     |
+| `const`     | —                 | i64/bool | constant materialization         |
+| `param`     | —                 | i64/bool | function parameter (entry block) |
+| `block_arg` | —                 | i64/bool | block parameter (join value)     |
 | `add/sub/mul/div/rem` | 2        | i64    | integer arithmetic               |
 | `neg`       | 1                 | i64    | unary minus                      |
-| `eq/ne/lt/le/gt/ge` | 2        | i64    | comparisons yield 0 or 1         |
+| `eq/ne/lt/le/gt/ge` | 2        | bool   | comparisons yield 0 or 1         |
 | `load`      | 1 (address)      | i64    | memory read (effect: read)       |
 | `store`     | 2 (addr, value)  | none   | memory write (effect: write)     |
 | `call`      | n (arguments)    | i64    | user function call (effect: call)|
@@ -115,6 +119,16 @@ No alias analysis is performed (out of scope).
 
 ### Memory/effect semantics
 
+Every instruction that touches memory carries an explicit effect tag and
+explicit prototype memory metadata. The current model is intentionally not a
+native pointer model:
+
+- addresses are integer indices into the evaluator's 8 KiB slot array;
+- accesses use an explicit byte width and alignment, currently 8 and 8;
+- address space 0 is the evaluator slot space;
+- native pointer address spaces, byte widths other than the prototype scalar,
+  and alias identities are not supported yet.
+
 Every instruction that touches memory carries an explicit effect tag:
 
 - `SSA_EFFECT_NONE` — pure value computation;
@@ -123,20 +137,21 @@ Every instruction that touches memory carries an explicit effect tag:
 - `SSA_EFFECT_CALL` — `call`; the callee's effects are opaque to this
   backend lane.
 
-The tags are metadata for future passes (reordering, common-subexpression
-elimination, liveness). The verifier only requires that a `store` is not
-followed in the same block by another `store` with identical operands —
-trivial by construction today — and that effects are recorded. Full
-alias/ordering analysis is explicitly out of scope for this milestone.
+The tags and memory fields are metadata for future passes (reordering,
+common-subexpression elimination, liveness, and eventual alias analysis).
+The verifier currently requires the prototype slot-memory contract and the
+correct read/write effect. Full alias/ordering analysis is explicitly out of
+scope for this milestone.
 
 ### Call ABI metadata
 
 Calls carry the callee name and argument list; the module keeps a function
-table mapping name to entry block, parameter count, and return type. The
-subset ABI is the existing native scalar contract: every parameter and the
-result are `i64`, one value per slot, matching the System V register
-convention for the current Linux x86-64 target. The design deliberately does
-not model stack spilling, vector ABI classes, or sret storage; those belong
+table mapping name to entry block, canonical parameter types, return type,
+and ABI classes. HIR predeclares all signatures before lowering bodies, so
+forward and recursive calls are checked for argument count and canonical type
+identity. The current subset uses i64/bool scalar values and the evaluator
+represents them as integer slots; the design deliberately does not model
+stack spilling, vector ABI classes, or sret storage. Those belong
 to the ABI-lowering layer that will consume this IR later.
 
 ## 4. Source spans
@@ -171,7 +186,10 @@ expressions read them; no versioning happens in the builder.
 
 ## 6. SSA construction pass
 
-The pass consumes the HIR and produces block-argument SSA in three steps:
+The pass consumes the HIR and produces block-argument SSA in three steps.
+This is a deterministic, liveness-based two-pass construction for the current
+straight-line-block subset; it is not an on-demand Braun or sealed-block
+algorithm:
 
 1. **Linearization** — each block's statements are processed in order.
    Expression trees evaluate to SSA values: constants become `const`
@@ -196,9 +214,10 @@ The pass consumes the HIR and produces block-argument SSA in three steps:
    parameter used on a path has exactly one defining edge value. Reading a
    local that is never defined on some path is rejected at build time.
 
-This is a sealed-block construction without phi nodes: no placeholder
-values, no late operand filling, and a deterministic result that the
-verifier can check edge-for-edge.
+This is a liveness-based block-argument construction without phi nodes: no
+placeholder values or late operand filling are needed, and the deterministic
+result can be checked edge-for-edge. A sealed-block algorithm may replace it
+later when the HIR supports richer control-flow and value definitions.
 
 ## 7. Verifier invariants
 
@@ -281,13 +300,29 @@ basis for differential tests against the existing host interpreter.
 - generic-parameter and non-finalized-type rejection by the verifier.
 
 Differential tests parse the same Cobra source with the real parser, run
-each function through the host interpreter (`interpreter_run_function`) and
-through the new SSA evaluator, and require identical results. Supported
-differential programs stay inside the intersection of the two engines'
-subsets (scalar locals, arithmetic, comparisons, `if`/`else`, `while`,
+each successful function through the host interpreter
+(`interpreter_run_function`) and through the new SSA evaluator, and require
+both successful execution and an identical result. Rejection cases are tested
+separately: both engines must reject and the backend diagnostic must contain
+the expected error class. Supported differential programs stay inside the
+intersection of the two engines' subsets (i64/bool locals, arithmetic,
+comparisons, `if`/`else`, `while`,
 `for` over constant arrays, calls, recursion, `return`).
 
-## 11. Explicit non-goals for this milestone
+## 11. Type-arena ownership boundary
+
+The parser owns its frontend canonical arena. Backend IR does not retain
+pointers into that arena. During HIR construction, supported frontend scalar
+kinds are imported by kind into the backend module's separately owned arena;
+HIR and SSA values reference only those backend-owned, finalized descriptors.
+This is an explicit prototype boundary, not a general type-cloning facility:
+compound types and native pointer types remain unsupported until their layout,
+ownership, and ABI import rules are specified.
+
+The new module lives under `src/backend_ir/` and is compiled and tested on
+its own; it is not linked into the production `cobra` binary yet.
+
+## 12. Explicit non-goals for this milestone
 
 - No register allocation, instruction selection, object/binary writers, JIT,
   or new targets.
@@ -296,6 +331,3 @@ subsets (scalar locals, arithmetic, comparisons, `if`/`else`, `while`,
 - No weakening of ownership/region/lifetime rules; memory operations only
   carry effect metadata, and no alias analysis is performed.
 - No new parser syntax and no new generic lanes.
-
-The new module lives under `src/backend_ir/` and is compiled and tested on
-its own; it is not linked into the production `cobra` binary yet.

@@ -5,7 +5,7 @@
  * produces flat block-argument SSA. The pass is a separate phase: the HIR
  * builder and the parser never construct SSA. See docs/BACKEND_IR.md.
  *
- * The algorithm is sealed-block construction without phi nodes:
+ * The algorithm is a liveness-based two-pass construction without phi nodes:
  *
  *   1. per-block read-before-assign and assign sets (straight-line blocks);
  *   2. a backward liveness fixpoint computing live-in locals per block;
@@ -164,7 +164,7 @@ static bool create_blocks_and_params(SsaPass *p) {
                 continue;
             }
             SsaValueRef param = bir_add_block_param(
-                arena, p->base + b, p->module->type_i64,
+                arena, p->base + b, p->fn->locals[l].type,
                 fn->blocks[b].source_line, fn->blocks[b].source_col);
             if (param == SSA_VALUE_NONE) {
                 ssa_fail(p, fn->blocks[b].source_line, fn->blocks[b].source_col,
@@ -185,7 +185,7 @@ static bool create_blocks_and_params(SsaPass *p) {
        parameters even though the module value pool is shared. */
     for (size_t i = 0; i < fn->param_count; i++) {
         SsaValueRef param = bir_add_value(arena, SSA_VALUE_PARAM,
-                                          p->module->type_i64,
+                                          p->fn->param_types[i],
                                           fn->locals[i].source_line,
                                           fn->locals[i].source_col);
         if (param == SSA_VALUE_NONE) {
@@ -205,7 +205,7 @@ static SsaValueRef ssa_eval_expr(SsaPass *p, size_t block, HirExpr *expr) {
     SsaArena *arena = &p->module->arena;
     switch (expr->kind) {
         case HIR_EXPR_CONST:
-            return bir_add_const(arena, p->module->type_i64, expr->const_i64,
+            return bir_add_const(arena, expr->type, expr->const_i64,
                                  expr->source_line, expr->source_col);
         case HIR_EXPR_LOCAL: {
             const size_t index = block * p->local_count + expr->local;
@@ -223,7 +223,7 @@ static SsaValueRef ssa_eval_expr(SsaPass *p, size_t block, HirExpr *expr) {
             if (lhs == SSA_VALUE_NONE || rhs == SSA_VALUE_NONE) return SSA_VALUE_NONE;
             const SsaValueRef operands[2] = {lhs, rhs};
             SsaInstRef inst = bir_add_inst(arena, expr->binop,
-                                           p->module->type_i64, operands, 2,
+                                           expr->type, operands, 2,
                                            expr->source_line, expr->source_col);
             if (inst == SSA_INST_NONE ||
                 !bir_block_add_inst(arena, p->base + block, inst)) {
@@ -245,8 +245,8 @@ static SsaValueRef ssa_eval_expr(SsaPass *p, size_t block, HirExpr *expr) {
                 }
             }
             SsaInstRef inst = bir_add_inst(arena, SSA_OP_CALL,
-                                           p->module->type_i64, operands,
-                                           expr->arg_count,
+                                           expr->type == p->module->type_void ? NULL : expr->type,
+                                           operands, expr->arg_count,
                                            expr->source_line, expr->source_col);
             free(operands);
             if (inst == SSA_INST_NONE ||
@@ -256,6 +256,7 @@ static SsaValueRef ssa_eval_expr(SsaPass *p, size_t block, HirExpr *expr) {
             snprintf(arena->insts[inst].callee, sizeof(arena->insts[inst].callee),
                      "%s", expr->callee);
             arena->insts[inst].effect = SSA_EFFECT_CALL;
+            if (expr->type == p->module->type_void) return SSA_VALUE_NONE;
             return bir_inst_result(arena, inst, expr->source_line, expr->source_col);
         }
         default:
@@ -324,7 +325,8 @@ static bool emit_block(SsaPass *p, size_t block, HirBlock *hb) {
                 break;
             }
             case HIR_STMT_EXPR: {
-                if (ssa_eval_expr(p, block, stmt->expr) == SSA_VALUE_NONE) {
+                SsaValueRef value = ssa_eval_expr(p, block, stmt->expr);
+                if (value == SSA_VALUE_NONE && stmt->expr->type != p->module->type_void) {
                     return false;
                 }
                 break;

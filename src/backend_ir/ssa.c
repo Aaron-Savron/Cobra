@@ -131,6 +131,12 @@ SsaInstRef bir_add_inst(SsaArena *arena, SsaOpcode op, const CobraType *type,
     arena->operand_used += operand_count;
     inst->target = SSA_BLOCK_NONE;
     inst->target2 = SSA_BLOCK_NONE;
+    if (op == SSA_OP_LOAD || op == SSA_OP_STORE) {
+        inst->address_kind = SSA_ADDRESS_INTEGER_SLOT;
+        inst->memory_width = 8;
+        inst->memory_alignment = 8;
+        inst->address_space = 0;
+    }
     inst->source_line = line;
     inst->source_col = col;
     return (SsaInstRef)arena->inst_count++;
@@ -281,15 +287,14 @@ bool bir_set_return(SsaArena *arena, SsaBlockRef block, SsaValueRef value,
     return bir_set_terminator(arena, block, inst);
 }
 
-bool bir_register_function_info(BackendIrModule *module, const char *name,
-                                SsaBlockRef entry, size_t param_count,
-                                const SsaValueRef *params,
-                                const CobraType *return_type, bool has_return) {
-    if (!module || !name || !name[0] || entry == SSA_BLOCK_NONE ||
-        entry >= module->arena.block_count || !return_type ||
+bool bir_declare_function(BackendIrModule *module, const char *name,
+                           size_t param_count,
+                           const CobraType *const *param_types,
+                           const CobraType *return_type, bool has_return) {
+    if (!module || !name || !name[0] || !return_type ||
         param_count > BIR_MAX_PARAMS) {
         if (module) snprintf(module->error, sizeof(module->error),
-                             "invalid function registration");
+                             "invalid function declaration");
         return false;
     }
     if (bir_find_function(module, name)) {
@@ -305,13 +310,57 @@ bool bir_register_function_info(BackendIrModule *module, const char *name,
     BirFunctionInfo *info = &module->functions[module->function_count++];
     memset(info, 0, sizeof(*info));
     snprintf(info->name, sizeof(info->name), "%s", name);
-    info->entry = entry;
+    info->entry = SSA_BLOCK_NONE;
     info->param_count = param_count;
-    for (size_t k = 0; k < param_count && k < BIR_MAX_PARAMS; k++) {
+    for (size_t k = 0; k < param_count; k++) {
+        info->param_types[k] = param_types && param_types[k]
+            ? param_types[k] : module->type_i64;
+    }
+    info->return_type = return_type;
+    info->return_abi = return_type->abi;
+    info->has_return = has_return;
+    for (size_t k = 0; k < param_count; k++) info->param_abi[k] = info->param_types[k]->abi;
+    return true;
+}
+
+bool bir_register_function_info(BackendIrModule *module, const char *name,
+                                SsaBlockRef entry, size_t param_count,
+                                const SsaValueRef *params,
+                                const CobraType *return_type, bool has_return) {
+    if (!module || !name || !name[0] || entry == SSA_BLOCK_NONE ||
+        entry >= module->arena.block_count || !return_type ||
+        param_count > BIR_MAX_PARAMS) {
+        if (module) snprintf(module->error, sizeof(module->error),
+                             "invalid function registration");
+        return false;
+    }
+    BirFunctionInfo *info = (BirFunctionInfo *)bir_find_function(module, name);
+    if (!info) {
+        const CobraType *defaults[BIR_MAX_PARAMS] = {0};
+        for (size_t k = 0; k < param_count; k++) defaults[k] = module->type_i64;
+        if (!bir_declare_function(module, name, param_count, defaults,
+                                  return_type, has_return)) return false;
+        info = (BirFunctionInfo *)bir_find_function(module, name);
+    } else if (info->entry != SSA_BLOCK_NONE) {
+        snprintf(module->error, sizeof(module->error),
+                 "function '%s' is already registered", name);
+        return false;
+    } else if (info->param_count != param_count ||
+               !(info->return_type == return_type ||
+                 cobra_type_equal(info->return_type, return_type)) ||
+               info->has_return != has_return) {
+        snprintf(module->error, sizeof(module->error),
+                 "function '%s' definition does not match its declaration", name);
+        return false;
+    }
+    info->entry = entry;
+    for (size_t k = 0; k < param_count; k++) {
         info->params[k] = params ? params[k] : SSA_VALUE_NONE;
     }
     info->return_type = return_type;
+    info->return_abi = return_type->abi;
     info->has_return = has_return;
+    for (size_t k = 0; k < param_count; k++) info->param_abi[k] = info->param_types[k]->abi;
     return true;
 }
 

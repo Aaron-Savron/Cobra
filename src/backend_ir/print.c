@@ -9,6 +9,7 @@
 
 static const char *type_label(const BackendIrModule *module, const CobraType *type) {
     if (type == module->type_i64) return "i64";
+    if (type == module->type_bool) return "bool";
     if (type == module->type_void) return "void";
     return cobra_type_kind_name(type ? type->kind : COBRA_TYPE_UNTYPED);
 }
@@ -23,7 +24,7 @@ void bir_dump(const BackendIrModule *module, FILE *out) {
         fprintf(out, "fn \"%s\"(", info->name);
         for (size_t k = 0; k < info->param_count; k++) {
             if (k) fprintf(out, ", ");
-            fprintf(out, "i64");
+            fprintf(out, "%s", type_label(module, info->param_types[k]));
         }
         fprintf(out, ") -> %s\n", type_label(module, info->return_type));
     }
@@ -35,7 +36,9 @@ void bir_dump(const BackendIrModule *module, FILE *out) {
         fprintf(out, " [%s](", block->is_entry ? "entry" : "block");
         for (size_t k = 0; k < block->param_count; k++) {
             if (k) fprintf(out, ", ");
-            fprintf(out, "v%u: i64", block->params[k]);
+            SsaValueRef param = block->params[k];
+            fprintf(out, "v%u: %s", param,
+                    type_label(module, arena->values[param].type));
         }
         fprintf(out, ")");
         if (block->source_line > 0) fprintf(out, " ; line %d", block->source_line);

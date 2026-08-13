@@ -165,6 +165,18 @@ static bool check_function_table(VerifyCtx *ctx) {
             verr(ctx, "function '%s' has an invalid return type", info->name);
             return false;
         }
+        if (info->return_abi != info->return_type->abi) {
+            verr(ctx, "function '%s' has inconsistent return ABI metadata", info->name);
+            return false;
+        }
+        for (size_t p = 0; p < info->param_count; p++) {
+            if (!info->param_types[p] || !info->param_types[p]->finalized ||
+                bir_type_has_generic(info->param_types[p]) ||
+                info->param_abi[p] != info->param_types[p]->abi) {
+                verr(ctx, "function '%s' has invalid parameter ABI metadata", info->name);
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -267,6 +279,18 @@ static bool check_block(VerifyCtx *ctx, SsaBlockRef ref) {
             verr(ctx, "block b%u load must have exactly one operand", ref);
             return false;
         }
+        if (inst->op == SSA_OP_LOAD || inst->op == SSA_OP_STORE) {
+            SsaEffect expected = inst->op == SSA_OP_LOAD
+                ? SSA_EFFECT_READ : SSA_EFFECT_WRITE;
+            if (inst->effect != expected || inst->address_kind != SSA_ADDRESS_INTEGER_SLOT ||
+                inst->memory_width == 0 || inst->memory_alignment == 0 ||
+                inst->address_space != 0 ||
+                arena->values[arena->operands[inst->operand_start]].type !=
+                    ctx->module->type_i64) {
+                verr(ctx, "block b%u memory instruction has incomplete slot-memory metadata", ref);
+                return false;
+            }
+        }
         if (inst->op == SSA_OP_CALL) {
             if (!inst->callee[0]) {
                 verr(ctx, "block b%u call has no callee name", ref);
@@ -280,6 +304,26 @@ static bool check_block(VerifyCtx *ctx, SsaBlockRef ref) {
             if (inst->operand_count != callee->param_count) {
                 verr(ctx, "block b%u call '%s' has %u arguments, expected %zu",
                      ref, inst->callee, inst->operand_count, callee->param_count);
+                return false;
+            }
+            for (size_t arg = 0; arg < callee->param_count; arg++) {
+                const SsaValue *value = &arena->values[
+                    arena->operands[inst->operand_start + arg]];
+                if (!value->type || value->type != callee->param_types[arg]) {
+                    verr(ctx, "block b%u call '%s' argument %zu has the wrong canonical type",
+                         ref, inst->callee, arg + 1);
+                    return false;
+                }
+            }
+            if (callee->has_return) {
+                if (!inst->type || inst->type != callee->return_type ||
+                    inst->result == SSA_VALUE_NONE) {
+                    verr(ctx, "block b%u call '%s' has the wrong result type",
+                         ref, inst->callee);
+                    return false;
+                }
+            } else if (inst->type || inst->result != SSA_VALUE_NONE) {
+                verr(ctx, "void call '%s' unexpectedly produces a value", inst->callee);
                 return false;
             }
         }
@@ -308,7 +352,8 @@ static bool check_block(VerifyCtx *ctx, SsaBlockRef ref) {
             break;
         case SSA_OP_BRANCH:
             if (term->operand_count != 1 ||
-                !valid_value(ctx, arena->operands[term->operand_start])) {
+                !valid_value(ctx, arena->operands[term->operand_start]) ||
+                arena->values[arena->operands[term->operand_start]].type != ctx->module->type_bool) {
                 verr(ctx, "block b%u branch has an invalid condition", ref);
                 return false;
             }

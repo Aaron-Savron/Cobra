@@ -12,10 +12,32 @@
 typedef struct {
     BackendIrModule *module;
     HirFunction *fn;
-    SsaBlockRef current;
+    HirBlockRef current;
     int synthetic_seq;
     bool failed;
 } HirBuilder;
+
+/* The backend owns its canonical arena. AST descriptors are consulted only
+   at the import boundary, then mapped to finalized descriptors in the backend
+   arena so HIR/SSA never retain frontend-arena pointers. */
+static const CobraType *bir_import_ast_type(BackendIrModule *module,
+                                             const ASTNode *node,
+                                             bool allow_untyped) {
+    if (!module || !node) return NULL;
+    CobraTypeKind kind = node->canonical_type
+        ? node->canonical_type->kind : node->declared_type;
+    if (kind == COBRA_TYPE_UNTYPED && allow_untyped) return module->type_i64;
+    switch (kind) {
+        case COBRA_TYPE_I64: return module->type_i64;
+        case COBRA_TYPE_BOOL: return module->type_bool;
+        case COBRA_TYPE_VOID: return module->type_void;
+        default: return NULL;
+    }
+}
+
+static bool bir_types_equal(const CobraType *left, const CobraType *right) {
+    return left && right && (left == right || cobra_type_equal(left, right));
+}
 
 /* ------------------------------------------------------------------ */
 /* Diagnostics                                                        */
@@ -52,7 +74,7 @@ static HirBlock *hir_new_block(HirBuilder *b, const char *name, int line, int co
     }
     HirBlock *block = &fn->blocks[fn->block_count];
     memset(block, 0, sizeof(*block));
-    block->id = (SsaBlockRef)fn->block_count;
+    block->id = (HirBlockRef)fn->block_count;
     snprintf(block->name, sizeof(block->name), "%s", name);
     block->source_line = line;
     block->source_col = col;
@@ -60,7 +82,7 @@ static HirBlock *hir_new_block(HirBuilder *b, const char *name, int line, int co
     return block;
 }
 
-static bool hir_add_edge(HirBuilder *b, SsaBlockRef from, SsaBlockRef to) {
+static bool hir_add_edge(HirBuilder *b, HirBlockRef from, HirBlockRef to) {
     HirFunction *fn = b->fn;
     if (from >= fn->block_count || to >= fn->block_count) return false;
     HirBlock *source = &fn->blocks[from];
@@ -68,7 +90,7 @@ static bool hir_add_edge(HirBuilder *b, SsaBlockRef from, SsaBlockRef to) {
     size_t next = source->succ_count + 1;
     if (next > source->succ_cap) {
         size_t cap = source->succ_cap ? source->succ_cap * 2 : 4;
-        SsaBlockRef *grown = realloc(source->succs, sizeof(SsaBlockRef) * cap);
+        HirBlockRef *grown = realloc(source->succs, sizeof(HirBlockRef) * cap);
         if (!grown) return false;
         source->succs = grown;
         source->succ_cap = cap;
@@ -76,7 +98,7 @@ static bool hir_add_edge(HirBuilder *b, SsaBlockRef from, SsaBlockRef to) {
     next = target->pred_count + 1;
     if (next > target->pred_cap) {
         size_t cap = target->pred_cap ? target->pred_cap * 2 : 4;
-        SsaBlockRef *grown = realloc(target->preds, sizeof(SsaBlockRef) * cap);
+        HirBlockRef *grown = realloc(target->preds, sizeof(HirBlockRef) * cap);
         if (!grown) return false;
         target->preds = grown;
         target->pred_cap = cap;
@@ -86,7 +108,7 @@ static bool hir_add_edge(HirBuilder *b, SsaBlockRef from, SsaBlockRef to) {
     return true;
 }
 
-static bool hir_block_add_stmt(HirBuilder *b, SsaBlockRef block, HirStmt stmt) {
+static bool hir_block_add_stmt(HirBuilder *b, HirBlockRef block, HirStmt stmt) {
     HirBlock *target = &b->fn->blocks[block];
     if (target->term.kind != HIR_TERM_NONE) return false;
     if (target->stmt_count == target->stmt_cap) {
@@ -100,7 +122,7 @@ static bool hir_block_add_stmt(HirBuilder *b, SsaBlockRef block, HirStmt stmt) {
     return true;
 }
 
-static bool hir_set_term(HirBuilder *b, SsaBlockRef block, HirTerm term) {
+static bool hir_set_term(HirBuilder *b, HirBlockRef block, HirTerm term) {
     if (b->fn->blocks[block].term.kind != HIR_TERM_NONE) {
         bir_fail(b, 0, 0, "internal error: block already terminated");
         return false;
@@ -161,7 +183,7 @@ static int hir_find_local(HirBuilder *b, const char *name) {
 }
 
 static int hir_add_local(HirBuilder *b, const char *name, bool is_param,
-                         int line, int col) {
+                         const CobraType *type, int line, int col) {
     int existing = hir_find_local(b, name);
     if (existing >= 0) return existing;
     if (b->fn->local_count >= BIR_MAX_LOCALS) {
@@ -171,6 +193,7 @@ static int hir_add_local(HirBuilder *b, const char *name, bool is_param,
     HirLocal *local = &b->fn->locals[b->fn->local_count];
     memset(local, 0, sizeof(*local));
     snprintf(local->name, sizeof(local->name), "%s", name);
+    local->type = type;
     local->is_param = is_param;
     local->source_line = line;
     local->source_col = col;
@@ -189,7 +212,7 @@ static int hir_require_local(HirBuilder *b, const char *name, int line, int col)
 static int hir_synthetic_local(HirBuilder *b, const char *prefix, int line, int col) {
     char name[COBRA_MAX_IDENT_LEN];
     snprintf(name, sizeof(name), "@%s_%d", prefix, b->synthetic_seq++);
-    return hir_add_local(b, name, false, line, col);
+    return hir_add_local(b, name, false, b->module->type_i64, line, col);
 }
 
 /* ------------------------------------------------------------------ */
@@ -237,12 +260,14 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
             if (!expr) return false;
             expr->kind = HIR_EXPR_CONST;
             expr->const_i64 = node->int_val;
+            expr->type = b->module->type_i64;
             break;
         case AST_BOOL_LITERAL:
             expr = hir_expr_alloc(b, node->source_line, node->source_col);
             if (!expr) return false;
             expr->kind = HIR_EXPR_CONST;
             expr->const_i64 = node->int_val ? 1 : 0;
+            expr->type = b->module->type_bool;
             break;
         case AST_VAR_REF: {
             int local = hir_require_local(b, node->name,
@@ -252,6 +277,7 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
             if (!expr) return false;
             expr->kind = HIR_EXPR_LOCAL;
             expr->local = (uint32_t)local;
+            expr->type = b->fn->locals[local].type;
             break;
         }
         case AST_BINARY_OP: {
@@ -266,15 +292,27 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
             expr->kind = HIR_EXPR_BINOP;
             expr->binop = op;
             expr->args = calloc(2, sizeof(HirExpr *));
+            expr->arg_count = 2;
             if (!expr->args) {
                 bir_fail(b, node->source_line, node->source_col, "out of memory");
+                hir_expr_free(expr);
                 return false;
             }
             if (!hir_build_expr(b, node->children[0], &expr->args[0]) ||
                 !hir_build_expr(b, node->children[1], &expr->args[1])) {
+                hir_expr_free(expr);
                 return false;
             }
-            expr->arg_count = 2;
+            if (!expr->args[0]->type || !expr->args[1]->type ||
+                !bir_types_equal(expr->args[0]->type, expr->args[1]->type) ||
+                !bir_types_equal(expr->args[0]->type, b->module->type_i64)) {
+                bir_fail(b, node->source_line, node->source_col,
+                         "operator '%s' requires two i64 operands", node->name);
+                hir_expr_free(expr);
+                return false;
+            }
+            expr->type = (op >= SSA_OP_EQ && op <= SSA_OP_GE)
+                ? b->module->type_bool : b->module->type_i64;
             break;
         }
         case AST_FUNC_CALL: {
@@ -287,19 +325,41 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
             if (!expr) return false;
             expr->kind = HIR_EXPR_CALL;
             snprintf(expr->callee, sizeof(expr->callee), "%s", node->name);
+            const BirFunctionInfo *callee = bir_find_function(b->module, node->name);
+            if (!callee) {
+                bir_fail(b, node->source_line, node->source_col,
+                         "call to unknown function '%s'", node->name);
+                return false;
+            }
+            if (node->child_count != callee->param_count) {
+                bir_fail(b, node->source_line, node->source_col,
+                         "call '%s' has %zu arguments, expected %zu",
+                         node->name, node->child_count, callee->param_count);
+                return false;
+            }
             if (node->child_count) {
                 expr->args = calloc(node->child_count, sizeof(HirExpr *));
+                expr->arg_count = node->child_count;
                 if (!expr->args) {
                     bir_fail(b, node->source_line, node->source_col, "out of memory");
+                    hir_expr_free(expr);
                     return false;
                 }
                 for (size_t i = 0; i < node->child_count; i++) {
                     if (!hir_build_expr(b, node->children[i], &expr->args[i])) {
+                        hir_expr_free(expr);
+                        return false;
+                    }
+                    if (!bir_types_equal(expr->args[i]->type, callee->param_types[i])) {
+                        bir_fail(b, node->source_line, node->source_col,
+                                 "argument %zu to '%s' has the wrong type",
+                                 i + 1, node->name);
+                        hir_expr_free(expr);
                         return false;
                     }
                 }
-                expr->arg_count = node->child_count;
             }
+            expr->type = callee->has_return ? callee->return_type : b->module->type_void;
             break;
         }
         case AST_COMPTIME_EXPR:
@@ -318,6 +378,13 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
 /* ------------------------------------------------------------------ */
 
 static bool hir_emit_assign(HirBuilder *b, uint32_t local, HirExpr *expr) {
+    if (!expr || local >= b->fn->local_count ||
+        !bir_types_equal(b->fn->locals[local].type, expr->type)) {
+        bir_fail(b, expr ? expr->source_line : 0, expr ? expr->source_col : 0,
+                 "assignment type does not match local '%s'",
+                 local < b->fn->local_count ? b->fn->locals[local].name : "<invalid>");
+        return false;
+    }
     HirStmt stmt;
     memset(&stmt, 0, sizeof(stmt));
     stmt.kind = HIR_STMT_ASSIGN;
@@ -337,7 +404,7 @@ static bool hir_emit_simple(HirBuilder *b, HirStmtKind kind, HirExpr *expr) {
     return hir_block_add_stmt(b, b->current, stmt);
 }
 
-static bool hir_build_if(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_block) {
+static bool hir_build_if(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_block) {
     if (stmt->child_count < 2) {
         bir_fail(b, stmt->source_line, stmt->source_col,
                  "if statement is missing its body");
@@ -345,6 +412,11 @@ static bool hir_build_if(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_blo
     }
     HirExpr *cond = NULL;
     if (!hir_build_expr(b, stmt->children[0], &cond)) return false;
+    if (!bir_types_equal(cond->type, b->module->type_bool)) {
+        bir_fail(b, stmt->source_line, stmt->source_col,
+                 "if condition must have bool type");
+        return false;
+    }
 
     HirBlock *then_block = hir_new_block(b, "then", stmt->source_line, stmt->source_col);
     HirBlock *else_block = stmt->child_count > 2
@@ -352,7 +424,7 @@ static bool hir_build_if(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_blo
     HirBlock *merge = hir_new_block(b, "merge", stmt->source_line, stmt->source_col);
     if (!then_block || !merge || (stmt->child_count > 2 && !else_block)) return false;
 
-    SsaBlockRef pre = b->current;
+    HirBlockRef pre = b->current;
     HirTerm term;
     memset(&term, 0, sizeof(term));
     term.kind = HIR_TERM_BRANCH;
@@ -404,7 +476,7 @@ static bool hir_build_if(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_blo
     return true;
 }
 
-static bool hir_build_while(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_block) {
+static bool hir_build_while(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_block) {
     if (stmt->child_count < 2) {
         bir_fail(b, stmt->source_line, stmt->source_col,
                  "while statement is missing its body");
@@ -426,6 +498,11 @@ static bool hir_build_while(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_
     b->current = header->id;
     HirExpr *cond = NULL;
     if (!hir_build_expr(b, stmt->children[0], &cond)) return false;
+    if (!bir_types_equal(cond->type, b->module->type_bool)) {
+        bir_fail(b, stmt->source_line, stmt->source_col,
+                 "while condition must have bool type");
+        return false;
+    }
     HirTerm head;
     memset(&head, 0, sizeof(head));
     head.kind = HIR_TERM_BRANCH;
@@ -458,7 +535,7 @@ static bool hir_build_while(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_
     return true;
 }
 
-static bool hir_build_for(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_block) {
+static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_block) {
     if (stmt->secondary_name[0]) {
         bir_fail(b, stmt->source_line, stmt->source_col,
                  "for index,value form is outside the backend-IR subset");
@@ -471,7 +548,7 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_bl
     }
     ASTNode *target = stmt->children[0];
     ASTNode *body = stmt->children[1];
-    int loop_local = hir_add_local(b, stmt->name, false,
+    int loop_local = hir_add_local(b, stmt->name, false, b->module->type_i64,
                                    stmt->source_line, stmt->source_col);
     if (loop_local < 0) return false;
 
@@ -491,6 +568,7 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_bl
             element->kind = HIR_EXPR_CONST;
             element->const_i64 = target->children[i]->type == AST_INT_LITERAL
                 ? target->children[i]->int_val : 0;
+            element->type = b->module->type_i64;
             if (!hir_emit_assign(b, (uint32_t)loop_local, element)) return false;
             bool body_terminated = false;
             if (!hir_build_stmt_list(b, body->children, body->child_count,
@@ -530,6 +608,7 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_bl
         if (!start_expr) return false;
         start_expr->kind = HIR_EXPR_CONST;
         start_expr->const_i64 = 0;
+        start_expr->type = b->module->type_i64;
     }
     HirExpr *bound_expr = NULL;
     if (is_range) {
@@ -549,6 +628,7 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_bl
     if (!start_ref) return false;
     start_ref->kind = HIR_EXPR_LOCAL;
     start_ref->local = (uint32_t)start_local;
+    start_ref->type = b->module->type_i64;
     if (!hir_emit_assign(b, (uint32_t)loop_local, start_ref)) return false;
 
     HirBlock *header = hir_new_block(b, "for_header", stmt->source_line, stmt->source_col);
@@ -571,8 +651,10 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_bl
     if (!index_ref || !bound_ref) return false;
     index_ref->kind = HIR_EXPR_LOCAL;
     index_ref->local = (uint32_t)loop_local;
+    index_ref->type = b->module->type_i64;
     bound_ref->kind = HIR_EXPR_LOCAL;
     bound_ref->local = (uint32_t)bound_local;
+    bound_ref->type = b->module->type_i64;
     HirExpr *cond = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
     if (!cond) return false;
     cond->kind = HIR_EXPR_BINOP;
@@ -582,6 +664,7 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_bl
     cond->args[0] = index_ref;
     cond->args[1] = bound_ref;
     cond->arg_count = 2;
+    cond->type = b->module->type_bool;
 
     b->current = header->id;
     HirTerm head;
@@ -622,8 +705,10 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_bl
     if (!one || !index_again || !plus) return false;
     one->kind = HIR_EXPR_CONST;
     one->const_i64 = 1;
+    one->type = b->module->type_i64;
     index_again->kind = HIR_EXPR_LOCAL;
     index_again->local = (uint32_t)loop_local;
+    index_again->type = b->module->type_i64;
     plus->kind = HIR_EXPR_BINOP;
     plus->binop = SSA_OP_ADD;
     plus->args = calloc(2, sizeof(HirExpr *));
@@ -631,6 +716,7 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_bl
     plus->args[0] = index_again;
     plus->args[1] = one;
     plus->arg_count = 2;
+    plus->type = b->module->type_i64;
     if (!hir_emit_assign(b, (uint32_t)loop_local, plus)) return false;
     HirTerm back;
     memset(&back, 0, sizeof(back));
@@ -647,7 +733,7 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, SsaBlockRef *continue_bl
 
 static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_count,
                                  bool *terminated) {
-    SsaBlockRef cur = b->current;
+    HirBlockRef cur = b->current;
     bool block_terminated = false;
     for (size_t i = 0; i < stmt_count && !b->failed; i++) {
         ASTNode *stmt = stmts[i];
@@ -655,22 +741,36 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
         switch (stmt->type) {
             case AST_VAR_DECL:
             case AST_ASSIGN: {
-                if (stmt->declared_type != COBRA_TYPE_UNTYPED &&
-                    stmt->declared_type != COBRA_TYPE_I64) {
-                    bir_fail(b, stmt->source_line, stmt->source_col,
-                             "declaration type is outside the scalar backend-IR subset");
-                    return false;
-                }
                 if (stmt->child_count == 0) {
                     bir_fail(b, stmt->source_line, stmt->source_col,
                              "declaration without initializer is outside the backend-IR subset");
                     return false;
                 }
-                int local = hir_add_local(b, stmt->name, false,
-                                          stmt->source_line, stmt->source_col);
-                if (local < 0) return false;
                 HirExpr *value = NULL;
                 if (!hir_build_expr(b, stmt->children[0], &value)) return false;
+                int existing = hir_find_local(b, stmt->name);
+                const CobraType *declared = NULL;
+                if (stmt->type == AST_VAR_DECL) {
+                    declared = bir_import_ast_type(b->module, stmt, true);
+                    if (!declared) {
+                        bir_fail(b, stmt->source_line, stmt->source_col,
+                                 "declaration type is outside the backend-IR subset");
+                        return false;
+                    }
+                } else if (existing >= 0) {
+                    declared = b->fn->locals[existing].type;
+                } else {
+                    declared = value->type;
+                }
+                if (!declared || !bir_types_equal(declared, value->type)) {
+                    bir_fail(b, stmt->source_line, stmt->source_col,
+                             "assignment type does not match '%s'", stmt->name);
+                    return false;
+                }
+                int local = existing >= 0 ? existing :
+                    hir_add_local(b, stmt->name, false, declared,
+                                  stmt->source_line, stmt->source_col);
+                if (local < 0) return false;
                 if (!hir_emit_assign(b, (uint32_t)local, value)) return false;
                 break;
             }
@@ -678,6 +778,16 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                 HirExpr *value = NULL;
                 if (stmt->child_count > 0 &&
                     !hir_build_expr(b, stmt->children[0], &value)) {
+                    return false;
+                }
+                if (value && b->fn->return_type == b->module->type_void) {
+                    bir_fail(b, stmt->source_line, stmt->source_col,
+                             "void function cannot return a value");
+                    return false;
+                }
+                if (value && !bir_types_equal(value->type, b->fn->return_type)) {
+                    bir_fail(b, stmt->source_line, stmt->source_col,
+                             "return expression has the wrong type");
                     return false;
                 }
                 HirTerm term;
@@ -696,21 +806,21 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                 break;
             }
             case AST_IF_STMT: {
-                SsaBlockRef next = cur;
+                HirBlockRef next = cur;
                 if (!hir_build_if(b, stmt, &next)) return false;
                 cur = next;
                 b->current = next;
                 break;
             }
             case AST_WHILE_STMT: {
-                SsaBlockRef next = cur;
+                HirBlockRef next = cur;
                 if (!hir_build_while(b, stmt, &next)) return false;
                 cur = next;
                 b->current = next;
                 break;
             }
             case AST_FOR_LOOP: {
-                SsaBlockRef next = cur;
+                HirBlockRef next = cur;
                 if (!hir_build_for(b, stmt, &next)) return false;
                 cur = next;
                 b->current = next;
@@ -731,6 +841,41 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
 /* Function entry                                                     */
 /* ------------------------------------------------------------------ */
 
+static bool hir_prepare_signature(BackendIrModule *module, ASTNode *function,
+                                  const CobraType **param_types,
+                                  size_t *param_count_out,
+                                  const CobraType **return_type_out,
+                                  bool *has_return_out) {
+    size_t count = 0;
+    for (size_t i = 0; i < function->child_count; i++) {
+        ASTNode *param = function->children[i];
+        if (param->type != AST_PARAM) continue;
+        if (count >= BIR_MAX_PARAMS) {
+            snprintf(module->error, sizeof(module->error),
+                     "%s: too many parameters for backend-IR subset", function->name);
+            return false;
+        }
+        param_types[count] = bir_import_ast_type(module, param, true);
+        if (!param_types[count]) {
+            snprintf(module->error, sizeof(module->error),
+                     "%.40s: parameter '%.40s' is outside the backend-IR subset",
+                     function->name, param->name);
+            return false;
+        }
+        count++;
+    }
+    const CobraType *return_type = bir_import_ast_type(module, function, true);
+    if (!return_type) {
+        snprintf(module->error, sizeof(module->error),
+                 "%s: return type is outside the backend-IR subset", function->name);
+        return false;
+    }
+    *param_count_out = count;
+    *return_type_out = return_type;
+    *has_return_out = return_type != module->type_void;
+    return true;
+}
+
 bool bir_build_function(BackendIrModule *module, ASTNode *function,
                         BirFunctionInfo **out_info) {
     if (!module || !function || function->type != AST_FUNCTION) {
@@ -745,9 +890,18 @@ bool bir_build_function(BackendIrModule *module, ASTNode *function,
                  function->name);
         return false;
     }
-    if (bir_find_function(module, function->name)) {
-        snprintf(module->error, sizeof(module->error),
-                 "%s: duplicate function in backend-IR module", function->name);
+    const CobraType *signature_params[BIR_MAX_PARAMS] = {0};
+    size_t signature_count = 0;
+    const CobraType *signature_return = NULL;
+    bool has_return = false;
+    if (!hir_prepare_signature(module, function, signature_params,
+                               &signature_count, &signature_return, &has_return)) {
+        return false;
+    }
+    const BirFunctionInfo *declared = bir_find_function(module, function->name);
+    if (!declared && !bir_declare_function(module, function->name, signature_count,
+                                           signature_params, signature_return,
+                                           has_return)) {
         return false;
     }
 
@@ -761,21 +915,10 @@ bool bir_build_function(BackendIrModule *module, ASTNode *function,
     snprintf(fn.name, sizeof(fn.name), "%s", function->name);
     b.fn = &fn;
 
-    size_t param_count = 0;
-    for (size_t i = 0; i < function->child_count; i++) {
-        if (function->children[i]->type == AST_PARAM) param_count++;
-    }
+    size_t param_count = signature_count;
     fn.param_count = param_count;
-
-    bool has_return = function->declared_type != COBRA_TYPE_VOID;
-    if (!has_return && function->declared_type != COBRA_TYPE_UNTYPED &&
-        function->declared_type != COBRA_TYPE_I64 &&
-        function->declared_type != COBRA_TYPE_VOID) {
-        snprintf(module->error, sizeof(module->error),
-                 "%s: return type is outside the scalar backend-IR subset",
-                 function->name);
-        goto fail;
-    }
+    fn.return_type = signature_return;
+    for (size_t i = 0; i < param_count; i++) fn.param_types[i] = signature_params[i];
 
     HirBlock *entry = hir_new_block(&b, "entry", function->source_line, function->source_col);
     if (!entry) goto fail;
@@ -787,14 +930,8 @@ bool bir_build_function(BackendIrModule *module, ASTNode *function,
     for (size_t i = 0; i < function->child_count; i++) {
         ASTNode *child = function->children[i];
         if (child->type != AST_PARAM) continue;
-        if (child->declared_type != COBRA_TYPE_UNTYPED &&
-            child->declared_type != COBRA_TYPE_I64) {
-            bir_fail(&b, child->source_line, child->source_col,
-                     "parameter '%s' is outside the scalar backend-IR subset",
-                     child->name);
-            goto fail;
-        }
-        int local = hir_add_local(&b, child->name, true,
+        const CobraType *param_type = signature_params[param_count];
+        int local = hir_add_local(&b, child->name, true, param_type,
                                   child->source_line, child->source_col);
         if (local < 0 || (size_t)local != param_count) {
             bir_fail(&b, child->source_line, child->source_col,
@@ -837,11 +974,12 @@ bool bir_build_function(BackendIrModule *module, ASTNode *function,
         HirTerm term;
         memset(&term, 0, sizeof(term));
         term.kind = HIR_TERM_RETURN;
-        if (!has_return) {
+        if (has_return) {
             HirExpr *zero = hir_expr_alloc(&b, function->source_line, function->source_col);
             if (!zero) goto fail;
             zero->kind = HIR_EXPR_CONST;
             zero->const_i64 = 0;
+            zero->type = module->type_i64;
             term.ret_expr = zero;
         }
         if (!hir_set_term(&b, b.current, term)) goto fail;
@@ -852,11 +990,12 @@ bool bir_build_function(BackendIrModule *module, ASTNode *function,
             HirTerm term;
             memset(&term, 0, sizeof(term));
             term.kind = HIR_TERM_RETURN;
-            if (!has_return) {
+            if (has_return) {
                 HirExpr *zero = hir_expr_alloc(&b, function->source_line, function->source_col);
                 if (!zero) goto fail;
                 zero->kind = HIR_EXPR_CONST;
                 zero->const_i64 = 0;
+                zero->type = module->type_i64;
                 term.ret_expr = zero;
             }
             fn.blocks[i].term = term;
@@ -874,13 +1013,11 @@ bool bir_build_function(BackendIrModule *module, ASTNode *function,
     if (!bir_ssa_lower(module, &fn, &entry_ref, param_refs)) goto fail;
     if (entry_ref == SSA_BLOCK_NONE ||
         !bir_register_function_info(module, function->name, entry_ref, param_count,
-                                    param_refs,
-                                    has_return ? module->type_i64 : module->type_void,
-                                    has_return)) {
+                                    param_refs, signature_return, has_return)) {
         goto fail;
     }
 
-    if (out_info) *out_info = &module->functions[module->function_count - 1];
+    if (out_info) *out_info = (BirFunctionInfo *)bir_find_function(module, function->name);
     hir_function_free(&fn);
     return true;
 
@@ -892,6 +1029,30 @@ fail:
 bool bir_build_program(BackendIrModule *module, ASTNode *root) {
     if (!module || !root) return false;
     module->error[0] = '\0';
+
+    /* Predeclare every signature before lowering bodies. This makes forward,
+       recursive, and mutually recursive calls type-checkable in HIR. */
+    for (size_t i = 0; i < root->child_count; i++) {
+        ASTNode *decl = root->children[i];
+        if (decl->type != AST_FUNCTION) continue;
+        if (decl->generic_param_count > 0) {
+            snprintf(module->error, sizeof(module->error),
+                     "%.40s: generic functions are outside the backend-IR subset",
+                     decl->name);
+            return false;
+        }
+        const CobraType *params[BIR_MAX_PARAMS] = {0};
+        size_t param_count = 0;
+        const CobraType *return_type = NULL;
+        bool has_return = false;
+        if (!hir_prepare_signature(module, decl, params, &param_count,
+                                   &return_type, &has_return) ||
+            !bir_declare_function(module, decl->name, param_count, params,
+                                  return_type, has_return)) {
+            return false;
+        }
+    }
+
     for (size_t i = 0; i < root->child_count; i++) {
         ASTNode *decl = root->children[i];
         if (decl->type == AST_FUNCTION) {
@@ -935,12 +1096,19 @@ void bir_module_init(BackendIrModule *module, const char *source_file) {
                                        NULL, NULL, NULL, NULL,
                                        COBRA_OWNERSHIP_VALUE,
                                        COBRA_MUTABILITY_DEFAULT, -1);
+    module->type_bool = cobra_type_make(module->type_arena, COBRA_TYPE_BOOL, NULL,
+                                        NULL, NULL, NULL, NULL,
+                                        COBRA_OWNERSHIP_VALUE,
+                                        COBRA_MUTABILITY_DEFAULT, -1);
     module->type_void = cobra_type_make(module->type_arena, COBRA_TYPE_VOID, NULL,
                                         NULL, NULL, NULL, NULL,
                                         COBRA_OWNERSHIP_VALUE,
                                         COBRA_MUTABILITY_DEFAULT, -1);
     if (module->type_i64 && !module->type_i64->finalized) {
         cobra_type_finalize(module->type_arena, (CobraType *)module->type_i64);
+    }
+    if (module->type_bool && !module->type_bool->finalized) {
+        cobra_type_finalize(module->type_arena, (CobraType *)module->type_bool);
     }
     if (module->type_void && !module->type_void->finalized) {
         cobra_type_finalize(module->type_arena, (CobraType *)module->type_void);
