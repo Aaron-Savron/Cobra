@@ -311,6 +311,8 @@ bool bir_declare_function(BackendIrModule *module, const char *name,
     memset(info, 0, sizeof(*info));
     snprintf(info->name, sizeof(info->name), "%s", name);
     info->entry = SSA_BLOCK_NONE;
+    info->first_block = SSA_BLOCK_NONE;
+    info->block_count = 0;
     info->param_count = param_count;
     for (size_t k = 0; k < param_count; k++) {
         info->param_types[k] = param_types && param_types[k]
@@ -354,6 +356,8 @@ bool bir_register_function_info(BackendIrModule *module, const char *name,
         return false;
     }
     info->entry = entry;
+    info->first_block = entry;
+    info->block_count = module->arena.block_count - entry;
     for (size_t k = 0; k < param_count; k++) {
         info->params[k] = params ? params[k] : SSA_VALUE_NONE;
     }

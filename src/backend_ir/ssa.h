@@ -258,6 +258,8 @@ typedef struct {
 typedef struct {
     char name[BIR_MAX_CALLEE_NAME];
     SsaBlockRef entry;
+    SsaBlockRef first_block;   /* owned contiguous block range           */
+    size_t block_count;
     size_t param_count;
     const CobraType *param_types[BIR_MAX_PARAMS];
     CobraAbiKind param_abi[BIR_MAX_PARAMS];

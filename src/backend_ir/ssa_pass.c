@@ -341,7 +341,8 @@ static bool emit_block(SsaPass *p, size_t block, HirBlock *hb) {
             SsaValueRef *args = NULL;
             size_t count = 0;
             if (!ssa_edge_args(p, block, hb->term.target, &args, &count)) return false;
-            bool ok = bir_set_jump(arena, ref, p->base + hb->term.target,
+            bool ok = bir_add_edge(arena, ref, p->base + hb->term.target) &&
+                      bir_set_jump(arena, ref, p->base + hb->term.target,
                                    args, count, hb->source_line, hb->source_col);
             free(args);
             return ok;
@@ -358,7 +359,9 @@ static bool emit_block(SsaPass *p, size_t block, HirBlock *hb) {
                 free(else_args);
                 return false;
             }
-            bool ok = bir_set_branch(arena, ref, cond,
+            bool ok = bir_add_edge(arena, ref, p->base + hb->term.target) &&
+                      bir_add_edge(arena, ref, p->base + hb->term.target2) &&
+                      bir_set_branch(arena, ref, cond,
                                      p->base + hb->term.target,
                                      p->base + hb->term.target2,
                                      then_args, then_count,

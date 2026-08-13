@@ -39,6 +39,18 @@ static void eval_fail(SsaEval *ev, const char *fmt, ...) {
     ev->failed = true;
 }
 
+static bool eval_validate_memory(SsaEval *ev, const SsaInst *inst) {
+    if (inst->address_kind != SSA_ADDRESS_INTEGER_SLOT ||
+        inst->memory_width != 8 || inst->memory_alignment != 8 ||
+        inst->address_space != 0 ||
+        (inst->op == SSA_OP_LOAD && inst->effect != SSA_EFFECT_READ) ||
+        (inst->op == SSA_OP_STORE && inst->effect != SSA_EFFECT_WRITE)) {
+        eval_fail(ev, "memory instruction violates the 8-byte integer-slot contract");
+        return false;
+    }
+    return true;
+}
+
 static int64_t eval_value(SsaEval *ev, SsaValueRef ref) {
     if (ref == SSA_VALUE_NONE || ref >= ev->slot_count) return 0;
     const SsaValue *value = &ev->module->arena.values[ref];
@@ -282,6 +294,7 @@ bool bir_eval_function(const BackendIrModule *module, const char *name,
                 break;
             }
             case SSA_OP_LOAD: {
+                if (!eval_validate_memory(&ev, inst)) break;
                 int64_t address = eval_value(&ev, arena->operands[inst->operand_start]);
                 if (address < 0 || address >= BIR_MEMORY_SLOTS) {
                     eval_fail(&ev, "load out of bounds (%lld)", (long long)address);
@@ -293,6 +306,7 @@ bool bir_eval_function(const BackendIrModule *module, const char *name,
                 break;
             }
             case SSA_OP_STORE: {
+                if (!eval_validate_memory(&ev, inst)) break;
                 int64_t address = eval_value(&ev, arena->operands[inst->operand_start]);
                 int64_t value = eval_value(&ev, arena->operands[inst->operand_start + 1]);
                 if (address < 0 || address >= BIR_MEMORY_SLOTS) {

@@ -229,8 +229,15 @@ later when the HIR supports richer control-flow and value definitions.
 - **valid operands** — every operand handle is in range and not the invalid
   handle; arity matches the opcode (binary ops take exactly two operands,
   `load` one, `store` two, `call` exactly its function's parameter count);
-- **edge-argument arity** — every edge's argument list has exactly the
-  successor's block-parameter count, and each argument is a valid value;
+- **edge arguments** — every edge's argument list has exactly the
+  successor's block-parameter count; every argument is valid and has the
+  target block parameter's canonical type;
+- **opcode signatures** — arithmetic, comparison, branch, memory, call, and
+  return instructions have the documented operand arity, canonical operand
+  types, result type, and effect metadata;
+- **function signatures** — parameter SSA values, call arguments/results,
+  and return operands match their owning function's canonical signature and
+  ABI metadata;
 - **terminators** — every block has exactly one terminator, the terminator
   is the last instruction in its block, and no instruction appears after a
   terminator;
@@ -238,9 +245,10 @@ later when the HIR supports richer control-flow and value definitions.
   standard iterative algorithm; every use of a value is dominated by its
   definition; a use inside the defining block appears strictly after the
   definition (block parameters, function parameters, and constants are
-  defined at block entry). Unreachable blocks are legal; their contents are
-  checked structurally (operands valid, edge arity, terminators) but their
-  internal dominance is not enforced, since no execution path reaches them;
+  defined at block entry). Unreachable blocks are legal and are still
+  associated with an explicit owning function block range, so their signature
+  and structural checks run; dominance is not enforced because no execution
+  path reaches them;
 - **no unresolved generics** — no value, instruction, or block carries a
   type that recursively contains a `GENERIC_PARAM` descriptor;
 - **canonical finalized types** — every type attached to a value is a
@@ -273,7 +281,8 @@ A small interpreter executes the SSA form directly:
 
 - one value-slot array per call frame indexed by `SsaValueRef`, so recursive
   and re-entrant calls cannot clobber their callers' locals or parameters;
-- a flat memory of 8 KiB `i64` slots backing `load`/`store`;
+- a flat memory of 8 KiB `i64` slots backing `load`/`store`; accesses must
+  use the exact 8-byte width/alignment and integer-slot address metadata;
 - a call stack of return targets with depth and step limits, so malformed
   IR cannot hang the host;
 - function parameters are bound from call arguments (and from zero at the

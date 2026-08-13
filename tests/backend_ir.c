@@ -326,6 +326,105 @@ static void test_load_store(void) {
     int64_t result = 0;
     CHECK(bir_eval_function(&module, "main", &result));
     CHECK(result == 42);
+    arena->insts[load].memory_width = 4;
+    CHECK(!bir_eval_function(&module, "main", &result));
+    bir_module_free(&module);
+}
+
+static void test_edge_type_rejected(void) {
+    BackendIrModule module;
+    bir_module_init(&module, "<unit:edge_type>");
+    SsaArena *arena = &module.arena;
+    SsaBlockRef entry = bir_add_entry_block(arena, "entry", 1, 1);
+    SsaBlockRef join = bir_add_block(arena, "join", 1, 1);
+    SsaValueRef parameter = bir_add_block_param(arena, join, module.type_i64, 1, 1);
+    SsaValueRef boolean = bir_add_const(arena, module.type_bool, 1, 1, 1);
+    CHECK(bir_add_edge(arena, entry, join));
+    CHECK(bir_set_jump(arena, entry, join, &boolean, 1, 1, 1));
+    CHECK(bir_set_return(arena, join, parameter, 1, 1));
+    CHECK(bir_register_function_info(&module, "main", entry, 0, NULL,
+                                     module.type_i64, true));
+    char err[256] = {0};
+    CHECK(!bir_verify(&module, err, sizeof(err)));
+    CHECK(strstr(err, "target block-parameter type") != NULL);
+    bir_module_free(&module);
+}
+
+static void test_return_type_rejected(void) {
+    BackendIrModule module;
+    bir_module_init(&module, "<unit:return_type>");
+    SsaArena *arena = &module.arena;
+    SsaBlockRef entry = bir_add_entry_block(arena, "entry", 1, 1);
+    SsaValueRef boolean = bir_add_const(arena, module.type_bool, 1, 1, 1);
+    CHECK(bir_set_return(arena, entry, boolean, 1, 1));
+    CHECK(bir_register_function_info(&module, "main", entry, 0, NULL,
+                                     module.type_i64, true));
+    char err[256] = {0};
+    CHECK(!bir_verify(&module, err, sizeof(err)));
+    CHECK(strstr(err, "return") != NULL);
+    bir_module_free(&module);
+}
+
+static void test_opcode_signature_rejected(void) {
+    BackendIrModule module;
+    bir_module_init(&module, "<unit:opcode_signature>");
+    SsaArena *arena = &module.arena;
+    SsaBlockRef entry = bir_add_entry_block(arena, "entry", 1, 1);
+    SsaValueRef one = bir_add_const(arena, module.type_i64, 1, 1, 1);
+    SsaInstRef add = bir_add_inst(arena, SSA_OP_ADD, module.type_i64, &one, 1, 1, 1);
+    CHECK(bir_block_add_inst(arena, entry, add));
+    CHECK(bir_set_return(arena, entry, one, 1, 1));
+    CHECK(bir_register_function_info(&module, "main", entry, 0, NULL,
+                                     module.type_i64, true));
+    char err[256] = {0};
+    CHECK(!bir_verify(&module, err, sizeof(err)));
+    CHECK(strstr(err, "add") != NULL && strstr(err, "operands") != NULL);
+    bir_module_free(&module);
+}
+
+static void test_parameter_signature_rejected(void) {
+    BackendIrModule module;
+    bir_module_init(&module, "<unit:param_signature>");
+    SsaArena *arena = &module.arena;
+    SsaBlockRef entry = bir_add_entry_block(arena, "entry", 1, 1);
+    SsaValueRef parameter = bir_add_value(arena, SSA_VALUE_PARAM,
+                                          module.type_bool, 1, 1);
+    arena->values[parameter].param_index = 0;
+    CHECK(bir_set_return(arena, entry, parameter, 1, 1));
+    SsaValueRef params[1] = {parameter};
+    CHECK(bir_register_function_info(&module, "main", entry, 1, params,
+                                     module.type_bool, true));
+    /* The compatibility registration API declares scalar parameters as i64;
+       the bool SSA parameter must therefore be rejected by the verifier. */
+    char err[256] = {0};
+    CHECK(!bir_verify(&module, err, sizeof(err)));
+    CHECK(strstr(err, "parameter") != NULL);
+    bir_module_free(&module);
+}
+
+static void test_call_result_signature_rejected(void) {
+    BackendIrModule module;
+    bir_module_init(&module, "<unit:call_result>");
+    SsaArena *arena = &module.arena;
+    SsaBlockRef callee_entry = bir_add_entry_block(arena, "callee", 1, 1);
+    SsaValueRef one = bir_add_const(arena, module.type_i64, 1, 1, 1);
+    CHECK(bir_set_return(arena, callee_entry, one, 1, 1));
+    CHECK(bir_register_function_info(&module, "callee", callee_entry, 0, NULL,
+                                     module.type_i64, true));
+
+    SsaBlockRef caller_entry = bir_add_entry_block(arena, "caller", 1, 1);
+    SsaInstRef call = bir_add_inst(arena, SSA_OP_CALL, module.type_bool,
+                                   NULL, 0, 1, 1);
+    snprintf(arena->insts[call].callee, sizeof(arena->insts[call].callee), "callee");
+    arena->insts[call].effect = SSA_EFFECT_CALL;
+    CHECK(bir_block_add_inst(arena, caller_entry, call));
+    SsaValueRef result = bir_inst_result(arena, call, 1, 1);
+    CHECK(bir_set_return(arena, caller_entry, result, 1, 1));
+    CHECK(bir_register_function_info(&module, "caller", caller_entry, 0, NULL,
+                                     module.type_bool, true));
+    char err[256] = {0};
+    CHECK(!bir_verify(&module, err, sizeof(err)));
+    CHECK(strstr(err, "result") != NULL);
     bir_module_free(&module);
 }
 
@@ -351,6 +450,29 @@ static void test_unreachable_block(void) {
     int64_t result = 0;
     CHECK(bir_eval_function(&module, "main", &result));
     CHECK(result == 7);
+    bir_module_free(&module);
+}
+
+static void test_unreachable_return_type_rejected(void) {
+    BackendIrModule module;
+    bir_module_init(&module, "<unit:unreachable_return>");
+    SsaArena *arena = &module.arena;
+    SsaBlockRef entry = bir_add_entry_block(arena, "entry", 1, 1);
+    SsaBlockRef live = bir_add_block(arena, "live", 1, 1);
+    SsaBlockRef dead = bir_add_block(arena, "dead", 1, 1);
+    SsaValueRef good = bir_add_const(arena, module.type_i64, 1, 1, 1);
+    SsaValueRef wrong = bir_add_const(arena, module.type_bool, 1, 1, 1);
+    CHECK(bir_add_edge(arena, entry, live));
+    CHECK(bir_set_jump(arena, entry, live, NULL, 0, 1, 1));
+    CHECK(bir_set_return(arena, live, good, 1, 1));
+    /* Dead blocks still belong to the registered function's block range and
+       must obey its signature even though dominance is not checked there. */
+    CHECK(bir_set_return(arena, dead, wrong, 1, 1));
+    CHECK(bir_register_function_info(&module, "main", entry, 0, NULL,
+                                     module.type_i64, true));
+    char err[256] = {0};
+    CHECK(!bir_verify(&module, err, sizeof(err)));
+    CHECK(strstr(err, "return") != NULL);
     bir_module_free(&module);
 }
 
@@ -402,6 +524,8 @@ static void test_use_before_def_rejected(void) {
     /* use instruction added first, so the use precedes the def in the block */
     const SsaValueRef forward[2] = {c0, result};
     SsaInstRef use = bir_add_inst(arena, SSA_OP_ADD, module.type_i64, forward, 2, 1, 1);
+    SsaValueRef use_result = bir_inst_result(arena, use, 1, 1);
+    CHECK(use_result != SSA_VALUE_NONE);
     CHECK(bir_block_add_inst(arena, entry, use));
     CHECK(bir_block_add_inst(arena, entry, def));
     CHECK(bir_set_return(arena, entry, result, 1, 1));
@@ -537,7 +661,13 @@ int main(void) {
     test_differential();
     test_unit_subset();
     test_load_store();
+    test_edge_type_rejected();
+    test_return_type_rejected();
+    test_opcode_signature_rejected();
+    test_parameter_signature_rejected();
+    test_call_result_signature_rejected();
     test_unreachable_block();
+    test_unreachable_return_type_rejected();
     test_missing_terminator_rejected();
     test_arity_mismatch_rejected();
     test_use_before_def_rejected();
