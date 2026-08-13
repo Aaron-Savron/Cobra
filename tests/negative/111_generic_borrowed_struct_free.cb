@@ -1,0 +1,8 @@
+struct View[T]: {
+    data: readonly []T,
+}
+
+def invalid_free(view: View[i64]) -> i64: {
+    free(view.data)
+    return 0
+}

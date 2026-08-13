@@ -1,0 +1,22 @@
+import "modules/generic_borrowed_view_helpers.cb"
+
+def test_generic_borrowed_view_module() -> i64: {
+    data_i64 = alloc_i64(2)
+    let first: ModuleView[i64]
+    first.data = data_i64
+    let second: ModuleView[i64]
+    second.data = data_i64
+    assert(module_view_len_i64(first) == 2)
+    assert(module_view_len_i64(second) == 2)
+
+    data_f32 = alloc_f32(4)
+    let float_view: ModuleView[f32]
+    float_view.data = data_f32
+    assert(module_view_len_f32(float_view) == 4)
+
+    data_u8 = alloc_u8(6)
+    let byte_view: ModuleView[u8]
+    byte_view.data = data_u8
+    assert(module_view_len_u8(byte_view) == 6)
+    return 0
+}

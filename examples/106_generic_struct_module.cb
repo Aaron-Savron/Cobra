@@ -1,0 +1,13 @@
+import "modules/generic_struct_helpers.cb"
+
+def test_generic_struct_module() -> i64: {
+    let box: ModuleBox[i64]
+    box.value = 8
+
+    assert(module_box_score(box) == 9)
+    let first: ModuleBox[i64] = module_box_identity(box)
+    let second: ModuleBox[i64] = module_box_identity(first)
+    assert(first.value == 8)
+    assert(second.value == 8)
+    return 0
+}

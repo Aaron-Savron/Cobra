@@ -246,9 +246,10 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
     }
 
     if (match(parser, TOKEN_IDENTIFIER)) {
-        /* A generic type parameter is resolved to its canonical placeholder
-           while parsing; it is never represented as a named struct. */
-        const CobraType *generic = parser_generic_param(parser, parser->current_token.text);
+        char named_type[COBRA_MAX_IDENT_LEN];
+        copy_token_text(parser, named_type, sizeof(named_type), "type name");
+        const CobraType *generic = parser_generic_param(parser, named_type);
+        advance_token(parser);
         if (generic) {
             if (tensor) {
                 fprintf(stderr, "%s:%d:%d: error: scalar generic parameters cannot be used as tensor element types\n",
@@ -265,7 +266,6 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
                     parser_set_canonical(parser, owner, COBRA_TYPE_SLICE, qualifier,
                                          generic, NULL, NULL, NULL);
                 }
-                advance_token(parser);
                 return COBRA_TYPE_SLICE;
             }
             if (qualifier != 0) {
@@ -274,12 +274,38 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
                 exit(1);
             }
             if (owner) owner->canonical_type = generic;
-            advance_token(parser);
             return COBRA_TYPE_GENERIC_PARAM;
         }
-        /* A plain identifier in type position is a user-defined struct type.
-           Its qualified identity is constructed directly from the token; no
-           AST type-name mirror is needed. */
+
+        const CobraType *generic_argument = NULL;
+        if (match(parser, TOKEN_LBRACKET)) {
+            advance_token(parser);
+            if (match(parser, TOKEN_IDENTIFIER)) {
+                char argument_name[COBRA_MAX_IDENT_LEN];
+                copy_token_text(parser, argument_name, sizeof(argument_name), "generic type argument");
+                generic_argument = parser_generic_param(parser, argument_name);
+                if (!generic_argument) {
+                    fprintf(stderr, "%s:%d:%d: error: generic struct arguments must be scalar types or parameters\n",
+                            parser->source_file, parser->current_token.line, parser->current_token.col);
+                    exit(1);
+                }
+                advance_token(parser);
+            } else {
+                CobraTypeKind argument_kind = token_to_type(parser->current_token.type);
+                if (argument_kind == COBRA_TYPE_UNKNOWN ||
+                    argument_kind == COBRA_TYPE_VOID ||
+                    argument_kind == COBRA_TYPE_F64) {
+                    fprintf(stderr, "%s:%d:%d: error: generic struct arguments must be scalar types\n",
+                            parser->source_file, parser->current_token.line, parser->current_token.col);
+                    exit(1);
+                }
+                generic_argument = parser_component_type(parser, argument_kind, NULL);
+                advance_token(parser);
+            }
+            expect(parser, TOKEN_RBRACKET, "Expected ']' after generic struct argument");
+        }
+        /* A named generic struct is represented by its base name plus one
+           canonical argument until IR materializes the packed specialization. */
         if (owner && parser->canonical_arena) {
             CobraOwnershipKind ownership = qualifier == 1 ? COBRA_OWNERSHIP_BORROWED : COBRA_OWNERSHIP_VALUE;
             CobraMutabilityKind mutability = qualifier == 1 ? COBRA_MUTABILITY_READONLY :
@@ -287,11 +313,10 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
                                                               COBRA_MUTABILITY_DEFAULT);
             owner->canonical_type = cobra_type_make(parser->canonical_arena,
                                                     COBRA_TYPE_STRUCT,
-                                                    parser->current_token.text,
-                                                    NULL, NULL, NULL, NULL,
+                                                    named_type,
+                                                    generic_argument, NULL, NULL, NULL,
                                                     ownership, mutability, -1);
         }
-        advance_token(parser);
         return COBRA_TYPE_STRUCT;
     }
     CobraTypeKind type = token_to_type(parser->current_token.type);
@@ -1209,12 +1234,52 @@ static ASTNode *parse_struct_declaration(Parser *parser) {
     copy_token_text(parser, struct_name, sizeof(struct_name), "struct name");
     advance_token(parser);
 
+    size_t previous_generic_count = parser->generic_param_count;
+    parser->generic_param_count = 0;
+    if (match(parser, TOKEN_LBRACKET)) {
+        advance_token(parser);
+        while (!match(parser, TOKEN_RBRACKET)) {
+            if (parser->generic_param_count >= 1 ||
+                !match(parser, TOKEN_IDENTIFIER)) {
+                fprintf(stderr, "%s:%d:%d: error: generic structs currently require exactly one identifier type parameter\n",
+                        parser->source_file, parser->current_token.line, parser->current_token.col);
+                exit(1);
+            }
+            const char *parameter_name = parser->current_token.text;
+            size_t index = parser->generic_param_count++;
+            snprintf(parser->generic_param_names[index], COBRA_MAX_IDENT_LEN, "%.63s", parameter_name);
+            parser->generic_param_types[index] = cobra_type_make(parser->canonical_arena,
+                                                                  COBRA_TYPE_GENERIC_PARAM,
+                                                                  parameter_name, NULL, NULL, NULL, NULL,
+                                                                  COBRA_OWNERSHIP_VALUE,
+                                                                  COBRA_MUTABILITY_DEFAULT, -1);
+            advance_token(parser);
+            if (match(parser, TOKEN_COMMA)) advance_token(parser);
+            else if (!match(parser, TOKEN_RBRACKET)) {
+                fprintf(stderr, "%s:%d:%d: error: expected ',' or ']' after generic struct parameter\n",
+                        parser->source_file, parser->current_token.line, parser->current_token.col);
+                exit(1);
+            }
+        }
+        expect(parser, TOKEN_RBRACKET, "Expected ']' after generic struct parameters");
+    }
+
     if (match(parser, TOKEN_COLON)) advance_token(parser);
     expect(parser, TOKEN_LBRACE, "Expected '{' after struct name");
 
     ASTNode *struct_node = parser_create_node_at(parser, AST_STRUCT_DECL, struct_name, name_token);
     struct_node->declared_type = COBRA_TYPE_STRUCT;
-    struct_node->canonical_type = parser_component_type(parser, COBRA_TYPE_STRUCT, struct_name);
+    struct_node->generic_param_count = parser->generic_param_count;
+    for (size_t i = 0; i < parser->generic_param_count; i++) {
+        snprintf(struct_node->generic_param_names[i], COBRA_MAX_IDENT_LEN, "%.63s",
+                 parser->generic_param_names[i]);
+        struct_node->generic_param_types[i] = parser->generic_param_types[i];
+    }
+    struct_node->canonical_type = parser->generic_param_count == 1
+        ? cobra_type_make(parser->canonical_arena, COBRA_TYPE_STRUCT, struct_name,
+                          parser->generic_param_types[0], NULL, NULL, NULL,
+                          COBRA_OWNERSHIP_VALUE, COBRA_MUTABILITY_DEFAULT, -1)
+        : parser_component_type(parser, COBRA_TYPE_STRUCT, struct_name);
     while (!match(parser, TOKEN_RBRACE)) {
         if (!match(parser, TOKEN_IDENTIFIER)) {
             fprintf(stderr, "%s:%d:%d: error: expected field name in struct '%s'\n",
@@ -1248,6 +1313,7 @@ static ASTNode *parse_struct_declaration(Parser *parser) {
         if (match(parser, TOKEN_COMMA)) advance_token(parser);
     }
     expect(parser, TOKEN_RBRACE, "Expected '}' after struct fields");
+    parser->generic_param_count = previous_generic_count;
     return struct_node;
 }
 

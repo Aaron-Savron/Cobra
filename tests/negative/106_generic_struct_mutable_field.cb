@@ -1,0 +1,7 @@
+struct MutableBox[T]: {
+    value: out i64,
+}
+
+def use_mutable(box: MutableBox[i64]) -> i64: {
+    return 0
+}

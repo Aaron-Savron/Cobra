@@ -68,6 +68,77 @@ int main(void) {
     assert(cobra_type_error(instantiated_result) == i32);
     assert(instantiated_result->abi == COBRA_ABI_SUM_INDIRECT);
 
+    /* Scalar-only generic structs substitute fields before finalization and
+       intern repeated specializations by their complete canonical shape. */
+    static CobraTypeArena generic_struct_arena;
+    cobra_type_arena_init(&generic_struct_arena);
+    CobraType *struct_parameter = cobra_type_make(&generic_struct_arena,
+                                                  COBRA_TYPE_GENERIC_PARAM, "T",
+                                                  NULL, NULL, NULL, NULL,
+                                                  COBRA_OWNERSHIP_VALUE,
+                                                  COBRA_MUTABILITY_DEFAULT, -1);
+    CobraType *box_template = cobra_type_named(&generic_struct_arena,
+                                                COBRA_TYPE_STRUCT, "Box");
+    assert(struct_parameter && box_template);
+    assert(cobra_type_add_generic_arg(box_template, struct_parameter));
+    assert(cobra_type_add_field(box_template, "value", struct_parameter,
+                                COBRA_OWNERSHIP_VALUE,
+                                COBRA_MUTABILITY_DEFAULT, -1));
+    CobraType *box_i64 = cobra_type_instantiate_struct(&generic_struct_arena,
+                                                       box_template, struct_parameter,
+                                                       i64, "Box__i64");
+    CobraType *same_box_i64 = cobra_type_instantiate_struct(&generic_struct_arena,
+                                                            box_template, struct_parameter,
+                                                            i64, "Box__i64");
+    CobraType *box_f32 = cobra_type_instantiate_struct(&generic_struct_arena,
+                                                       box_template, struct_parameter,
+                                                       f32, "Box__f32");
+    assert(box_i64 && same_box_i64 && box_f32);
+    assert(box_i64 == same_box_i64);
+    assert(box_i64 != box_f32);
+    assert(box_i64->finalized && box_i64->abi == COBRA_ABI_STRUCT_VALUE);
+    assert(box_i64->fields[0].type == i64);
+    assert(box_i64->fields[0].offset == 0 && box_i64->size == 8);
+    assert(box_f32->fields[0].type == f32);
+    assert(box_f32->fields[0].offset == 0 && box_f32->size == 8);
+    assert(!cobra_type_add_field(box_i64, "extra", i64,
+                                 COBRA_OWNERSHIP_VALUE,
+                                 COBRA_MUTABILITY_DEFAULT, -1));
+
+    /* Generic borrowed-field structs substitute the element while preserving
+       the field's borrowed/readonly contract and two-word slice layout. */
+    CobraType *view_parameter = cobra_type_make(&generic_struct_arena,
+                                                COBRA_TYPE_GENERIC_PARAM, "V",
+                                                NULL, NULL, NULL, NULL,
+                                                COBRA_OWNERSHIP_VALUE,
+                                                COBRA_MUTABILITY_DEFAULT, -1);
+    CobraType *view_template = cobra_type_named(&generic_struct_arena,
+                                                COBRA_TYPE_STRUCT, "View");
+    CobraType *view_slice = cobra_type_make(&generic_struct_arena,
+                                            COBRA_TYPE_SLICE, NULL,
+                                            view_parameter, NULL, NULL, NULL,
+                                            COBRA_OWNERSHIP_BORROWED,
+                                            COBRA_MUTABILITY_READONLY, -1);
+    assert(view_parameter && view_template && view_slice);
+    assert(cobra_type_add_generic_arg(view_template, view_parameter));
+    assert(cobra_type_add_field(view_template, "data", view_slice,
+                                COBRA_OWNERSHIP_BORROWED,
+                                COBRA_MUTABILITY_READONLY, -1));
+    CobraType *view_i64 = cobra_type_instantiate_struct(&generic_struct_arena,
+                                                        view_template, view_parameter,
+                                                        i64, "View__i64");
+    CobraType *same_view_i64 = cobra_type_instantiate_struct(&generic_struct_arena,
+                                                             view_template, view_parameter,
+                                                             i64, "View__i64");
+    assert(view_i64 && same_view_i64 && view_i64 == same_view_i64);
+    assert(view_i64->abi == COBRA_ABI_STRUCT_VALUE && view_i64->size == 16);
+    assert(view_i64->fields[0].offset == 0);
+    assert(view_i64->fields[0].type->kind == COBRA_TYPE_SLICE);
+    assert(cobra_type_element(view_i64->fields[0].type)->kind == COBRA_TYPE_I64);
+    assert(view_i64->fields[0].ownership == COBRA_OWNERSHIP_BORROWED);
+    assert(view_i64->fields[0].mutability == COBRA_MUTABILITY_READONLY);
+    assert(view_i64->fields[0].region_id == -1);
+
     /* Readonly generic slices keep the borrowed pointer-plus-length ABI while
        selecting an element-specific storage kind during substitution. */
     CobraType *readonly_slice_template = cobra_type_make(

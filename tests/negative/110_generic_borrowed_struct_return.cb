@@ -1,0 +1,7 @@
+struct View[T]: {
+    data: readonly []T,
+}
+
+def invalid_return(view: View[i64]) -> View[i64]: {
+    return view
+}

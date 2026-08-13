@@ -1,0 +1,11 @@
+struct ModuleBox[T]: {
+    value: T,
+}
+
+pub def module_box_score(box: ModuleBox[i64]) -> i64: {
+    return box.value + 1
+}
+
+pub def module_box_identity(box: ModuleBox[i64]) -> ModuleBox[i64]: {
+    return box
+}

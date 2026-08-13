@@ -60,6 +60,10 @@ emit examples/100_generic_functions.cb "$work/generic-functions.s"
 emit examples/101_generic_module.cb "$work/generic-module.s"
 emit examples/103_generic_readonly_slices.cb "$work/generic-slices.s"
 emit examples/104_generic_readonly_slice_module.cb "$work/generic-slice-module.s"
+emit examples/105_generic_structs.cb "$work/generic-structs.s"
+emit examples/106_generic_struct_module.cb "$work/generic-struct-module.s"
+emit examples/107_generic_borrowed_views.cb "$work/generic-borrowed-views.s"
+emit examples/108_generic_borrowed_view_module.cb "$work/generic-borrowed-view-module.s"
 
 maybe=$(body "$work/sums.s" maybe_value)
 checked=$(body "$work/sums.s" checked_value)
@@ -88,6 +92,19 @@ generic_slice_i64=$(body "$work/generic-slices.s" readonly_len__i64)
 generic_slice_f32=$(body "$work/generic-slices.s" readonly_len__f32)
 generic_slice_calls=$(body "$work/generic-slices.s" test_generic_readonly_slices)
 generic_slice_module_calls=$(body "$work/generic-slice-module.s" test_generic_readonly_slice_module)
+generic_struct_score=$(body "$work/generic-structs.s" box_score)
+generic_struct_scale=$(body "$work/generic-structs.s" box_scale)
+generic_struct_identity=$(body "$work/generic-structs.s" box_identity)
+generic_struct_identity_f32=$(body "$work/generic-structs.s" box_identity_f32)
+generic_struct_calls=$(body "$work/generic-structs.s" test_generic_structs)
+generic_struct_module_score=$(body "$work/generic-struct-module.s" module_box_score)
+generic_struct_module_identity=$(body "$work/generic-struct-module.s" module_box_identity)
+generic_struct_module_calls=$(body "$work/generic-struct-module.s" test_generic_struct_module)
+generic_borrowed_i64=$(body "$work/generic-borrowed-views.s" view_len_i64)
+generic_borrowed_f32=$(body "$work/generic-borrowed-views.s" view_len_f32)
+generic_borrowed_u8=$(body "$work/generic-borrowed-views.s" view_len_u8)
+generic_borrowed_calls=$(body "$work/generic-borrowed-views.s" test_generic_borrowed_views)
+generic_borrowed_module_calls=$(body "$work/generic-borrowed-view-module.s" test_generic_borrowed_view_module)
 
 # Scalar values, enums, and sums stay in native registers/frame slots. They do
 # not allocate a heap object or enter a runtime type dispatcher.
@@ -189,6 +206,64 @@ if [ "$(grep -Ec 'call[[:space:]]+module_readonly_len__i64@PLT' <<<"$generic_sli
     exit 1
 fi
 require_text "module readonly f32 slice" "$generic_slice_module_calls" 'call[[:space:]]+module_readonly_len__f32@PLT'
+
+# Scalar generic structs are materialized before lowering. Their parameters are
+# ordinary by-value struct pointers, fields use the specialized packed layout,
+# and struct returns copy into caller-owned storage instead of returning a dead
+# callee-frame address.
+require_text "generic struct scalar field copy" "$generic_struct_score" 'mov rax, QWORD PTR \[rsi\+0\]'
+require_text "generic struct f32 field load" "$generic_struct_scale" 'movss xmm0, DWORD PTR \[rax \+ 0\]'
+require_text "generic struct return sret" "$generic_struct_identity" 'mov rdi, QWORD PTR \[rbp-240\]'
+require_text "generic struct return copy" "$generic_struct_identity" 'mov QWORD PTR \[rdi\+0\], rax'
+require_text "generic struct i64 call" "$generic_struct_calls" 'call[[:space:]]+box_score@PLT'
+require_text "generic struct f32 call" "$generic_struct_calls" 'call[[:space:]]+box_scale@PLT'
+require_text "generic struct return call" "$generic_struct_calls" 'call[[:space:]]+box_identity@PLT'
+require_text "generic struct f32 return call" "$generic_struct_calls" 'call[[:space:]]+box_identity_f32@PLT'
+require_text "generic struct f32 return copy" "$generic_struct_identity_f32" 'mov QWORD PTR \[rdi\+0\], rax'
+forbid_text "generic struct heap" "$generic_struct_score $generic_struct_scale $generic_struct_identity $generic_struct_identity_f32" '((malloc|calloc|realloc|free)@PLT|cobra_(alloc|free|type))'
+if [ "$(grep -Ec '^box_score:' "$work/generic-structs.s")" -ne 1 ] ||
+   [ "$(grep -Ec '^box_scale:' "$work/generic-structs.s")" -ne 1 ] ||
+   [ "$(grep -Ec '^box_identity:' "$work/generic-structs.s")" -ne 1 ] ||
+   [ "$(grep -Ec '^box_identity_f32:' "$work/generic-structs.s")" -ne 1 ]; then
+    printf '%s\n' 'contract failed: generic struct specializations were duplicated or missing' >&2
+    exit 1
+fi
+require_text "module generic struct field" "$generic_struct_module_score" 'mov rax, QWORD PTR \[rsi\+0\]'
+require_text "module generic struct return" "$generic_struct_module_identity" 'mov QWORD PTR \[rdi\+0\], rax'
+require_text "module generic struct call" "$generic_struct_module_calls" 'call[[:space:]]+module_box_score@PLT'
+if [ "$(grep -Ec 'call[[:space:]]+module_box_identity@PLT' <<<"$generic_struct_module_calls")" -ne 2 ]; then
+    printf '%s\n' 'contract failed: repeated module generic struct specialization was not reused' >&2
+    exit 1
+fi
+if [ "$(grep -Ec '^module_box_identity:' "$work/generic-struct-module.s")" -ne 1 ]; then
+    printf '%s\n' 'contract failed: module generic struct identity was duplicated or missing' >&2
+    exit 1
+fi
+
+# Generic borrowed-field structs retain a two-word view field after scalar
+# substitution. The field is copied by value, read through canonical offsets,
+# and never allocates or dispatches through a runtime type object.
+for borrowed_body in "$generic_borrowed_i64" "$generic_borrowed_f32" "$generic_borrowed_u8"; do
+    require_text "generic borrowed field pointer" "$borrowed_body" 'mov rax, QWORD PTR \[rsi\+0\]'
+    require_text "generic borrowed field length" "$borrowed_body" 'mov rax, QWORD PTR \[rsi\+8\]'
+    forbid_text "generic borrowed field runtime dispatch" "$borrowed_body" 'call[[:space:]]+cobra_'
+    forbid_text "generic borrowed field allocator" "$borrowed_body" 'call[[:space:]]+(malloc|calloc|realloc|memcpy|memmove)@PLT'
+done
+require_text "generic borrowed i64 view call" "$generic_borrowed_calls" 'call[[:space:]]+view_len_i64@PLT'
+require_text "generic borrowed f32 view call" "$generic_borrowed_calls" 'call[[:space:]]+view_len_f32@PLT'
+require_text "generic borrowed u8 view call" "$generic_borrowed_calls" 'call[[:space:]]+view_len_u8@PLT'
+if [ "$(grep -Ec '^module_view_len_i64:' "$work/generic-borrowed-view-module.s")" -ne 1 ] ||
+   [ "$(grep -Ec '^module_view_len_f32:' "$work/generic-borrowed-view-module.s")" -ne 1 ] ||
+   [ "$(grep -Ec '^module_view_len_u8:' "$work/generic-borrowed-view-module.s")" -ne 1 ]; then
+    printf '%s\n' 'contract failed: generic borrowed-view module specializations were duplicated or missing' >&2
+    exit 1
+fi
+if [ "$(grep -Ec 'call[[:space:]]+module_view_len_i64@PLT' <<<"$generic_borrowed_module_calls")" -ne 2 ]; then
+    printf '%s\n' 'contract failed: repeated generic borrowed-view module specialization was not reused' >&2
+    exit 1
+fi
+require_text "module generic borrowed f32 call" "$generic_borrowed_module_calls" 'call[[:space:]]+module_view_len_f32@PLT'
+require_text "module generic borrowed u8 call" "$generic_borrowed_module_calls" 'call[[:space:]]+module_view_len_u8@PLT'
 
 # A simple match is compares and branches, not a boxed state machine.
 require_text "enum compare" "$phase" 'cmp[[:space:]]'

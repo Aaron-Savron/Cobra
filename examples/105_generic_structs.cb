@@ -1,0 +1,37 @@
+# Scalar-only generic structs specialize into ordinary packed native structs.
+
+struct Box[T]: {
+    value: T,
+}
+
+def box_score(box: Box[i64]) -> i64: {
+    return box.value
+}
+
+def box_scale(box: Box[f32]) -> f32: {
+    return box.value * 2.0
+}
+
+def box_identity(box: Box[i64]) -> Box[i64]: {
+    return box
+}
+
+def box_identity_f32(box: Box[f32]) -> Box[f32]: {
+    return box
+}
+
+def test_generic_structs() -> i64: {
+    let integer_box: Box[i64]
+    integer_box.value = 7
+    assert(box_score(integer_box) == 7)
+
+    let copied_box: Box[i64] = box_identity(integer_box)
+    assert(copied_box.value == 7)
+
+    let float_box: Box[f32]
+    float_box.value = 2.5
+    assert(box_scale(float_box) == 5.0)
+    let copied_float: Box[f32] = box_identity_f32(float_box)
+    assert(copied_float.value == 2.5)
+    return 0
+}

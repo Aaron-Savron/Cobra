@@ -1,0 +1,43 @@
+# Generic borrowed views preserve pointer-plus-length ABI without owning data.
+
+struct View[T]: {
+    data: readonly []T,
+}
+
+def view_len_i64(view: View[i64]) -> i64: {
+    return len(view.data)
+}
+
+def view_len_f32(view: View[f32]) -> i64: {
+    return len(view.data)
+}
+
+def view_len_u8(view: View[u8]) -> i64: {
+    return len(view.data)
+}
+
+def test_generic_borrowed_views() -> i64: {
+    data_i64 = alloc_i64(3)
+    let view_i64: View[i64]
+    view_i64.data = data_i64
+    assert(view_len_i64(view_i64) == 3)
+
+    data_f32 = alloc_f32(5)
+    let view_f32: View[f32]
+    view_f32.data = data_f32
+    assert(view_len_f32(view_f32) == 5)
+
+    data_u8 = alloc_u8(7)
+    let view_u8: View[u8]
+    view_u8.data = data_u8
+    assert(view_len_u8(view_u8) == 7)
+
+    # Region-backed views are valid only while their owner is active.
+    with region scratch(256): {
+        region_data = scratch.alloc_i64(2)
+        let region_view: View[i64]
+        region_view.data = region_data
+        assert(view_len_i64(region_view) == 2)
+    }
+    return 0
+}

@@ -1,0 +1,8 @@
+struct RecursiveBox[T]: {
+    value: T,
+    next: RecursiveBox[T],
+}
+
+def use_recursive(box: RecursiveBox[i64]) -> i64: {
+    return box.value
+}

@@ -1,0 +1,15 @@
+struct ModuleView[T]: {
+    data: readonly []T,
+}
+
+pub def module_view_len_i64(view: ModuleView[i64]) -> i64: {
+    return len(view.data)
+}
+
+pub def module_view_len_f32(view: ModuleView[f32]) -> i64: {
+    return len(view.data)
+}
+
+pub def module_view_len_u8(view: ModuleView[u8]) -> i64: {
+    return len(view.data)
+}

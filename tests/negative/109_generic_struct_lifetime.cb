@@ -1,0 +1,7 @@
+struct LifetimeBox[T]: {
+    value: readonly []T,
+}
+
+def invalid_lifetime(box: LifetimeBox[i64]) -> LifetimeBox[i64]: {
+    return box
+}

@@ -533,6 +533,95 @@ CobraType *cobra_type_instantiate(CobraTypeArena *arena,
     return intern_finalized_type(arena, candidate);
 }
 
+CobraType *cobra_type_instantiate_struct(CobraTypeArena *arena,
+                                         const CobraType *template_type,
+                                         const CobraType *parameter,
+                                         const CobraType *argument,
+                                         const char *specialized_name) {
+    if (!arena || !template_type || !parameter || !argument ||
+        !specialized_name || !specialized_name[0]) return NULL;
+    if (template_type->kind != COBRA_TYPE_STRUCT ||
+        parameter->kind != COBRA_TYPE_GENERIC_PARAM ||
+        !scalar_generic_argument(argument) ||
+        template_type->generic_arg_count != 1 ||
+        template_type->generic_args[0] != parameter) {
+        type_error(arena, "generic struct substitution requires one scalar parameter");
+        return NULL;
+    }
+    if (template_type->field_count == 0) {
+        type_error(arena, "generic struct '%s' has no fields", template_type->name);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < arena->count; i++) {
+        CobraType *existing = &arena->nodes[i];
+        if (existing->kind != COBRA_TYPE_STRUCT ||
+            strcmp(existing->name, specialized_name) != 0 ||
+            !existing->finalized) continue;
+        if (cobra_type_equal(existing, template_type)) return existing;
+        /* The candidate has not been built yet, so a same-name finalized
+           descriptor is only reusable after the full field shape is checked
+           below. Keep the collision check after construction. */
+    }
+
+    CobraType *candidate = cobra_type_named(arena, COBRA_TYPE_STRUCT, specialized_name);
+    if (!candidate || !cobra_type_add_generic_arg(candidate, argument)) {
+        type_error(arena, "could not construct generic struct specialization");
+        return NULL;
+    }
+    for (size_t i = 0; i < template_type->field_count; i++) {
+        const CobraTypeField *source = &template_type->fields[i];
+        const CobraType *field_type = source->type == parameter ? argument : source->type;
+        bool borrowed_slice = false;
+        if (source->type && slice_type_kind(source->type->kind) &&
+            source->type->generic_arg_count == 1 &&
+            source->type->generic_args[0] == parameter) {
+            if (source->ownership != COBRA_OWNERSHIP_BORROWED ||
+                source->mutability != COBRA_MUTABILITY_READONLY ||
+                source->region_id != -1) {
+                type_error(arena,
+                           "generic slice field '%s' must be borrowed and readonly",
+                           source->name);
+                return NULL;
+            }
+            field_type = cobra_type_instantiate(arena, source->type,
+                                                parameter, argument);
+            borrowed_slice = field_type != NULL;
+        }
+        bool valid_scalar = field_type && field_type->kind != COBRA_TYPE_GENERIC_PARAM &&
+                            scalar_generic_argument(field_type) &&
+                            source->ownership == COBRA_OWNERSHIP_VALUE &&
+                            source->mutability == COBRA_MUTABILITY_DEFAULT &&
+                            source->region_id == -1;
+        if (!valid_scalar && !borrowed_slice) {
+            type_error(arena,
+                       "generic struct field '%s' must be an immutable scalar or readonly borrowed slice",
+                       source->name);
+            return NULL;
+        }
+        if (!cobra_type_add_field(candidate, source->name, field_type,
+                                  source->ownership, source->mutability,
+                                  source->region_id)) {
+            type_error(arena, "generic struct '%s' has too many fields",
+                       template_type->name);
+            return NULL;
+        }
+    }
+    if (!cobra_type_validate(arena, candidate)) return NULL;
+    for (size_t i = 0; i < arena->count; i++) {
+        CobraType *existing = &arena->nodes[i];
+        if (existing == candidate || !existing->finalized ||
+            existing->kind != COBRA_TYPE_STRUCT ||
+            strcmp(existing->name, specialized_name) != 0) continue;
+        if (cobra_type_equal(existing, candidate)) return existing;
+        type_error(arena,
+                   "generic struct specialization name collision for '%s'",
+                   specialized_name);
+        return NULL;
+    }
+    return intern_finalized_type(arena, candidate);
+}
+
 bool cobra_type_validate(CobraTypeArena *arena, const CobraType *type) {
     if (!arena || !type) return false;
     for (size_t i = 0; i < type->field_count; i++) {
@@ -641,6 +730,18 @@ static bool struct_shape_matches(ASTNode *decl, const CobraType *type) {
     return true;
 }
 
+static bool type_contains_generic_param(const CobraType *type) {
+    if (!type) return false;
+    if (type->kind == COBRA_TYPE_GENERIC_PARAM) return true;
+    for (size_t i = 0; i < type->generic_arg_count; i++) {
+        if (type_contains_generic_param(type->generic_args[i])) return true;
+    }
+    for (size_t i = 0; i < type->field_count; i++) {
+        if (type_contains_generic_param(type->fields[i].type)) return true;
+    }
+    return false;
+}
+
 static const CobraType *cobra_type_struct_layout_depth(CobraTypeArena *arena, ASTNode *root,
                                                        const char *name, int depth) {
     if (!arena || !root || !name || !name[0]) return NULL;
@@ -651,7 +752,13 @@ static const CobraType *cobra_type_struct_layout_depth(CobraTypeArena *arena, AS
     }
     if (!decl) return NULL;
 
-    CobraType *type = canonical_component_node(arena, COBRA_TYPE_STRUCT, name);
+    CobraType *type = NULL;
+    if (decl->canonical_type && decl->canonical_type->kind == COBRA_TYPE_STRUCT &&
+        strcmp(decl->canonical_type->name, name) == 0) {
+        type = (CobraType *)decl->canonical_type;
+    } else {
+        type = canonical_component_node(arena, COBRA_TYPE_STRUCT, name);
+    }
     if (!type) return NULL;
     if (type->finalized) {
         if (!struct_shape_matches(decl, type)) {
@@ -686,9 +793,17 @@ static const CobraType *cobra_type_struct_layout_depth(CobraTypeArena *arena, AS
             /* Per-field ownership-layout validation, carried over from the
                removed legacy module. The canonical descriptor is now the only
                source for the field kind, named identity, and qualifier. */
-            if (field_kind == COBRA_TYPE_SLICE || field_kind == COBRA_TYPE_SLICE_F32) {
+            bool generic_borrowed_slice = decl->generic_param_count == 1 &&
+                declared->kind == COBRA_TYPE_SLICE &&
+                declared->generic_arg_count == 1 &&
+                declared->generic_args[0] == decl->generic_param_types[0] &&
+                declared->ownership == COBRA_OWNERSHIP_BORROWED &&
+                declared->mutability == COBRA_MUTABILITY_READONLY &&
+                declared->region_id == -1;
+            if ((field_kind == COBRA_TYPE_SLICE || field_kind == COBRA_TYPE_SLICE_F32) &&
+                !generic_borrowed_slice) {
                 type_error(arena,
-                           "struct slice field '%s' is not supported; use a qualified []u8 view",
+                           "struct slice field '%s' is not supported; use a qualified generic readonly view",
                            field->name);
                 ok = false;
                 break;
@@ -723,6 +838,9 @@ static const CobraType *cobra_type_struct_layout_depth(CobraTypeArena *arena, AS
         type->populating = false;
         if (!ok) return NULL;
     }
+    /* Generic templates retain their placeholder fields until a call site
+       supplies a scalar argument. They are definitions, not ABI-ready values. */
+    if (type_contains_generic_param(type)) return type;
     if (!cobra_type_finalize(arena, type)) return NULL;
     return type;
 }

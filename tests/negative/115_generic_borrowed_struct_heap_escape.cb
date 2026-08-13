@@ -1,0 +1,8 @@
+struct View[T]: {
+    data: readonly []T,
+}
+
+def invalid_heap_escape(view: View[i64]) -> i64: {
+    heap saved: View[i64] = view
+    return 0
+}

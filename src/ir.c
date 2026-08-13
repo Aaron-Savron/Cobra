@@ -971,6 +971,126 @@ static ASTNode *specialize_generic_function(IRContext *ctx, ASTNode *generic,
     return specialized;
 }
 
+static ASTNode *find_struct_declaration(IRContext *ctx, const char *name) {
+    if (!ctx || !ctx->root || !name || !name[0]) return NULL;
+    for (size_t i = 0; i < ctx->root->child_count; i++) {
+        ASTNode *node = ctx->root->children[i];
+        if (node->type == AST_STRUCT_DECL && strcmp(node->name, name) == 0)
+            return node;
+    }
+    return NULL;
+}
+
+static const char *generic_struct_suffix(const CobraType *argument) {
+    if (!argument) return "unknown";
+    return argument->name[0] && argument->kind == COBRA_TYPE_ENUM
+        ? argument->name : cobra_type_kind_name(argument->kind);
+}
+
+/* Materialize an immutable generic struct as an ordinary declaration before IR
+   registration. This keeps the existing by-value struct lowering unchanged:
+   after substitution, codegen sees only a finalized named struct with a real
+   canonical layout and never needs to understand generic placeholders. */
+static const CobraType *specialize_struct_reference(IRContext *ctx,
+                                                     const CobraType *requested,
+                                                     ASTNode *use_site) {
+    if (!ctx || !requested || requested->kind != COBRA_TYPE_STRUCT ||
+        requested->generic_arg_count == 0) return requested;
+    if (requested->generic_arg_count != 1 ||
+        requested->ownership != COBRA_OWNERSHIP_VALUE ||
+        requested->mutability != COBRA_MUTABILITY_DEFAULT ||
+        requested->region_id != -1) {
+        ir_error(ctx, use_site, "generic struct values must be immutable scalar by-value types");
+        return NULL;
+    }
+
+    ASTNode *template_decl = find_struct_declaration(ctx, requested->name);
+    if (!template_decl || template_decl->generic_param_count != 1 ||
+        !template_decl->generic_param_types[0]) {
+        ir_error(ctx, use_site, "generic struct template is not declared with one type parameter");
+        return NULL;
+    }
+    const CobraType *argument = requested->generic_args[0];
+    if (!generic_scalar_argument(argument)) {
+        ir_error(ctx, use_site, "generic struct arguments must be scalar types");
+        return NULL;
+    }
+    const CobraType *template_type = cobra_type_struct_layout(
+        ctx->canonical_arena, ctx->root, template_decl->name);
+    if (!template_type) {
+        ir_error(ctx, use_site, "generic struct template has an invalid layout");
+        return NULL;
+    }
+
+    char specialized_name[COBRA_MAX_IDENT_LEN];
+    snprintf(specialized_name, sizeof(specialized_name), "%.46s__%.15s",
+             template_decl->name, generic_struct_suffix(argument));
+    const CobraType *specialized = cobra_type_instantiate_struct(
+        ctx->canonical_arena, template_type, template_decl->generic_param_types[0],
+        argument, specialized_name);
+    if (!specialized) {
+        const char *reason = ctx->canonical_arena->error[0]
+            ? ctx->canonical_arena->error : "generic struct specialization is unsupported";
+        ir_error(ctx, use_site, reason);
+        return NULL;
+    }
+
+    /* Add one synthetic, non-generic declaration for the specialized layout.
+       It is intentionally an AST declaration rather than a side table entry,
+       so canonical field lookup, IR registration, and codegen all share the
+       existing declaration-driven path. */
+    ASTNode *special_decl = find_struct_declaration(ctx, specialized->name);
+    if (!special_decl) {
+        special_decl = ast_create_node(AST_STRUCT_DECL, specialized->name);
+        if (!special_decl) {
+            ir_error(ctx, use_site, "could not allocate generic struct specialization declaration");
+            return NULL;
+        }
+        special_decl->declared_type = COBRA_TYPE_STRUCT;
+        special_decl->canonical_type = specialized;
+        special_decl->source_line = use_site ? use_site->source_line : template_decl->source_line;
+        special_decl->source_col = use_site ? use_site->source_col : template_decl->source_col;
+        snprintf(special_decl->source_file, sizeof(special_decl->source_file), "%.511s",
+                 template_decl->source_file);
+        for (size_t i = 0; i < specialized->field_count; i++) {
+            const CobraTypeField *field_type = &specialized->fields[i];
+            ASTNode *field = ast_create_node(AST_PARAM, field_type->name);
+            if (!field) {
+                ast_free(special_decl);
+                ir_error(ctx, use_site, "could not allocate generic struct field declaration");
+                return NULL;
+            }
+            field->declared_type = field_type->type->kind;
+            field->canonical_type = field_type->type;
+            ast_add_child(special_decl, field);
+        }
+        ast_add_child(ctx->root, special_decl);
+    }
+    return specialized;
+}
+
+static void specialize_struct_types_in_tree(IRContext *ctx, ASTNode *node) {
+    if (!ctx || !node) return;
+    /* A generic declaration is a template, not a use site. Its placeholder
+       fields remain unresolved until a concrete Box[T] reference is seen. */
+    if (node->type == AST_STRUCT_DECL && node->generic_param_count > 0) return;
+    if (node->canonical_type && node->canonical_type->kind == COBRA_TYPE_STRUCT &&
+        node->canonical_type->generic_arg_count > 0 &&
+        !node->canonical_type->finalized) {
+        const CobraType *specialized = specialize_struct_reference(ctx,
+                                                                    node->canonical_type,
+                                                                    node);
+        if (specialized) {
+            node->canonical_type = specialized;
+            node->declared_type = COBRA_TYPE_STRUCT;
+            node->value_type = node->type == AST_PARAM || node->type == AST_VAR_DECL
+                ? COBRA_TYPE_STRUCT : node->value_type;
+        }
+    }
+    for (size_t i = 0; i < node->child_count; i++)
+        specialize_struct_types_in_tree(ctx, node->children[i]);
+}
+
 static bool canonical_call_compatible(const CobraType *expected, const CobraType *actual) {
     if (!expected || !actual) return true;
     if (cobra_type_equal(expected, actual)) return true;
@@ -1108,6 +1228,9 @@ static bool is_imported_function(IRContext *ctx, const char *name) {
    convenience mirror of cobra_type_struct_layout, not a second layout. */
 static void register_struct_decl(IRContext *ctx, ASTNode *decl, bool report_errors) {
     if (!ctx || !decl) return;
+    /* Generic declarations are templates. Register only materialized
+       specializations so no unresolved placeholder can influence ABI checks. */
+    if (decl->generic_param_count > 0) return;
     if (ctx->struct_count >= COBRA_MAX_STRUCTS) {
         if (report_errors) ir_error(ctx, decl, "too many struct types");
         return;
@@ -1289,7 +1412,9 @@ static void propagate_member_view_metadata(IRContext *ctx, IRLocal *view, ASTNod
 
 static bool is_region_alloc_call(IRContext *ctx, ASTNode *node) {
     return node && node->type == AST_FUNC_CALL && node->qualifier[0] != '\0' &&
-           (strcmp(node->name, "alloc_f32") == 0 || strcmp(node->name, "alloc_u8") == 0) &&
+           (strcmp(node->name, "alloc_i64") == 0 ||
+            strcmp(node->name, "alloc_f32") == 0 ||
+            strcmp(node->name, "alloc_u8") == 0) &&
            is_active_region(ctx, node->qualifier);
 }
 
@@ -1698,10 +1823,12 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                             break;
                         }
                     }
-                    if (base_type != COBRA_TYPE_SLICE_U8)
-                        ir_error(ctx, node, "only []u8 struct fields are writable by index");
+                    if (base_type != COBRA_TYPE_SLICE &&
+                        base_type != COBRA_TYPE_SLICE_F32 &&
+                        base_type != COBRA_TYPE_SLICE_U8)
+                        ir_error(ctx, node, "only slice struct fields are writable by index");
                     if (field_qualifier != 2)
-                        ir_error(ctx, node, "cannot write readonly byte-view field; use out []u8");
+                        ir_error(ctx, node, "cannot write readonly borrowed slice field");
                 }
             } else if (!find_local(ctx, node->name, &base_type) ||
                 (base_type != COBRA_TYPE_ARRAY && base_type != COBRA_TYPE_SLICE &&
@@ -1803,8 +1930,10 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
             if (node->qualifier[0] != '\0') {
                 if (is_active_region(ctx, node->qualifier)) {
                     /* Region-qualified calls are the arena allocator surface.
-                       Anything other than alloc_f32 is an unknown member. */
-                    if (strcmp(node->name, "alloc_f32") != 0 && strcmp(node->name, "alloc_u8") != 0) {
+                       Only the typed allocation helpers are valid members. */
+                    if (strcmp(node->name, "alloc_i64") != 0 &&
+                        strcmp(node->name, "alloc_f32") != 0 &&
+                        strcmp(node->name, "alloc_u8") != 0) {
                         char message[180];
                         snprintf(message, sizeof(message), "region '%s' has no function '%s'",
                                  node->qualifier, node->name);
@@ -2040,6 +2169,16 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                 }
                 node->value_type = strcmp(node->name, "alloc_f32") == 0 ? COBRA_TYPE_SLICE_F32 :
                                    (strcmp(node->name, "alloc_u8") == 0 ? COBRA_TYPE_SLICE_U8 : COBRA_TYPE_SLICE);
+                CobraTypeKind element_kind = strcmp(node->name, "alloc_f32") == 0 ? COBRA_TYPE_F32 :
+                                             (strcmp(node->name, "alloc_u8") == 0 ? COBRA_TYPE_U8 : COBRA_TYPE_I64);
+                node->canonical_type = cobra_type_make(ctx->canonical_arena, node->value_type, NULL,
+                                                       cobra_type_make(ctx->canonical_arena, element_kind,
+                                                                       NULL, NULL, NULL, NULL, NULL,
+                                                                       COBRA_OWNERSHIP_VALUE,
+                                                                       COBRA_MUTABILITY_DEFAULT, -1),
+                                                       NULL, NULL, NULL,
+                                                       COBRA_OWNERSHIP_VALUE,
+                                                       COBRA_MUTABILITY_DEFAULT, -1);
                 return node->value_type;
             }
             if (strcmp(node->name, "slice_u8") == 0) {
@@ -2418,22 +2557,36 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                 ir_error(ctx, node, message);
                 return;
             }
-            if (field_type == COBRA_TYPE_SLICE_U8 && base && field_qualifier == 1 &&
+            bool borrowed_view_field = field_index >= 0 &&
+                type->fields[field_index].ownership == COBRA_FIELD_BORROWED_VIEW &&
+                (field_type == COBRA_TYPE_SLICE || field_type == COBRA_TYPE_SLICE_F32 ||
+                 field_type == COBRA_TYPE_SLICE_U8);
+            if (borrowed_view_field && base && field_qualifier == 1 &&
                 (base->is_parameter || (field_index >= 0 &&
                  (base->struct_field_initialized & (1ULL << field_index)) != 0))) {
-                ir_error(ctx, node, "cannot reassign readonly byte-view field; use out []u8");
+                ir_error(ctx, node, "cannot reassign readonly borrowed slice field");
             }
             CobraTypeKind value = infer_expr(node->children[1], ctx);
-            if (field_type == COBRA_TYPE_SLICE_U8 && value != COBRA_TYPE_SLICE_U8 &&
-                value != COBRA_TYPE_UNKNOWN) {
-                ir_error(ctx, node, "byte-view field assignment requires a []u8 view");
+            if (borrowed_view_field && value != COBRA_TYPE_UNKNOWN &&
+                value != COBRA_TYPE_SLICE && value != COBRA_TYPE_SLICE_F32 &&
+                value != COBRA_TYPE_SLICE_U8) {
+                ir_error(ctx, node, "borrowed slice field assignment requires a slice view");
+            }
+            if (borrowed_view_field && value != COBRA_TYPE_UNKNOWN &&
+                node->children[1]->canonical_type && node->canonical_type) {
+                const CobraType *expected_element = cobra_type_element(node->canonical_type);
+                const CobraType *actual_element = cobra_type_element(node->children[1]->canonical_type);
+                if (expected_element && actual_element &&
+                    expected_element->kind != actual_element->kind) {
+                    ir_error(ctx, node, "borrowed slice field element type does not match");
+                }
             }
             if (field_type == COBRA_TYPE_ENUM && value == COBRA_TYPE_ENUM &&
                 field_type_name[0] != '\0' && cobra_type_node_name(node->children[1])[0] != '\0' &&
                 strcmp(field_type_name, cobra_type_node_name(node->children[1])) != 0) {
                 ir_error(ctx, node, "cannot assign a value from a different enum to this field");
             }
-            if (field_type == COBRA_TYPE_SLICE_U8) {
+            if (borrowed_view_field) {
                 if (!base) {
                     ir_error(ctx, node, "nested borrowed view assignment requires an explicit owner contract");
                 } else {
@@ -2443,7 +2596,7 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                         snprintf(base->borrowed_from, sizeof(base->borrowed_from), "%.63s", node->children[1]->name);
                 }
             }
-            if (value != COBRA_TYPE_UNKNOWN && value != COBRA_TYPE_UNTYPED &&
+            if (!borrowed_view_field && value != COBRA_TYPE_UNKNOWN && value != COBRA_TYPE_UNTYPED &&
                 !(field_type == value) && !(is_integer(field_type) && is_integer(value)) &&
                 !(field_type == COBRA_TYPE_F32 && is_integer(value)) &&
                 !(field_type == COBRA_TYPE_BOOL && (value == COBRA_TYPE_BOOL || is_integer(value)))) {
@@ -2479,6 +2632,13 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                                                        COBRA_MUTABILITY_DEFAULT, -1);
             }
             node->value_type = declared;
+            if (node->type == AST_HEAP_DECL && declared == COBRA_TYPE_STRUCT) {
+                IRStruct *heap_struct = find_struct(ctx, cobra_type_node_name(node));
+                if (heap_struct && heap_struct->has_borrowed_fields) {
+                    ir_error(ctx, node,
+                             "cannot store a borrowed generic struct in heap storage; its owner is not part of the value");
+                }
+            }
             if (!node->canonical_type) canonical_inferred_type(ctx, node);
             CobraTypeKind declared_element = canonical_element_kind(node->canonical_type);
             if ((declared == COBRA_TYPE_ARRAY || declared == COBRA_TYPE_LIST) &&
@@ -2563,6 +2723,12 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
             }
             IRLocal *declared_local = find_local_entry(ctx, node->name);
             if (declared_local) node->canonical_type = declared_local->canonical_type;
+            if (declared_local && declared == COBRA_TYPE_STRUCT &&
+                node->child_count > 0 && node->children[0]->type == AST_VAR_REF) {
+                IRLocal *source_struct = find_local_entry(ctx, node->children[0]->name);
+                if (source_struct && source_struct->type == COBRA_TYPE_STRUCT)
+                    copy_struct_borrow_metadata(declared_local, source_struct);
+            }
             if (node->child_count > 0 && is_region_alloc_call(ctx, node->children[0])) {
                 IRLocal *region_local = find_local_entry(ctx, node->name);
                 if (region_local) {
@@ -2673,10 +2839,12 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                             break;
                         }
                     }
-                    if (base_type != COBRA_TYPE_SLICE_U8)
-                        ir_error(ctx, node, "only []u8 struct fields are writable by index");
+                    if (base_type != COBRA_TYPE_SLICE &&
+                        base_type != COBRA_TYPE_SLICE_F32 &&
+                        base_type != COBRA_TYPE_SLICE_U8)
+                        ir_error(ctx, node, "only slice struct fields are writable by index");
                     if (field_qualifier != 2)
-                        ir_error(ctx, node, "cannot write readonly byte-view field; use out []u8");
+                        ir_error(ctx, node, "cannot write readonly borrowed slice field");
                 }
             } else if (!find_local(ctx, node->name, &base_type) ||
                 (base_type != COBRA_TYPE_ARRAY && base_type != COBRA_TYPE_SLICE &&
@@ -2929,11 +3097,10 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                 if (returned && returned->borrowed_from[0]) {
                     ir_error(ctx, node, "returning a borrowed struct would escape its owner");
                 } else if (returned_type) {
-                    for (int field_index = 0; field_index < returned_type->field_count; field_index++) {
-                        if (returned_type->fields[field_index].type == COBRA_TYPE_SLICE_U8) {
-                            ir_error(ctx, node, "returning a struct with borrowed byte-view fields is not supported yet");
-                            break;
-                        }
+                    if (returned && returned->region_expired) {
+                        ir_error(ctx, node, "returning a struct with a region-backed borrowed slice would escape its region");
+                    } else if (returned_type->has_borrowed_fields) {
+                        ir_error(ctx, node, "returning a struct with borrowed slice fields is not supported yet");
                     }
                 }
             }
@@ -3199,6 +3366,19 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
         cobra_type_arena_init(root->canonical_arena);
     }
     root_context.canonical_arena = root->canonical_arena;
+
+    /* Resolve every concrete generic-struct use before the shared layout
+       prepass. Generic function declarations remain templates and are handled
+       by the existing scalar function-specialization path. */
+    for (size_t i = 0; i < root->child_count; i++) {
+        ASTNode *declaration = root->children[i];
+        if (declaration->type == AST_FUNCTION && declaration->generic_param_count > 0)
+            continue;
+        if (declaration->type == AST_STRUCT_DECL && declaration->generic_param_count > 0)
+            continue;
+        specialize_struct_types_in_tree(&root_context, declaration);
+    }
+
     /* Source imports are composed into one flat native namespace. Reject
        duplicate aliases and definitions before type validation so resolution
        cannot depend on declaration order and codegen cannot emit duplicate labels. */

@@ -40,7 +40,7 @@ typedef enum { SYM_SCALAR = 0, SYM_ARRAY, SYM_SLICE, SYM_TENSOR, SYM_F32, SYM_LI
 /* An active `with region NAME:` scope. Each entry owns a hidden three-slot
    i64 state array ([base, cur, cap]) that arena_create/arena_alloc/
    arena_destroy read and write; the backing store is released once after the
-   body. Region-qualified alloc_f32 and alloc_u8 calls bump from the innermost
+   body. Region-qualified alloc_i64, alloc_f32, and alloc_u8 calls bump from the innermost
    region whose name matches the qualifier. */
 typedef struct {
     bool active;
@@ -419,6 +419,8 @@ static void emit_sum_constructor(CodeGen *cg, ASTNode *node, const char *dest_re
                                  CobraTypeKind error_type, const char *payload_name,
                                  const char *error_name);
 
+static int struct_storage_size(CodeGen *cg, const char *type_name);
+
 static void emit_tensor_return(CodeGen *cg, ASTNode *value) {
     if (!value) {
         fprintf(stderr, "CodeGen Error: tensor return requires a value\n");
@@ -454,6 +456,18 @@ static void emit_tensor_return(CodeGen *cg, ASTNode *value) {
         fprintf(stderr, "CodeGen Error: tensor return value must be a tensor variable or tensor call\n");
         exit(EXIT_FAILURE);
     }
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-240]\n");
+}
+
+static void emit_struct_return(CodeGen *cg, ASTNode *value) {
+    if (!value || !cg->current_return_type_name[0]) {
+        fprintf(stderr, "CodeGen Error: struct return requires a typed value\n");
+        exit(EXIT_FAILURE);
+    }
+    emit_expr(cg, value);
+    fprintf(cg->out, "    mov rsi, rax\n    mov rdi, QWORD PTR [rbp-240]\n");
+    emit_copy_memory(cg, "rsi", "rdi",
+                     struct_storage_size(cg, cg->current_return_type_name));
     fprintf(cg->out, "    mov rax, QWORD PTR [rbp-240]\n");
 }
 
@@ -881,12 +895,13 @@ static RegionInfo *region_by_name(CodeGen *cg, const char *name) {
 
 static bool is_region_alloc(CodeGen *cg, ASTNode *n) {
     return n && n->qualifier[0] != '\0' && region_by_name(cg, n->qualifier) &&
-           (!strcmp(n->name, "alloc_f32") || !strcmp(n->name, "alloc_u8"));
+           (!strcmp(n->name, "alloc_i64") || !strcmp(n->name, "alloc_f32") ||
+            !strcmp(n->name, "alloc_u8"));
 }
 
 static void emit_failure(CodeGen *cg, const char *message);
 
-/* scratch.alloc_f32(n) and scratch.alloc_u8(n) bump storage out of the
+/* scratch.alloc_i64(n), scratch.alloc_f32(n), and scratch.alloc_u8(n) bump storage out of the
    region and return the pointer+length pair in rax/rdx. A zero
    arena_alloc result means the bump crossed the backing store's capacity. */
 static void emit_region_alloc(CodeGen *cg, ASTNode *n) {
@@ -905,7 +920,8 @@ static void emit_region_alloc(CodeGen *cg, ASTNode *n) {
     int count = reserve(cg, 8);
     emit_expr(cg, n->children[0]);
     fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n    cmp rax, 0\n    jl .Lreg_neg_%d\n", count, fail_neg);
-    const char *scale = !strcmp(n->name, "alloc_u8") ? "" : "shl rsi, 2";
+    const char *scale = !strcmp(n->name, "alloc_u8") ? "" :
+                        (!strcmp(n->name, "alloc_f32") ? "shl rsi, 2" : "shl rsi, 3");
     /* ArenaState is an out struct. Pass its address in rdi and the byte count
        in rsi, matching the ordinary Cobra struct-parameter ABI. */
     fprintf(cg->out, "    lea rdi, [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    %s\n    call arena_alloc@PLT\n    test rax, rax\n    je .Lreg_oom_%d\n", r->state_base, count, scale, fail_oom);
@@ -1238,7 +1254,9 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
                                           node->secondary_name);
             if (node->value_type == COBRA_TYPE_STRUCT) {
                 fprintf(cg->out, "    add rax, %d\n", offset);
-            } else if (node->value_type == COBRA_TYPE_SLICE_U8) {
+            } else if (node->value_type == COBRA_TYPE_SLICE ||
+                       node->value_type == COBRA_TYPE_SLICE_F32 ||
+                       node->value_type == COBRA_TYPE_SLICE_U8) {
                 fprintf(cg->out, "    mov rdx, QWORD PTR [rax + %d]\n    mov rax, QWORD PTR [rax + %d]\n",
                         offset + 8, offset);
             } else if (node->value_type == COBRA_TYPE_F32) {
@@ -1431,7 +1449,10 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
             ASTNode *a = node->child_count ? node->children[0] : NULL;
             if (a && a->type == AST_STRING_LITERAL) fprintf(cg->out, "    mov rax, %zu\n", strlen(a->string_val));
             else if (a && a->type == AST_ARRAY_LITERAL) fprintf(cg->out, "    mov rax, %zu\n", a->child_count);
-            else if (a && a->type == AST_MEMBER_ACCESS && a->value_type == COBRA_TYPE_SLICE_U8) {
+            else if (a && a->type == AST_MEMBER_ACCESS &&
+                     (a->value_type == COBRA_TYPE_SLICE ||
+                      a->value_type == COBRA_TYPE_SLICE_F32 ||
+                      a->value_type == COBRA_TYPE_SLICE_U8)) {
                 emit_expr(cg, a);
                 fprintf(cg->out, "    mov rax, rdx\n");
             } else if (a && a->type == AST_VAR_REF) {
@@ -2105,7 +2126,8 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
     }
     bool tensor_return = fn->declared_type == COBRA_TYPE_TENSOR_F32;
     bool sum_return = fn->declared_type == COBRA_TYPE_OPTION || fn->declared_type == COBRA_TYPE_RESULT;
-    bool compound_return = tensor_return || sum_return;
+    bool struct_return = fn->declared_type == COBRA_TYPE_STRUCT;
+    bool compound_return = tensor_return || sum_return || struct_return;
     int stack_slots = function_stack_slot_count(cg, n->name, compound_return);
     /* The first outgoing stack argument is written at [rsp+0] before call;
        the call's pushed return address becomes [rbp+8], so the callee reads
@@ -2115,14 +2137,16 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
 
     int result_temp = 0;
     if (compound_return) {
-        /* Allocate the result region first. The hidden sum pointer addresses
-           its high-address tag field, with payload fields at negative offsets. */
+        /* Allocate the caller-owned result region first. Struct and tensor
+           returns use its low-address base; sums use the historical high
+           address tag pointer. */
         if (cg->stack_offset < COBRA_LOCAL_BASE) cg->stack_offset = COBRA_LOCAL_BASE;
         int result_size = tensor_return ? COBRA_TENSOR_FIELDS * 8 :
+                           struct_return ? struct_storage_size(cg, ast_payload_name(fn)) :
                            8 + sum_component_size(cg, ast_element_kind(fn), ast_payload_name(fn)) +
                            (fn->declared_type == COBRA_TYPE_RESULT ?
                             sum_component_size(cg, ast_error_kind(fn), ast_error_name(fn)) : 0);
-        if (tensor_return) {
+        if (tensor_return || struct_return) {
             result_temp = cg->stack_offset;
             cg->stack_offset += result_size;
         } else {
@@ -3052,7 +3076,9 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             int offset = field_offset_for(cg, ast_payload_name(n->children[0]),
                                           n->secondary_name);
             CobraTypeKind field_type = n->declared_type;
-            if (field_type == COBRA_TYPE_SLICE_U8) {
+            if (field_type == COBRA_TYPE_SLICE ||
+                field_type == COBRA_TYPE_SLICE_F32 ||
+                field_type == COBRA_TYPE_SLICE_U8) {
                 int field_length = reserve(cg, 8);
                 fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rdx\n    mov rdx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rdx + %d], rax\n    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rdx + %d], rax\n",
                         field_length, field_address, offset, field_length, offset + 8);
@@ -3074,6 +3100,8 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             if (has_result && n->children[0]->type == AST_VAR_REF) returned_name = n->children[0]->name;
             if (cg->current_return_type == COBRA_TYPE_TENSOR_F32) {
                 if (has_result) emit_tensor_return(cg, n->children[0]);
+            } else if (cg->current_return_type == COBRA_TYPE_STRUCT) {
+                if (has_result) emit_struct_return(cg, n->children[0]);
             } else if (cg->current_return_type == COBRA_TYPE_OPTION ||
                        cg->current_return_type == COBRA_TYPE_RESULT) {
                 if (has_result) emit_sum_return(cg, n->children[0], cg->current_return_type);
@@ -3195,7 +3223,8 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
     cg->propagation_label = cg->label_count++;
     bool tensor_return = fn->declared_type == COBRA_TYPE_TENSOR_F32;
     bool sum_return = fn->declared_type == COBRA_TYPE_OPTION || fn->declared_type == COBRA_TYPE_RESULT;
-    bool compound_return = tensor_return || sum_return;
+    bool struct_return = fn->declared_type == COBRA_TYPE_STRUCT;
+    bool compound_return = tensor_return || sum_return || struct_return;
     fprintf(cg->out, "    .intel_syntax noprefix\n");
     /* The native test runner calls test_* functions from a separate C
        translation unit. They remain externally visible only in test mode;

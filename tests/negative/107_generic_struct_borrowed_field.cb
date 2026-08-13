@@ -1,0 +1,7 @@
+struct BorrowedBox[T]: {
+    value: readonly []u8,
+}
+
+def use_borrowed(box: BorrowedBox[i64]) -> i64: {
+    return 0
+}

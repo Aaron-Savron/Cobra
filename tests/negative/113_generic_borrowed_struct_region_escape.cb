@@ -1,0 +1,12 @@
+struct View[T]: {
+    data: readonly []T,
+}
+
+def invalid_region_escape() -> i64: {
+    let view: View[i64]
+    with region scratch(64): {
+        data = scratch.alloc_i64(1)
+        view.data = data
+    }
+    return len(view.data)
+}

@@ -299,6 +299,14 @@ CobraType *cobra_type_instantiate(CobraTypeArena *arena,
                                   const CobraType *template_type,
                                   const CobraType *parameter,
                                   const CobraType *argument);
+/* Instantiate a one-parameter immutable struct template. Scalar fields and
+   readonly borrowed scalar slices are finalized, packed-layout checked, and
+   interned by name and field shape; owned and mutable fields are rejected. */
+CobraType *cobra_type_instantiate_struct(CobraTypeArena *arena,
+                                         const CobraType *template_type,
+                                         const CobraType *parameter,
+                                         const CobraType *argument,
+                                         const char *specialized_name);
 const CobraType *cobra_type_element(const CobraType *type);
 const CobraType *cobra_type_error(const CobraType *type);
 const CobraType *cobra_type_key(const CobraType *type);
