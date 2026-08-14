@@ -14,7 +14,7 @@
 
 ---
 
-> **Active development:** Linux x86_64 is the production target. Win64, ARM64, and Wasm32 are interface stubs open for contributors. Expect the language to keep moving.
+> **Active development: Day #5.** Linux x86_64 is the production target. Win64, ARM64, and Wasm32 are interface stubs open for contributors. Expect the language to keep moving.
 
 ## Why Cobra exists
 
