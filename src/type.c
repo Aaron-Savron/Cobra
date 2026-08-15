@@ -57,12 +57,23 @@ bool cobra_type_add_generic_arg(CobraType *type, const CobraType *argument) {
     return true;
 }
 
+/* Attach one variant payload to a payload-carrying enum descriptor. A NULL
+   payload marks a unit variant. Only legal before finalization; the payload
+   count must stay within COBRA_MAX_TYPE_ARGS. */
+bool cobra_type_add_variant_payload(CobraType *type, const CobraType *payload) {
+    if (!type || type->finalized || type->kind != COBRA_TYPE_ENUM ||
+        type->generic_arg_count >= COBRA_MAX_TYPE_ARGS) return false;
+    type->generic_args[type->generic_arg_count++] = payload;
+    return true;
+}
+
 const CobraType *cobra_type_element(const CobraType *type) {
     if (!type || type->generic_arg_count == 0) return NULL;
     if (type->kind == COBRA_TYPE_OPTION || type->kind == COBRA_TYPE_RESULT ||
         type->kind == COBRA_TYPE_LIST || type->kind == COBRA_TYPE_ARRAY ||
         type->kind == COBRA_TYPE_SLICE || type->kind == COBRA_TYPE_SLICE_F32 ||
-        type->kind == COBRA_TYPE_SLICE_U8 || type->kind == COBRA_TYPE_TENSOR_F32)
+        type->kind == COBRA_TYPE_SLICE_U8 || type->kind == COBRA_TYPE_TENSOR_F32 ||
+        type->kind == COBRA_TYPE_POINTER)
         return type->generic_args[0];
     return NULL;
 }
@@ -110,6 +121,7 @@ const char *cobra_type_kind_name(CobraTypeKind kind) {
         case COBRA_TYPE_V256: return "v256";
         case COBRA_TYPE_VOID: return "void";
         case COBRA_TYPE_STRING: return "string";
+        case COBRA_TYPE_POINTER: return "pointer";
         case COBRA_TYPE_ARRAY: return "array";
         case COBRA_TYPE_SLICE: return "[]i64";
         case COBRA_TYPE_SLICE_F32: return "[]f32";
@@ -209,10 +221,18 @@ static size_t scalar_size(CobraTypeKind kind, CobraAbiKind *abi, size_t *alignme
         if (abi) *abi = COBRA_ABI_INVALID;
         return 0;
     }
+    if (kind == COBRA_TYPE_POINTER) {
+        if (abi) *abi = COBRA_ABI_REFERENCE;
+        return 8;
+    }
     if (kind == COBRA_TYPE_F32) {
         if (abi) *abi = COBRA_ABI_XMM;
         if (alignment) *alignment = 4;
         return 4;
+    }
+    if (kind == COBRA_TYPE_F64) {
+        if (abi) *abi = COBRA_ABI_XMM;
+        return 8;
     }
     if (kind == COBRA_TYPE_SLICE || kind == COBRA_TYPE_SLICE_F32 ||
         kind == COBRA_TYPE_SLICE_U8 || kind == COBRA_TYPE_TENSOR_F32) {
@@ -249,6 +269,8 @@ static bool finalize_type(CobraTypeArena *arena, CobraType *type,
     next_stack[depth] = type;
 
     for (size_t i = 0; i < type->generic_arg_count; i++) {
+        /* NULL entries mark unit variants of a payload-carrying enum. */
+        if (!type->generic_args[i]) continue;
         if (!finalize_type(arena, (CobraType *)type->generic_args[i], next_stack, depth + 1)) return false;
     }
     for (size_t i = 0; i < type->field_count; i++) {
@@ -258,7 +280,26 @@ static bool finalize_type(CobraTypeArena *arena, CobraType *type,
     CobraAbiKind abi = COBRA_ABI_INVALID;
     size_t alignment = 8;
     size_t size = scalar_size(type->kind, &abi, &alignment);
-    if (type->kind == COBRA_TYPE_OPTION || type->kind == COBRA_TYPE_RESULT) {
+    if (type->kind == COBRA_TYPE_POINTER) {
+        if (type->generic_arg_count != 1) {
+            type_error(arena, "pointer requires one pointee type");
+            return false;
+        }
+        size = 8;
+        alignment = 8;
+        abi = COBRA_ABI_REFERENCE;
+    } else if (type->kind == COBRA_TYPE_ARRAY) {
+        if (type->generic_arg_count != 1 || type->array_length == 0 ||
+            type->array_length > COBRA_MAX_ARRAY_ELEMENTS ||
+            !type->generic_args[0] || type->generic_args[0]->size == 0 ||
+            type->generic_args[0]->size > SIZE_MAX / type->array_length) {
+            type_error(arena, "array requires one bounded element type");
+            return false;
+        }
+        size = type->generic_args[0]->size * type->array_length;
+        alignment = type->generic_args[0]->alignment;
+        abi = COBRA_ABI_STRUCT_VALUE;
+    } else if (type->kind == COBRA_TYPE_OPTION || type->kind == COBRA_TYPE_RESULT) {
         size_t required = type->kind == COBRA_TYPE_RESULT ? 2 : 1;
         if (type->generic_arg_count != required) {
             type_error(arena, "%s requires %zu generic argument%s",
@@ -268,7 +309,37 @@ static bool finalize_type(CobraTypeArena *arena, CobraType *type,
         size = COBRA_NATIVE_SUM_TAG_SIZE;
         for (size_t i = 0; i < required; i++) {
             const CobraType *argument = type->generic_args[i];
-            size += argument->kind == COBRA_TYPE_STRUCT ? argument->size : COBRA_NATIVE_SUM_SCALAR_SIZE;
+            /* Aggregate components (structs and nested sums) occupy their
+               real canonical size; scalar components keep the fixed
+               COBRA_NATIVE_SUM_SCALAR_SIZE slot. */
+            size += (argument->kind == COBRA_TYPE_STRUCT ||
+                     argument->kind == COBRA_TYPE_OPTION ||
+                     argument->kind == COBRA_TYPE_RESULT ||
+                     argument->kind == COBRA_TYPE_SLICE ||
+                     argument->kind == COBRA_TYPE_SLICE_F32 ||
+                     argument->kind == COBRA_TYPE_SLICE_U8)
+                ? argument->size : COBRA_NATIVE_SUM_SCALAR_SIZE;
+        }
+        abi = COBRA_ABI_SUM_INDIRECT;
+        alignment = 8;
+    } else if (type->kind == COBRA_TYPE_ENUM && type->generic_arg_count > 0) {
+        /* Payload-carrying enum: an i64 tag plus one resident slot per
+           variant, mirroring the Result layout. Unit variants consume no
+           slot. Aggregate payloads (structs, nested sums, slices) occupy
+           their real canonical size; scalars keep the fixed slot width. */
+        size = COBRA_NATIVE_SUM_TAG_SIZE;
+        for (size_t i = 0; i < type->generic_arg_count; i++) {
+            const CobraType *payload = type->generic_args[i];
+            if (!payload) continue;
+            size += (payload->kind == COBRA_TYPE_STRUCT ||
+                     payload->kind == COBRA_TYPE_OPTION ||
+                     payload->kind == COBRA_TYPE_RESULT ||
+                     payload->kind == COBRA_TYPE_SLICE ||
+                     payload->kind == COBRA_TYPE_SLICE_F32 ||
+                     payload->kind == COBRA_TYPE_SLICE_U8 ||
+                     (payload->kind == COBRA_TYPE_ENUM &&
+                      payload->generic_arg_count > 0))
+                ? payload->size : COBRA_NATIVE_SUM_SCALAR_SIZE;
         }
         abi = COBRA_ABI_SUM_INDIRECT;
         alignment = 8;
@@ -325,7 +396,8 @@ static bool equal_type(const CobraType *left, const CobraType *right,
         left->ownership != right->ownership || left->mutability != right->mutability ||
         left->region_id != right->region_id ||
         left->generic_arg_count != right->generic_arg_count ||
-        left->field_count != right->field_count) return false;
+        left->field_count != right->field_count ||
+        left->array_length != right->array_length) return false;
 
     for (size_t i = 0; i < *pair_count; i++) {
         if (pairs[i].left == left && pairs[i].right == right) return true;
@@ -435,6 +507,7 @@ static bool scalar_generic_argument(const CobraType *type) {
         case COBRA_TYPE_U32:
         case COBRA_TYPE_U64:
         case COBRA_TYPE_F32:
+        case COBRA_TYPE_F64:
         case COBRA_TYPE_BOOL:
         case COBRA_TYPE_ENUM:
             return true;
@@ -634,11 +707,14 @@ static CobraType *substitute_recursive(CobraTypeArena *arena,
 
     CobraTypeKind kind = type->kind;
     if (slice_type_kind(kind)) {
-        if (type->ownership != COBRA_OWNERSHIP_BORROWED ||
-            type->mutability != COBRA_MUTABILITY_READONLY ||
+        bool readonly_view = type->ownership == COBRA_OWNERSHIP_BORROWED &&
+                             type->mutability == COBRA_MUTABILITY_READONLY;
+        bool writable_view = type->ownership == COBRA_OWNERSHIP_VALUE &&
+                             type->mutability == COBRA_MUTABILITY_OUT;
+        if ((!readonly_view && !writable_view) ||
             type->generic_arg_count != 1 ||
             !scalar_generic_argument(arguments[0])) {
-            type_error(arena, "generic slices must remain borrowed readonly scalar views");
+            type_error(arena, "generic slices must be readonly or out scalar views");
             return NULL;
         }
         CobraTypeKind inferred = slice_kind_for_element(arguments[0]->kind);
@@ -728,6 +804,12 @@ static CobraType *intern_finalized_type(CobraTypeArena *arena, CobraType *candid
 
 bool cobra_type_validate(CobraTypeArena *arena, const CobraType *type) {
     if (!arena || !type) return false;
+    if (type->kind == COBRA_TYPE_ARRAY &&
+        (type->array_length == 0 || type->array_length > COBRA_MAX_ARRAY_ELEMENTS ||
+         type->generic_arg_count != 1)) {
+        type_error(arena, "array has an invalid bound or element type");
+        return false;
+    }
     for (size_t i = 0; i < type->field_count; i++) {
         if (!type->fields[i].type || !type->fields[i].name[0]) {
             type_error(arena, "struct field %zu is incomplete", i);
@@ -778,28 +860,6 @@ static const CobraType *canonical_node(CobraTypeArena *arena, ASTNode *root,
     if (kind == COBRA_TYPE_STRUCT) {
         const CobraType *st = cobra_type_struct_layout_depth(arena, root, name, depth);
         if (!st) return NULL;
-        /* A by-value struct used nested must not carry owned string or
-           borrowed slice fields. This is checked at the reference site so it
-           holds regardless of build order, matching the legacy layout rule. */
-        if (depth > 0) {
-            for (size_t i = 0; i < st->field_count; i++) {
-                CobraTypeKind field_kind = st->fields[i].type->kind;
-                if (field_kind == COBRA_TYPE_STRING) {
-                    type_error(arena,
-                               "nested owned string field '%s' requires an ownership layout",
-                               st->fields[i].name);
-                    return NULL;
-                }
-                if (field_kind == COBRA_TYPE_SLICE ||
-                    field_kind == COBRA_TYPE_SLICE_F32 ||
-                    field_kind == COBRA_TYPE_SLICE_U8) {
-                    type_error(arena,
-                               "nested borrowed slice field '%s' requires an ownership layout",
-                               st->fields[i].name);
-                    return NULL;
-                }
-            }
-        }
         return st;
     }
     if (kind == COBRA_TYPE_ENUM) {
@@ -904,18 +964,17 @@ static const CobraType *cobra_type_struct_layout_depth(CobraTypeArena *arena, AS
                 declared->ownership == COBRA_OWNERSHIP_BORROWED &&
                 declared->mutability == COBRA_MUTABILITY_READONLY &&
                 declared->region_id == -1;
-            if ((field_kind == COBRA_TYPE_SLICE || field_kind == COBRA_TYPE_SLICE_F32) &&
-                !generic_borrowed_slice) {
+            bool readonly_borrowed_slice =
+                declared->ownership == COBRA_OWNERSHIP_BORROWED &&
+                declared->mutability == COBRA_MUTABILITY_READONLY &&
+                declared->region_id == -1;
+            if ((field_kind == COBRA_TYPE_SLICE || field_kind == COBRA_TYPE_SLICE_F32 ||
+                 field_kind == COBRA_TYPE_SLICE_U8) &&
+                !generic_borrowed_slice && !readonly_borrowed_slice &&
+                !(declared->ownership == COBRA_OWNERSHIP_VALUE &&
+                  declared->mutability == COBRA_MUTABILITY_DEFAULT)) {
                 type_error(arena,
-                           "struct slice field '%s' is not supported; use a qualified generic readonly view",
-                           field->name);
-                ok = false;
-                break;
-            }
-            if (field_kind == COBRA_TYPE_SLICE_U8 &&
-                declared->mutability != COBRA_MUTABILITY_READONLY &&
-                declared->mutability != COBRA_MUTABILITY_OUT) {
-                type_error(arena, "byte-view field '%s' requires readonly or out qualifier",
+                           "struct slice field '%s' requires an owned value or readonly generic view",
                            field->name);
                 ok = false;
                 break;

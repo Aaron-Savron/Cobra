@@ -14,6 +14,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <sys/wait.h>
 
 #define COBRA_VERSION_STRING "1.0.0"
@@ -198,6 +199,7 @@ typedef enum {
     COBRA_TYPE_V256,
     COBRA_TYPE_VOID,
     COBRA_TYPE_STRING,
+    COBRA_TYPE_POINTER,      /* typed backend/native pointer */
     COBRA_TYPE_ARRAY,
     COBRA_TYPE_SLICE,       /* zero-residency pointer + length view of i64 */
     COBRA_TYPE_SLICE_F32,   /* compatibility pointer + length view of f32 */
@@ -221,6 +223,7 @@ typedef enum {
    identity or ownership metadata. */
 #define COBRA_MAX_TYPE_ARGS 8
 #define COBRA_MAX_TYPE_FIELDS 32
+#define COBRA_MAX_ARRAY_ELEMENTS 64
 #define COBRA_MAX_TYPE_NODES 2048
 
 typedef enum {
@@ -273,6 +276,8 @@ struct CobraType {
     size_t generic_arg_count;
     CobraTypeField fields[COBRA_MAX_TYPE_FIELDS];
     size_t field_count;
+    /* Fixed value-array length. Meaningful only for COBRA_TYPE_ARRAY. */
+    size_t array_length;
     CobraOwnershipKind ownership;
     CobraMutabilityKind mutability;
     int region_id;
@@ -306,6 +311,9 @@ CobraType *cobra_type_make(CobraTypeArena *arena, CobraTypeKind kind, const char
                            CobraOwnershipKind ownership, CobraMutabilityKind mutability,
                            int region_id);
 bool cobra_type_add_generic_arg(CobraType *type, const CobraType *argument);
+/* Attach one variant payload to a payload-carrying enum descriptor (NULL marks
+   a unit variant). Legal only before finalization. */
+bool cobra_type_add_variant_payload(CobraType *type, const CobraType *payload);
 /* Recursively substitute canonical generic metadata, preserving ownership,
    mutability, region origin, field layout, ABI finalization, and interning.
    The current contract is exactly one scalar binding; multi-parameter
@@ -348,6 +356,8 @@ struct ASTNode {
     int bit_width;
     int shape_rank;
     char shape_dims[COBRA_MAX_SHAPE_DIMS][COBRA_MAX_IDENT_LEN];
+    /* Fixed value-array length for the backend source form array[T, N]. */
+    size_t array_length;
     
     char name[COBRA_MAX_IDENT_LEN];
     /* Optional second loop target for Python-style `for index, value in ...`. */
@@ -355,9 +365,30 @@ struct ASTNode {
     /* The variable a comprehension result is stored into (declaration name). */
     char comprehension_target[COBRA_MAX_IDENT_LEN];
     int int_val;
+    /* Full-precision literal magnitude. int_val is the low 32 bits for
+       compatibility with contexts that need a small integer; literal_i64 is
+       authoritative for integer literal values, literal_f64 for float
+       literals (float_val remains the f32-truncated form). */
+    int64_t literal_i64;
+    /* Full-precision unsigned magnitude for literals that exceed INT64_MAX
+       (u64 literals such as 18446744073709551615). literal_i64 holds the
+       same bit pattern; literal_is_unsigned records that the source form was
+       a positive magnitude too large for a signed value. */
+    uint64_t literal_u64;
+    bool literal_is_unsigned;
     float float_val;
+    double literal_f64;
     char string_val[COBRA_MAX_TOKEN_TEXT];
     char asm_code[COBRA_MAX_ASM_LEN];
+    /* Optional inline-asm operand binding: `asm(in a, b out result): { ... }`
+       loads named i64 locals into the fixed SysV argument registers
+       (rdi, rsi, rdx, rcx, r8, r9, in order) before the raw block and stores
+       rax into the named output local afterward, so the block can reference
+       those registers directly instead of the caller hand-rolling movs. */
+    char asm_inputs[6][COBRA_MAX_IDENT_LEN];
+    int asm_input_count;
+    char asm_output[COBRA_MAX_IDENT_LEN];
+    bool asm_has_output;
     /* Compile-time source location; never emitted into native output. */
     int source_line;
     int source_col;

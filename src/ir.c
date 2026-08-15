@@ -182,6 +182,13 @@ static bool register_enum_decl(IRContext *ctx, ASTNode *node) {
     snprintf(decl->name, sizeof(decl->name), "%.63s", node->name);
     for (size_t i = 0; i < node->child_count; i++) {
         ASTNode *variant = node->children[i];
+        if (variant->child_count > 0) {
+            char msg[192];
+            snprintf(msg, sizeof(msg),
+                     "enum variant '%.63s' carries a payload; payload-carrying enums are not supported by the production compiler",
+                     variant->name);
+            ir_error(ctx, variant, msg);
+        }
         for (int j = 0; j < decl->variant_count; j++) {
             if (decl->variants[j].value == variant->int_val ||
                 strcmp(decl->variants[j].name, variant->name) == 0) {
@@ -406,7 +413,7 @@ static bool local_shape(IRContext *ctx, ASTNode *node, int *rank,
 static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx);
 
 static bool expression_is_const_zero(ASTNode *node) {
-    return node && node->type == AST_INT_LITERAL && node->int_val == 0;
+    return node && node->type == AST_INT_LITERAL && node->literal_i64 == 0;
 }
 
 /* Resolve only compile-time integer expressions. Dynamic dimensions remain
@@ -415,7 +422,7 @@ static bool expression_is_const_zero(ASTNode *node) {
 static bool const_int_expr(ASTNode *node, long long *out) {
     if (!node || !out) return false;
     if (node->type == AST_INT_LITERAL) {
-        *out = node->int_val;
+        *out = node->literal_i64;
         return true;
     }
     if (node->type == AST_COMPTIME_EXPR && node->child_count == 1) {
@@ -1271,6 +1278,22 @@ static bool is_imported_function(IRContext *ctx, const char *name) {
 /* Register the shared layout contract once from the canonical descriptor.
    Codegen reads the same canonical sizes and offsets, so the IR table is a
    convenience mirror of cobra_type_struct_layout, not a second layout. */
+static bool direct_struct_field_supported(const CobraType *type, bool nested) {
+    if (!type) return false;
+    if (cobra_type_is_scalar(type)) return true;
+    if (cobra_type_is_slice_kind(type->kind)) {
+        return !nested && type->ownership == COBRA_OWNERSHIP_BORROWED &&
+               (type->mutability == COBRA_MUTABILITY_READONLY ||
+                type->mutability == COBRA_MUTABILITY_OUT) &&
+               type->region_id == -1;
+    }
+    if (type->kind != COBRA_TYPE_STRUCT) return false;
+    for (size_t i = 0; i < type->field_count; i++) {
+        if (!direct_struct_field_supported(type->fields[i].type, true)) return false;
+    }
+    return true;
+}
+
 static void register_struct_decl(IRContext *ctx, ASTNode *decl, bool report_errors) {
     if (!ctx || !decl) return;
     /* Generic declarations are templates. Register only materialized
@@ -1304,6 +1327,20 @@ static void register_struct_decl(IRContext *ctx, ASTNode *decl, bool report_erro
         snprintf(invalid->layout_error, sizeof(invalid->layout_error), "%.127s", reason);
         if (report_errors) ir_error(ctx, decl, invalid->layout_error);
         return;
+    }
+
+    for (size_t i = 0; i < canonical->field_count; i++) {
+        if (!direct_struct_field_supported(canonical->fields[i].type, false)) {
+            IRStruct *invalid = &ctx->structs[ctx->struct_count++];
+            memset(invalid, 0, sizeof(*invalid));
+            snprintf(invalid->name, sizeof(invalid->name), "%.63s", decl->name);
+            invalid->invalid_layout = true;
+            snprintf(invalid->layout_error, sizeof(invalid->layout_error),
+                     "struct '%.48s' has an unsupported production field",
+                     decl->name);
+            if (report_errors) ir_error(ctx, decl, invalid->layout_error);
+            return;
+        }
     }
 
     IRStruct *type = &ctx->structs[ctx->struct_count++];
@@ -3631,12 +3668,40 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
             }
             break;
         case AST_INSPECT_STMT:
-        case AST_ASM_BLOCK:
         case AST_COMPTIME_EXPR:
             for (size_t i = 0; i < node->child_count; i++) {
                 (void)infer_expr(node->children[i], ctx);
             }
             break;
+        case AST_ASM_BLOCK: {
+            for (size_t i = 0; i < node->child_count; i++) {
+                (void)infer_expr(node->children[i], ctx);
+            }
+            /* Operand-binding asm(in a, b out result): inputs must already
+               exist; the output is implicitly declared as i64, matching the
+               `name = value` auto-declare rule used elsewhere. */
+            for (int i = 0; i < node->asm_input_count; i++) {
+                CobraTypeKind existing = COBRA_TYPE_UNKNOWN;
+                if (!find_local(ctx, node->asm_inputs[i], &existing)) {
+                    char message[160];
+                    snprintf(message, sizeof(message), "asm input '%s' is not a declared local",
+                             node->asm_inputs[i]);
+                    ir_error(ctx, node, message);
+                }
+            }
+            if (node->asm_has_output) {
+                CobraTypeKind existing = COBRA_TYPE_UNKNOWN;
+                if (!find_local(ctx, node->asm_output, &existing)) {
+                    if (!add_local(ctx, node->asm_output, COBRA_TYPE_I64, NULL)) {
+                        char message[160];
+                        snprintf(message, sizeof(message), "could not declare asm output '%s'",
+                                 node->asm_output);
+                        ir_error(ctx, node, message);
+                    }
+                }
+            }
+            break;
+        }
         default:
             break;
     }
@@ -3716,7 +3781,30 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
 
     for (size_t i = 0; i < root->child_count; i++) {
         ASTNode *function = root->children[i];
-        if (function->type != AST_FUNCTION || function->generic_param_count > 0) continue;
+        if (function->type != AST_FUNCTION) continue;
+        if (function->generic_param_count > 0) {
+            /* The production validator still does not instantiate generic
+               collections. Keep the parser permissive for backend-v2
+               monomorphization, but preserve the production rejection until
+               that path is integrated. */
+            for (size_t parameter = 0; parameter < function->child_count; parameter++) {
+                ASTNode *param = function->children[parameter];
+                if (param->type != AST_PARAM) continue;
+                bool generic_collection = param->declared_type == COBRA_TYPE_LIST;
+                if (!generic_collection && param->canonical_type &&
+                    generic_slice_kind(param->canonical_type->kind) &&
+                    param->canonical_type->mutability == COBRA_MUTABILITY_OUT &&
+                    type_contains_generic_type(param->canonical_type,
+                                               function->generic_param_types[0])) {
+                    generic_collection = true;
+                }
+                if (!generic_collection) continue;
+                ir_error(&root_context, param,
+                         "generic collection parameters are reserved for the backend-v2 path");
+                ir->error_count++;
+            }
+            continue;
+        }
 
         IRContext ctx = {0};
         ctx.current_function = function;
@@ -3760,6 +3848,21 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
         ctx.return_error_type = canonical_error_kind(function->canonical_type);
         snprintf(ctx.return_type_name, sizeof(ctx.return_type_name), "%.63s", cobra_type_node_name(function));
         snprintf(ctx.return_error_type_name, sizeof(ctx.return_error_type_name), "%.63s", cobra_type_node_error_name(function));
+        /* Nested sums cross the boundary in the isolated backend only; the
+           direct emitter still requires scalar value and error payloads on
+           returns, mirroring the parameter rule below. */
+        if (function->declared_type == COBRA_TYPE_OPTION ||
+            function->declared_type == COBRA_TYPE_RESULT) {
+            if (!is_scalar_sum_component(ctx.return_payload_type)) {
+                ir_error(&ctx, function,
+                         "Option and Result returns currently require scalar value payloads");
+            }
+            if (function->declared_type == COBRA_TYPE_RESULT &&
+                !is_scalar_sum_component(ctx.return_error_type)) {
+                ir_error(&ctx, function,
+                         "Result returns currently require a scalar error payload");
+            }
+        }
         for (size_t j = 0; j < function->child_count; j++) {
             ASTNode *child = function->children[j];
             if (child->type == AST_PARAM) {

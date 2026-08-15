@@ -1,0 +1,6 @@
+# Nested fixed arrays may only nest scalar-element arrays. A nested array
+# whose own element is a non-scalar (here a string) is rejected by the parser.
+def bad() -> i64: {
+  let grid: array[array[string, 2], 2]
+  return 0
+}

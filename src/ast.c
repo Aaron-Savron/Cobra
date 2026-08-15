@@ -28,7 +28,11 @@ ASTNode *ast_create_node(ASTNodeType type, const char *name) {
     }
     node->secondary_name[0] = '\0';
     node->int_val = 0;
+    node->literal_i64 = 0;
+    node->literal_u64 = 0;
+    node->literal_is_unsigned = false;
     node->float_val = 0.0f;
+    node->literal_f64 = 0.0;
     node->string_val[0] = '\0';
     node->asm_code[0] = '\0';
     node->source_line = 0;

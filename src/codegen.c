@@ -1227,7 +1227,7 @@ static void emit_index_store(CodeGen *cg, const char *name, ASTNode **indices, s
 static void emit_expr(CodeGen *cg, ASTNode *node) {
     if (!node) return;
     switch (node->type) {
-        case AST_INT_LITERAL: fprintf(cg->out, "    mov rax, %d\n", node->int_val); return;
+        case AST_INT_LITERAL: fprintf(cg->out, "    mov rax, %lld\n", (long long)node->literal_i64); return;
         case AST_FLOAT_LITERAL: emit_float_literal(cg, node->float_val); return;
         case AST_STRING_LITERAL: emit_string_literal(cg, node->string_val); return;
         case AST_BOOL_LITERAL: fprintf(cg->out, "    mov rax, %d\n", node->int_val ? 1 : 0); return;
@@ -1682,7 +1682,7 @@ static void emit_math(CodeGen *cg, ASTNode *n) {
 
 static bool const_int_value(ASTNode *n, int64_t *out) {
     if (!n) return false;
-    if (n->type == AST_INT_LITERAL) { *out = n->int_val; return true; }
+    if (n->type == AST_INT_LITERAL) { *out = n->literal_i64; return true; }
     if (n->type == AST_COMPTIME_EXPR) { *out = interpreter_eval_expr(n); return true; }
     return false;
 }
@@ -2902,7 +2902,7 @@ static void vec_emit_float_const(CodeGen *cg, float value, int reg) {
 static void vec_emit_expr(CodeGen *cg, ASTNode *e, const char *loop_var, int reg, int base, int depth) {
     switch (e->type) {
         case AST_FLOAT_LITERAL: vec_emit_float_const(cg, e->float_val, reg); return;
-        case AST_INT_LITERAL: vec_emit_float_const(cg, (float)e->int_val, reg); return;
+        case AST_INT_LITERAL: vec_emit_float_const(cg, (float)e->literal_i64, reg); return;
         case AST_VAR_REF: {
             VarSymbol *s = find_symbol(cg, e->name);
             if (s->kind == SYM_F32) {
@@ -3646,7 +3646,25 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             if (try_emit_parallel(cg, n)) return;
             if (n->child_count) emit_statement(cg, n->children[0]);
             return;
-        case AST_ASM_BLOCK: fprintf(cg->out, "    # inline asm\n"); emit_inline_asm(cg, n->asm_code); return;
+        case AST_ASM_BLOCK: {
+            static const char *const arg_regs[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+            if (n->asm_input_count > 0) fprintf(cg->out, "    # inline asm inputs\n");
+            for (int i = 0; i < n->asm_input_count; i++) {
+                VarSymbol *s = find_symbol(cg, n->asm_inputs[i]);
+                if (!s) {
+                    fprintf(stderr, "CodeGen Error: asm input '%s' is not a declared local\n", n->asm_inputs[i]);
+                    exit(EXIT_FAILURE);
+                }
+                fprintf(cg->out, "    mov %s, QWORD PTR [rbp-%d]\n", arg_regs[i], s->offset);
+            }
+            fprintf(cg->out, "    # inline asm\n");
+            emit_inline_asm(cg, n->asm_code);
+            if (n->asm_has_output) {
+                VarSymbol *s = ensure_scalar(cg, n->asm_output, COBRA_TYPE_I64);
+                fprintf(cg->out, "    # inline asm output\n    mov QWORD PTR [rbp-%d], rax\n", s->offset);
+            }
+            return;
+        }
         default: return;
     }
 }

@@ -104,8 +104,48 @@ static void parser_set_canonical(Parser *parser, ASTNode *owner, CobraTypeKind k
 }
 
 static CobraTypeKind parse_sum_component(Parser *parser, const char *context,
-                                         char *type_name_out) {
+                                         char *type_name_out,
+                                         const CobraType **canonical_out) {
     type_name_out[0] = '\0';
+    if (canonical_out) *canonical_out = NULL;
+    /* Nested Option/Result components: Option[Option[i64]],
+       Result[Option[i64], bool], and so on. The component canonical is the
+       recursively built sum descriptor. */
+    if (match(parser, TOKEN_IDENTIFIER) &&
+        (!strcmp(parser->current_token.text, "Option") ||
+         !strcmp(parser->current_token.text, "Result"))) {
+        bool is_result = !strcmp(parser->current_token.text, "Result");
+        advance_token(parser);
+        expect(parser, TOKEN_LBRACKET, "Expected '[' after Option or Result");
+        char value_name[COBRA_MAX_IDENT_LEN];
+        const CobraType *value_canonical = NULL;
+        CobraTypeKind value = parse_sum_component(parser,
+                                                  "Option or Result value",
+                                                  value_name, &value_canonical);
+        const CobraType *value_type = value_canonical
+            ? value_canonical
+            : parser_component_type(parser, value, value_name);
+        const CobraType *error_type = NULL;
+        if (is_result) {
+            expect(parser, TOKEN_COMMA, "Result requires a value and error type");
+            char error_name[COBRA_MAX_IDENT_LEN];
+            const CobraType *error_canonical = NULL;
+            CobraTypeKind error = parse_sum_component(parser, "Result error",
+                                                      error_name, &error_canonical);
+            error_type = error_canonical
+                ? error_canonical
+                : parser_component_type(parser, error, error_name);
+        }
+        expect(parser, TOKEN_RBRACKET, "Expected ']' after Option or Result type");
+        if (canonical_out && parser->canonical_arena && value_type) {
+            *canonical_out = cobra_type_make(parser->canonical_arena,
+                                             is_result ? COBRA_TYPE_RESULT : COBRA_TYPE_OPTION,
+                                             NULL, value_type, error_type, NULL, NULL,
+                                             COBRA_OWNERSHIP_VALUE,
+                                             COBRA_MUTABILITY_DEFAULT, -1);
+        }
+        return is_result ? COBRA_TYPE_RESULT : COBRA_TYPE_OPTION;
+    }
     if (match(parser, TOKEN_IDENTIFIER)) {
         copy_token_text(parser, type_name_out, COBRA_MAX_IDENT_LEN, context);
         advance_token(parser);
@@ -113,9 +153,10 @@ static CobraTypeKind parse_sum_component(Parser *parser, const char *context,
     }
     CobraTypeKind type = token_to_type(parser->current_token.type);
     if (type != COBRA_TYPE_I32 && type != COBRA_TYPE_I64 &&
-        type != COBRA_TYPE_U32 && type != COBRA_TYPE_U64 &&
-        type != COBRA_TYPE_F32 && type != COBRA_TYPE_BOOL) {
-        fprintf(stderr, "%s:%d:%d: error: %s payload must be a scalar or named struct type\n",
+        type != COBRA_TYPE_U8 && type != COBRA_TYPE_U32 && type != COBRA_TYPE_U64 &&
+        type != COBRA_TYPE_F32 && type != COBRA_TYPE_F64 &&
+        type != COBRA_TYPE_BOOL && type != COBRA_TYPE_STRING) {
+        fprintf(stderr, "%s:%d:%d: error: %s payload must be a scalar, string, or named struct type\n",
                 parser->source_file, parser->current_token.line, parser->current_token.col, context);
         exit(1);
     }
@@ -134,14 +175,22 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
         advance_token(parser);
         expect(parser, TOKEN_LBRACKET, "Expected '[' after Option or Result");
         char value_name[COBRA_MAX_IDENT_LEN];
-        CobraTypeKind value = parse_sum_component(parser, "Option or Result value", value_name);
-        const CobraType *value_type = parser_component_type(parser, value, value_name);
+        const CobraType *value_canonical = NULL;
+        CobraTypeKind value = parse_sum_component(parser, "Option or Result value",
+                                                  value_name, &value_canonical);
+        const CobraType *value_type = value_canonical
+            ? value_canonical
+            : parser_component_type(parser, value, value_name);
         const CobraType *error_type = NULL;
         if (is_result) {
             expect(parser, TOKEN_COMMA, "Result requires a value and error type");
             char error_name[COBRA_MAX_IDENT_LEN];
-            CobraTypeKind error = parse_sum_component(parser, "Result error", error_name);
-            error_type = parser_component_type(parser, error, error_name);
+            const CobraType *error_canonical = NULL;
+            CobraTypeKind error = parse_sum_component(parser, "Result error",
+                                                      error_name, &error_canonical);
+            error_type = error_canonical
+                ? error_canonical
+                : parser_component_type(parser, error, error_name);
         }
         expect(parser, TOKEN_RBRACKET, "Expected ']' after Option or Result type");
         if (owner) parser_set_canonical(parser, owner,
@@ -149,20 +198,138 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
                                         qualifier, value_type, error_type, NULL, NULL);
         return is_result ? COBRA_TYPE_RESULT : COBRA_TYPE_OPTION;
     }
+    if (match(parser, TOKEN_IDENTIFIER) && strcmp(parser->current_token.text, "array") == 0) {
+        /* Fixed value arrays use an explicit bounded form: array[T, N].
+           This is intentionally separate from list[T], which is a runtime
+           growable collection with its own ownership contract. */
+        advance_token(parser);
+        expect(parser, TOKEN_LBRACKET, "Expected '[' after array in fixed-array type");
+        const CobraType *element_type = NULL;
+        if (match(parser, TOKEN_IDENTIFIER) &&
+            strcmp(parser->current_token.text, "array") == 0) {
+            /* Nested fixed array element: array[array[T, N], M]. The inner
+               descriptor is arena-owned and stays valid without joining the
+               AST tree. Only scalar-element arrays may nest. */
+            ASTNode nested;
+            memset(&nested, 0, sizeof(nested));
+            CobraTypeKind nested_kind = parse_type_into(parser,
+                                                        "fixed-array element",
+                                                        &nested, 0);
+            if (nested_kind != COBRA_TYPE_ARRAY || !nested.canonical_type) {
+                fprintf(stderr, "%s:%d:%d: error: nested fixed-array elements must be fixed arrays\n",
+                        parser->source_file, parser->current_token.line,
+                        parser->current_token.col);
+                exit(1);
+            }
+            element_type = nested.canonical_type;
+        } else if (match(parser, TOKEN_IDENTIFIER)) {
+            /* Named value-owned struct element: array[Point, N]. The type
+               resolves against declared structs exactly like Option[Point]
+               payloads; backend import rejects owning or view-bearing
+               structs at the isolated boundary. */
+            char element_name[COBRA_MAX_IDENT_LEN];
+            copy_token_text(parser, element_name, sizeof(element_name),
+                            "fixed-array element");
+            element_type = parser_component_type(parser, COBRA_TYPE_STRUCT,
+                                                 element_name);
+            if (!element_type) {
+                fprintf(stderr, "%s:%d:%d: error: unknown fixed-array element struct '%s'\n",
+                        parser->source_file, parser->current_token.line,
+                        parser->current_token.col, element_name);
+                exit(1);
+            }
+            advance_token(parser);
+        } else {
+            CobraTypeKind element_kind = token_to_type(parser->current_token.type);
+            if (element_kind == COBRA_TYPE_UNKNOWN || element_kind == COBRA_TYPE_VOID ||
+                element_kind == COBRA_TYPE_STRING || element_kind == COBRA_TYPE_V256) {
+                fprintf(stderr, "%s:%d:%d: error: fixed array elements must be scalar values\n",
+                        parser->source_file, parser->current_token.line,
+                        parser->current_token.col);
+                exit(1);
+            }
+            element_type = parser_component_type(parser, element_kind, NULL);
+            advance_token(parser);
+        }
+        expect(parser, TOKEN_COMMA, "Expected ',' after fixed-array element type");
+        if (!match(parser, TOKEN_INT_LITERAL)) {
+            fprintf(stderr, "%s:%d:%d: error: fixed array bound must be an integer literal\n",
+                    parser->source_file, parser->current_token.line,
+                    parser->current_token.col);
+            exit(1);
+        }
+        errno = 0;
+        char *end = NULL;
+        unsigned long long bound = strtoull(parser->current_token.text, &end, 10);
+        if (errno == ERANGE || end == parser->current_token.text || *end != '\0' ||
+            bound == 0 || bound > COBRA_MAX_ARRAY_ELEMENTS) {
+            fprintf(stderr, "%s:%d:%d: error: fixed array bound must be in 1..%d\n",
+                    parser->source_file, parser->current_token.line,
+                    parser->current_token.col, COBRA_MAX_ARRAY_ELEMENTS);
+            exit(1);
+        }
+        size_t array_length = (size_t)bound;
+        advance_token(parser);
+        expect(parser, TOKEN_RBRACKET, "Expected ']' after fixed-array bound");
+        if (owner) {
+            owner->array_length = array_length;
+            owner->canonical_type = cobra_type_make(parser->canonical_arena,
+                                                     COBRA_TYPE_ARRAY, NULL,
+                                                     element_type, NULL, NULL, NULL,
+                                                     qualifier == 1 ? COBRA_OWNERSHIP_BORROWED
+                                                                     : COBRA_OWNERSHIP_VALUE,
+                                                     qualifier == 1 ? COBRA_MUTABILITY_READONLY
+                                                                     : COBRA_MUTABILITY_DEFAULT,
+                                                     -1);
+            if (!owner->canonical_type) {
+                fprintf(stderr, "%s:%d:%d: error: could not construct fixed-array type metadata\n",
+                        parser->source_file, parser->current_token.line,
+                        parser->current_token.col);
+                exit(EXIT_FAILURE);
+            }
+            ((CobraType *)owner->canonical_type)->array_length = array_length;
+        }
+        return COBRA_TYPE_ARRAY;
+    }
     if (match(parser, TOKEN_IDENTIFIER) && strcmp(parser->current_token.text, "list") == 0) {
         advance_token(parser);
         expect(parser, TOKEN_LBRACKET, "Expected '[' after list in collection type");
+        const CobraType *generic_element = NULL;
+        const CobraType *struct_element = NULL;
         CobraTypeKind element = token_to_type(parser->current_token.type);
-        if (element == COBRA_TYPE_UNKNOWN || element == COBRA_TYPE_VOID) {
-            fprintf(stderr, "%s:%d:%d: error: list element type must be a scalar type\n",
+        if (match(parser, TOKEN_IDENTIFIER)) {
+            generic_element = parser_generic_param(parser, parser->current_token.text);
+            if (!generic_element) {
+                /* Named value-owned struct element: list[Point]. The type
+                   resolves against declared structs; backend import rejects
+                   owning or view-bearing structs at the isolated boundary. */
+                char element_name[COBRA_MAX_IDENT_LEN];
+                copy_token_text(parser, element_name, sizeof(element_name),
+                                "list element");
+                struct_element = parser_component_type(parser, COBRA_TYPE_STRUCT,
+                                                       element_name);
+                if (!struct_element) element = COBRA_TYPE_UNKNOWN;
+            }
+        }
+        if ((!generic_element && !struct_element && element == COBRA_TYPE_UNKNOWN) ||
+            element == COBRA_TYPE_VOID) {
+            fprintf(stderr, "%s:%d:%d: error: list element type must be a scalar type, generic parameter, or named struct\n",
                     parser->source_file, parser->current_token.line, parser->current_token.col);
+            exit(1);
+        }
+        if (generic_element && qualifier != 0) {
+            fprintf(stderr, "%s:%d:%d: error: generic owned lists cannot carry a borrowed qualifier\n",
+                    parser->source_file, parser->current_token.line,
+                    parser->current_token.col);
             exit(1);
         }
         advance_token(parser);
         expect(parser, TOKEN_RBRACKET, "Expected ']' after list element type");
         if (owner) {
             parser_set_canonical(parser, owner, COBRA_TYPE_LIST, qualifier,
-                                 parser_component_type(parser, element, NULL),
+                                 generic_element ? generic_element
+                                     : (struct_element ? struct_element
+                                                       : parser_component_type(parser, element, NULL)),
                                  NULL, NULL, NULL);
         }
         return COBRA_TYPE_LIST;
@@ -257,8 +424,8 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
                 exit(1);
             }
             if (slice) {
-                if (qualifier != 1) {
-                    fprintf(stderr, "%s:%d:%d: error: generic slices require an explicit readonly qualifier\n",
+                if (qualifier != 1 && qualifier != 2) {
+                    fprintf(stderr, "%s:%d:%d: error: generic slices require an explicit readonly or out qualifier\n",
                             parser->source_file, parser->current_token.line, parser->current_token.col);
                     exit(1);
                 }
@@ -388,26 +555,39 @@ void parser_init(Parser *parser, const char *source) {
 
 static ASTNode *parse_expression(Parser *parser);
 
-static long long parse_integer_magnitude(Parser *parser) {
+/* Parse a non-negative integer literal magnitude. When the magnitude fits a
+   signed long long, *is_unsigned is false and the signed value is returned.
+   Larger magnitudes that still fit uint64 are accepted as unsigned literals
+   (u64 contexts), so 18446744073709551615 parses where a signed read would
+   overflow. */
+static uint64_t parse_integer_magnitude(Parser *parser, bool *is_unsigned) {
     errno = 0;
     char *end = NULL;
     long long value = strtoll(parser->current_token.text, &end, 10);
-    if (errno == ERANGE || end == parser->current_token.text || *end != '\0' || value < 0) {
-        fprintf(stderr, "%s:%d:%d: error: integer literal is out of range\n",
-                parser->source_file, parser->current_token.line, parser->current_token.col);
-        exit(1);
+    if (errno != ERANGE && end != parser->current_token.text && *end == '\0' && value >= 0) {
+        if (is_unsigned) *is_unsigned = false;
+        return (uint64_t)value;
     }
-    return value;
+    errno = 0;
+    unsigned long long uvalue = strtoull(parser->current_token.text, &end, 10);
+    if (errno != ERANGE && end != parser->current_token.text && *end == '\0') {
+        if (is_unsigned) *is_unsigned = true;
+        return (uint64_t)uvalue;
+    }
+    fprintf(stderr, "%s:%d:%d: error: integer literal is out of range\n",
+            parser->source_file, parser->current_token.line, parser->current_token.col);
+    exit(1);
 }
 
 static int parse_int_literal(Parser *parser) {
-    long long value = parse_integer_magnitude(parser);
-    if (value > INT_MAX) {
+    bool is_unsigned = false;
+    uint64_t magnitude = parse_integer_magnitude(parser, &is_unsigned);
+    if (is_unsigned || magnitude > INT_MAX) {
         fprintf(stderr, "%s:%d:%d: error: integer literal is out of range\n",
                 parser->source_file, parser->current_token.line, parser->current_token.col);
         exit(1);
     }
-    return (int)value;
+    return (int)magnitude;
 }
 
 static ASTNode *parse_primary(Parser *parser) {
@@ -415,19 +595,28 @@ static ASTNode *parse_primary(Parser *parser) {
         advance_token(parser);
         if (match(parser, TOKEN_INT_LITERAL)) {
             ASTNode *node = parser_create_node(parser, AST_INT_LITERAL, NULL);
-            long long magnitude = parse_integer_magnitude(parser);
-            if (magnitude > (long long)INT_MAX + 1) {
+            /* Negative literals are signed even when the magnitude itself
+               exceeds INT64_MAX: -9223372036854775808 is INT64_MIN, while a
+               magnitude above 2^63 has no representable negation. */
+            bool is_unsigned = false;
+            uint64_t magnitude = parse_integer_magnitude(parser, &is_unsigned);
+            if (magnitude > (uint64_t)INT64_MAX + 1) {
                 fprintf(stderr, "%s:%d:%d: error: integer literal is out of range\n",
                         parser->source_file, parser->current_token.line, parser->current_token.col);
                 exit(1);
             }
-            node->int_val = magnitude == (long long)INT_MAX + 1 ? INT_MIN : -(int)magnitude;
+            node->literal_is_unsigned = false;
+            node->literal_u64 = magnitude;
+            node->literal_i64 = magnitude == (uint64_t)INT64_MAX + 1
+                ? INT64_MIN : -(int64_t)magnitude;
+            node->int_val = (int)(int32_t)node->literal_i64;
             advance_token(parser);
             return node;
         }
         if (match(parser, TOKEN_FLOAT_LITERAL)) {
             ASTNode *node = parser_create_node(parser, AST_FLOAT_LITERAL, NULL);
-            node->float_val = -(float)atof(parser->current_token.text);
+            node->literal_f64 = -atof(parser->current_token.text);
+            node->float_val = (float)node->literal_f64;
             advance_token(parser);
             return node;
         }
@@ -522,14 +711,20 @@ static ASTNode *parse_primary(Parser *parser) {
 
     if (match(parser, TOKEN_INT_LITERAL)) {
         ASTNode *node = parser_create_node(parser, AST_INT_LITERAL, NULL);
-        node->int_val = parse_int_literal(parser);
+        bool is_unsigned = false;
+        uint64_t magnitude = parse_integer_magnitude(parser, &is_unsigned);
+        node->literal_is_unsigned = is_unsigned;
+        node->literal_u64 = magnitude;
+        node->literal_i64 = (int64_t)magnitude;
+        node->int_val = (int)(int32_t)node->literal_i64;
         advance_token(parser);
         return node;
     }
 
     if (match(parser, TOKEN_FLOAT_LITERAL)) {
         ASTNode *node = parser_create_node(parser, AST_FLOAT_LITERAL, NULL);
-        node->float_val = (float)atof(parser->current_token.text);
+        node->literal_f64 = atof(parser->current_token.text);
+        node->float_val = (float)node->literal_f64;
         advance_token(parser);
         return node;
     }
@@ -877,24 +1072,72 @@ static ASTNode *parse_statement(Parser *parser) {
         while (!match(parser, TOKEN_RBRACE) && !match(parser, TOKEN_EOF)) {
             if (match(parser, TOKEN_CASE)) {
                 advance_token(parser);
-                if (!match(parser, TOKEN_IDENTIFIER)) {
-                    fprintf(stderr, "%s:%d:%d: error: expected enum name after 'case'\n",
+                if (!match(parser, TOKEN_IDENTIFIER) && !match(parser, TOKEN_NONE)) {
+                    fprintf(stderr, "%s:%d:%d: error: expected pattern name after 'case'\n",
                             parser->source_file, parser->current_token.line, parser->current_token.col);
                     exit(1);
                 }
                 Token enum_token = parser->current_token;
                 ASTNode *case_node = parser_create_node_at(parser, AST_MATCH_CASE, NULL, enum_token);
-                copy_token_text(parser, case_node->match_type_name, sizeof(case_node->match_type_name), "match enum name");
+                copy_token_text(parser, case_node->match_type_name, sizeof(case_node->match_type_name), "match pattern name");
                 advance_token(parser);
-                expect(parser, TOKEN_DOT, "Expected '.' between enum name and variant");
-                if (!match(parser, TOKEN_IDENTIFIER)) {
-                    fprintf(stderr, "%s:%d:%d: error: expected enum variant after 'case %s.'\n",
-                            parser->source_file, parser->current_token.line, parser->current_token.col, case_node->match_type_name);
-                    exit(1);
+                if (match(parser, TOKEN_LPAREN)) {
+                    /* Sum payload pattern: case some(x) / ok(x) / err(e).
+                       The payload binding is stored in secondary_name. */
+                    advance_token(parser);
+                    if (!match(parser, TOKEN_IDENTIFIER)) {
+                        fprintf(stderr, "%s:%d:%d: error: expected binding name after 'case %s('\n",
+                                parser->source_file, parser->current_token.line,
+                                parser->current_token.col, case_node->match_type_name);
+                        exit(1);
+                    }
+                    copy_token_text(parser, case_node->secondary_name,
+                                    sizeof(case_node->secondary_name), "match binding name");
+                    advance_token(parser);
+                    expect(parser, TOKEN_RPAREN, "Expected ')' after match binding");
+                } else if (match(parser, TOKEN_DOT)) {
+                    /* Enum pattern: case Type.Variant, with an optional
+                       payload binding list: case Shape.Circle(r). Payload
+                       bindings become trailing child AST_PARAM nodes after
+                       the arm body, so the body stays child zero. */
+                    advance_token(parser);
+                    if (!match(parser, TOKEN_IDENTIFIER)) {
+                        fprintf(stderr, "%s:%d:%d: error: expected enum variant after 'case %s.'\n",
+                                parser->source_file, parser->current_token.line, parser->current_token.col, case_node->match_type_name);
+                        exit(1);
+                    }
+                    copy_token_text(parser, case_node->secondary_name,
+                                    sizeof(case_node->secondary_name), "match variant name");
+                    advance_token(parser);
+                    if (match(parser, TOKEN_LPAREN)) {
+                        advance_token(parser);
+                        if (match(parser, TOKEN_RPAREN)) {
+                            fprintf(stderr, "%s:%d:%d: error: payload pattern 'case %s.%s' requires at least one binding\n",
+                                    parser->source_file, parser->current_token.line,
+                                    parser->current_token.col, case_node->match_type_name,
+                                    case_node->secondary_name);
+                            exit(1);
+                        }
+                        while (true) {
+                            if (!match(parser, TOKEN_IDENTIFIER)) {
+                                fprintf(stderr, "%s:%d:%d: error: expected binding name in 'case %s.%s(...)'\n",
+                                        parser->source_file, parser->current_token.line,
+                                        parser->current_token.col, case_node->match_type_name,
+                                        case_node->secondary_name);
+                                exit(1);
+                            }
+                            Token binding_token = parser->current_token;
+                            ASTNode *binding = parser_create_node_at(parser, AST_PARAM,
+                                                                     parser->current_token.text,
+                                                                     binding_token);
+                            ast_add_child(case_node, binding);
+                            advance_token(parser);
+                            if (!match(parser, TOKEN_COMMA)) break;
+                            advance_token(parser);
+                        }
+                        expect(parser, TOKEN_RPAREN, "Expected ')' after payload bindings");
+                    }
                 }
-                copy_token_text(parser, case_node->secondary_name,
-                                sizeof(case_node->secondary_name), "match variant name");
-                advance_token(parser);
                 if (match(parser, TOKEN_COLON)) advance_token(parser);
                 ast_add_child(case_node, parse_block(parser));
                 ast_add_child(match_node, case_node);
@@ -1025,13 +1268,22 @@ static ASTNode *parse_statement(Parser *parser) {
         CobraTypeKind declared_type = COBRA_TYPE_UNTYPED;
         if (match(parser, TOKEN_COLON)) {
             advance_token(parser);
-            declared_type = parse_type_into(parser, "variable declaration", var_node, 0);
+            int alias_qualifier = 0;
+            if (match(parser, TOKEN_IDENTIFIER) &&
+                (!strcmp(parser->current_token.text, "out") ||
+                 !strcmp(parser->current_token.text, "readonly"))) {
+                alias_qualifier = !strcmp(parser->current_token.text, "readonly") ? 1 : 2;
+                advance_token(parser);
+            }
+            declared_type = parse_type_into(parser, "variable declaration", var_node,
+                                            alias_qualifier);
         }
 
         var_node->declared_type = declared_type;
-        if (declared_type == COBRA_TYPE_STRUCT) {
-            /* Struct declarations may omit the initializer; the region is
-               zero-initialized and fields are assigned individually. */
+        if (declared_type == COBRA_TYPE_STRUCT || declared_type == COBRA_TYPE_ARRAY) {
+            /* Struct and fixed-array declarations may omit the initializer;
+               the slot is zero-initialized and fields or elements are
+               assigned individually. */
             if (match(parser, TOKEN_ASSIGN)) {
                 advance_token(parser);
                 ASTNode *init_expr = parse_expression(parser);
@@ -1108,10 +1360,42 @@ static ASTNode *parse_statement(Parser *parser) {
 
     if (match(parser, TOKEN_ASM)) {
         advance_token(parser);
-        expect(parser, TOKEN_COLON, "Expected ':' after 'asm'");
-        
         ASTNode *asm_node = parser_create_node(parser, AST_ASM_BLOCK, NULL);
-        
+
+        /* Optional operand binding: asm(in a, b out result): { ... } loads
+           named i64 locals into the fixed SysV argument registers before the
+           block and stores rax into the output local afterward. */
+        if (match(parser, TOKEN_LPAREN)) {
+            advance_token(parser);
+            if (match(parser, TOKEN_IN)) {
+                advance_token(parser);
+                while (!match(parser, TOKEN_RPAREN) && !match(parser, TOKEN_EOF) &&
+                       strcmp(parser->current_token.text, "out") != 0) {
+                    if (asm_node->asm_input_count >= 6) {
+                        fprintf(stderr, "%s:%d:%d: error: inline asm supports at most 6 input operands\n",
+                                parser->source_file, parser->current_token.line, parser->current_token.col);
+                        exit(1);
+                    }
+                    snprintf(asm_node->asm_inputs[asm_node->asm_input_count],
+                             sizeof(asm_node->asm_inputs[0]), "%.63s", parser->current_token.text);
+                    asm_node->asm_input_count++;
+                    advance_token(parser);
+                    if (match(parser, TOKEN_COMMA)) advance_token(parser);
+                }
+            }
+            if (!match(parser, TOKEN_RPAREN) && strcmp(parser->current_token.text, "out") == 0) {
+                advance_token(parser);
+                if (!match(parser, TOKEN_RPAREN) && !match(parser, TOKEN_EOF)) {
+                    snprintf(asm_node->asm_output, sizeof(asm_node->asm_output),
+                             "%.63s", parser->current_token.text);
+                    asm_node->asm_has_output = true;
+                    advance_token(parser);
+                }
+            }
+            expect(parser, TOKEN_RPAREN, "Expected ')' after asm operand list");
+        }
+        expect(parser, TOKEN_COLON, "Expected ':' after 'asm'");
+
         if (match(parser, TOKEN_LBRACE)) {
             advance_token(parser); // Skip {
             char buf[512] = "";
@@ -1197,6 +1481,41 @@ static ASTNode *parse_enum_declaration(Parser *parser) {
         variant->declared_type = COBRA_TYPE_I32;
         variant->int_val = next_value;
         advance_token(parser);
+        /* Payload-carrying variant: enum Shape: { Circle(f32), Rect(f32, f32) }.
+           The payload types become child AST_PARAM nodes of the variant, so a
+           non-zero child_count marks a payload variant. The production
+           compiler rejects payload variants at IR validation; the isolated
+           backend lowers them through the tagged-sum machinery. */
+        if (match(parser, TOKEN_LPAREN)) {
+            advance_token(parser);
+            if (match(parser, TOKEN_RPAREN)) {
+                fprintf(stderr, "%s:%d:%d: error: enum variant '%s' requires at least one payload type\n",
+                        parser->source_file, variant_token.line, variant_token.col, variant->name);
+                exit(1);
+            }
+            int payload_index = 0;
+            while (true) {
+                char payload_name[COBRA_MAX_IDENT_LEN];
+                snprintf(payload_name, sizeof(payload_name), "payload%d", payload_index);
+                ASTNode *payload = parser_create_node_at(parser, AST_PARAM,
+                                                         payload_name, parser->current_token);
+                payload->declared_type = parse_type_into(parser, "enum variant payload",
+                                                         payload, 0);
+                if (payload->declared_type == COBRA_TYPE_UNTYPED ||
+                    payload->declared_type == COBRA_TYPE_UNKNOWN ||
+                    !payload->canonical_type) {
+                    fprintf(stderr, "%s:%d:%d: error: invalid payload type in enum variant '%s'\n",
+                            parser->source_file, variant_token.line, variant_token.col,
+                            variant->name);
+                    exit(1);
+                }
+                ast_add_child(variant, payload);
+                payload_index++;
+                if (!match(parser, TOKEN_COMMA)) break;
+                advance_token(parser);
+            }
+            expect(parser, TOKEN_RPAREN, "Expected ')' after enum variant payload types");
+        }
         if (match(parser, TOKEN_ASSIGN)) {
             advance_token(parser);
             if (!match(parser, TOKEN_INT_LITERAL)) {
@@ -1304,11 +1623,6 @@ static ASTNode *parse_struct_declaration(Parser *parser) {
         }
         field->declared_type = parse_type_into(parser, "struct field", field, field_qualifier);
 
-        if (field->declared_type == COBRA_TYPE_OPTION || field->declared_type == COBRA_TYPE_RESULT) {
-            fprintf(stderr, "%s:%d:%d: error: Option and Result fields are not supported yet; keep sum values local or return them\n",
-                    parser->source_file, field_token.line, field_token.col);
-            exit(1);
-        }
         ast_add_child(struct_node, field);
         if (match(parser, TOKEN_COMMA)) advance_token(parser);
     }
@@ -1422,7 +1736,15 @@ static ASTNode *parse_function(Parser *parser) {
 
     if (match(parser, TOKEN_ARROW)) {
         advance_token(parser);
-        fn_node->declared_type = parse_type_into(parser, "return", fn_node, 0);
+        int return_qualifier = 0;
+        if (match(parser, TOKEN_IDENTIFIER) &&
+            (!strcmp(parser->current_token.text, "out") ||
+             !strcmp(parser->current_token.text, "readonly"))) {
+            return_qualifier = !strcmp(parser->current_token.text, "readonly") ? 1 : 2;
+            advance_token(parser);
+        }
+        fn_node->declared_type = parse_type_into(parser, "return", fn_node,
+                                                 return_qualifier);
 
     }
 

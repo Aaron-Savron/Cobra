@@ -40,7 +40,7 @@ int interpreter_eval_expr(ASTNode *node) {
         exit(1);
     }
 
-    if (node->type == AST_INT_LITERAL) return node->int_val;
+    if (node->type == AST_INT_LITERAL) return (int)node->literal_i64;
     if (node->type == AST_COMPTIME_EXPR) {
         return node->child_count > 0 ? interpreter_eval_expr(node->children[0]) : 0;
     }
@@ -151,7 +151,7 @@ static long long eval_expression(HostEvaluator *ev, ASTNode *node) {
     if (!node) return 0;
     switch (node->type) {
         case AST_INT_LITERAL:
-            return node->int_val;
+            return node->literal_i64;
         case AST_VAR_REF: {
             long long value = 0;
             if (!eval_find_local(ev, node->name, &value)) ev->failed = 1;

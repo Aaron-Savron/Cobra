@@ -46,6 +46,28 @@ int main(void) {
     assert(result->abi == COBRA_ABI_SUM_INDIRECT);
     assert(result->size == COBRA_NATIVE_SUM_TAG_SIZE + 2 * COBRA_NATIVE_SUM_SCALAR_SIZE);
 
+    /* Nested scalar sums: an aggregate component occupies its real canonical
+       size inside the enclosing sum, not the fixed scalar slot. */
+    CobraType *inner_option = cobra_type_new(&arena, COBRA_TYPE_OPTION);
+    assert(inner_option);
+    assert(cobra_type_add_generic_arg(inner_option, i64));
+    assert(cobra_type_validate(&arena, inner_option));
+    assert(inner_option->size ==
+           COBRA_NATIVE_SUM_TAG_SIZE + COBRA_NATIVE_SUM_SCALAR_SIZE);
+    CobraType *outer_option = cobra_type_new(&arena, COBRA_TYPE_OPTION);
+    assert(outer_option);
+    assert(cobra_type_add_generic_arg(outer_option, inner_option));
+    assert(cobra_type_validate(&arena, outer_option));
+    assert(outer_option->size == COBRA_NATIVE_SUM_TAG_SIZE + inner_option->size);
+    CobraType *nested_result = cobra_type_new(&arena, COBRA_TYPE_RESULT);
+    assert(nested_result);
+    assert(cobra_type_add_generic_arg(nested_result, inner_option));
+    assert(cobra_type_add_generic_arg(nested_result, i64));
+    assert(cobra_type_validate(&arena, nested_result));
+    assert(nested_result->size ==
+           COBRA_NATIVE_SUM_TAG_SIZE + inner_option->size +
+           COBRA_NATIVE_SUM_SCALAR_SIZE);
+
     /* Narrow generic-instantiation milestone: one canonical placeholder can
        specialize scalar Option and Result descriptors. Instantiation finalizes
        the ABI and interns equivalent results in the same arena. */
