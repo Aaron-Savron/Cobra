@@ -265,6 +265,10 @@ Token lexer_next_token(Lexer *lexer) {
                     token.type = TOKEN_COMPUTE;
                 } else if (strcmp(token.text, "parallel") == 0) {
                     token.type = TOKEN_PARALLEL;
+                } else if (strcmp(token.text, "gpu") == 0) {
+                    token.type = TOKEN_GPU_DIRECTIVE;
+                } else if (strcmp(token.text, "cpu") == 0) {
+                    token.type = TOKEN_CPU_DIRECTIVE;
                 } else {
                     token.type = TOKEN_UNKNOWN;
                 }
