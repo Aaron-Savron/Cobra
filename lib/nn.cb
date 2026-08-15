@@ -236,3 +236,74 @@ def mse_loss_f32(a: []f32, b: []f32, out: []f32, n: i64) -> void: {
     }
     out[0] = s / n
 }
+
+# --- Data / batching --------------------------------------------------------
+# Minimal minibatch support: shuffle an index permutation once per epoch,
+# then gather feature rows through it. There is no dataset object - a
+# "dataset" is just a flat []f32 buffer (row-major, `feature_dim` per row)
+# the caller already owns, and these functions only ever touch the row
+# range a batch needs.
+
+import c "libc.so.6" (rand, srand)
+
+# Fills idx[0..n) with 0, 1, ..., n-1. Call once before the first shuffle;
+# shuffle_indices_i64 only ever permutes, it never re-seeds this.
+def iota_i64(idx: []i64, n: i64) -> void: {
+    for i in n: {
+        idx[i] = i
+    }
+}
+
+# Seeds libc's PRNG. Call once at program start; not needed if determinism
+# across runs isn't required (glibc's default seed is fixed, so omitting
+# this still gives reproducible-but-not-random shuffles).
+def seed_random(seed: i64) -> void: {
+    srand(seed)
+}
+
+# In-place Fisher-Yates shuffle of an index permutation - the standard way
+# to reshuffle minibatch order once per training epoch without touching the
+# underlying data buffer at all.
+def shuffle_indices_i64(idx: []i64, n: i64) -> void: {
+    i = n - 1
+    while i > 0: {
+        r = rand()
+        span = i + 1
+        j = r - (r / span) * span
+        tmp = idx[i]
+        idx[i] = idx[j]
+        idx[j] = tmp
+        i = i - 1
+    }
+}
+
+# Gathers `batch_size` rows of `feature_dim` f32 each from `src` (row-major,
+# arbitrary row order) into `out` (row-major, batch order), following
+# idx[batch_start .. batch_start+batch_size) - the index buffer produced by
+# iota_i64 + shuffle_indices_i64. `out` must hold at least
+# batch_size*feature_dim elements; `src` must hold at least
+# (max(idx)+1)*feature_dim.
+def batch_gather_f32(src: []f32, idx: []i64, batch_start: i64, batch_size: i64,
+                      feature_dim: i64, out: []f32) -> void: {
+    b = 0
+    while b < batch_size: {
+        row = idx[batch_start + b]
+        f = 0
+        while f < feature_dim: {
+            out[b * feature_dim + f] = src[row * feature_dim + f]
+            f = f + 1
+        }
+        b = b + 1
+    }
+}
+
+# Same gather for scalar i64 labels (one label per row, not feature_dim per
+# row) - the common companion to batch_gather_f32 for (X, y) pairs.
+def batch_gather_labels_i64(labels: []i64, idx: []i64, batch_start: i64, batch_size: i64,
+                             out: []i64) -> void: {
+    b = 0
+    while b < batch_size: {
+        out[b] = labels[idx[batch_start + b]]
+        b = b + 1
+    }
+}

@@ -180,6 +180,79 @@ def fs_read_file_f32_checked(path: string, buf: []f32, max_bytes: i64) -> Result
     return ok(received)
 }
 
+# Checked path-level binary write for f32-backed storage - the write-side
+# counterpart to fs_read_file_f32_checked above, e.g. for saving trained
+# weight buffers to disk. `count` is the number of f32 elements (not bytes).
+def fs_write_file_f32_checked(path: string, buf: []f32, count: i64) -> Result[i64, i64]: {
+    let fd: i64 = fs_open_write(path)?
+    if count < 0: {
+        fs_close(fd)
+        return err(2)
+    }
+    if count > len(buf): {
+        fs_close(fd)
+        return err(2)
+    }
+    written = write(fd, buf, count * 4)
+    if written < 0: {
+        fs_close(fd)
+        return err(1)
+    }
+    closed = fs_close(fd)
+    if is_ok(closed) == 0: {
+        let error_code: i64 = unwrap_err(closed)
+        return err(error_code)
+    }
+    return ok(written)
+}
+
+# Checked path-level binary read/write for []u8-backed storage - e.g. the
+# fp16-packed weight bytes from pack_f16 (see lib/gpu_nn.cb's mixed-
+# precision helpers). `count`/`max_bytes` are byte counts, not elements.
+def fs_read_file_u8_checked(path: string, buf: []u8, max_bytes: i64) -> Result[i64, i64]: {
+    let fd: i64 = fs_open_read(path)?
+    if max_bytes < 0: {
+        fs_close(fd)
+        return err(2)
+    }
+    if max_bytes > len(buf): {
+        max_bytes = len(buf)
+    }
+    received = read(fd, buf, max_bytes)
+    if received < 0: {
+        fs_close(fd)
+        return err(1)
+    }
+    closed = fs_close(fd)
+    if is_ok(closed) == 0: {
+        return err(1)
+    }
+    return ok(received)
+}
+
+def fs_write_file_u8_checked(path: string, buf: []u8, count: i64) -> Result[i64, i64]: {
+    let fd: i64 = fs_open_write(path)?
+    if count < 0: {
+        fs_close(fd)
+        return err(2)
+    }
+    if count > len(buf): {
+        fs_close(fd)
+        return err(2)
+    }
+    written = write(fd, buf, count)
+    if written < 0: {
+        fs_close(fd)
+        return err(1)
+    }
+    closed = fs_close(fd)
+    if is_ok(closed) == 0: {
+        let error_code: i64 = unwrap_err(closed)
+        return err(error_code)
+    }
+    return ok(written)
+}
+
 # Append text to a path using the raw stream compatibility API.
 def fs_append(path: string, content: string) -> i64: {
     f = fopen(path, "a")

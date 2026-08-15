@@ -1,0 +1,66 @@
+# Cobra GPU Neural Network Kernels (lib/gpu_nn.cb)
+# =================================================
+# @gpu-kernel counterparts to lib/nn.cb's CPU/AVX2 layer math, chosen to be
+# autodiff-eligible (see src/gpu_lower.c's elementwise-kernel restriction:
+# every buffer access must use the kernel's own thread index). Each kernel
+# below therefore also gets a compiler-generated `<name>_backward` and
+# `<name>_backward_gpu` for free - no hand-written gradient code.
+#
+# This file is NOT part of the automatic prelude (unlike lib/nn.cb/std.cb/
+# fs.cb/...): every Cobra build concatenates those in unconditionally, and
+# an @gpu kernel there would force every single compiled program - even one
+# that never touches the GPU - to invoke glslangValidator and link the GPU
+# runtime. Import this file explicitly where you actually want GPU-resident
+# training:
+#
+#   import "lib/gpu_nn.cb"
+#
+# Conventions: same as lib/nn.cb (row-major []f32, caller-owned buffers,
+# i64 shapes) - the difference is these run as SPIR-V compute kernels
+# instead of scalar/AVX2 loops, and are meant for use with gpu_alloc_f32/
+# gpu_upload_f32/gpu_batch_begin from a resident training loop.
+
+# ReLU, out-of-place. `relu_gpu_backward(grad_out, x, y, grad_x, grad_y)`
+# is generated automatically; grad_y is unused (y is write-only) but still
+# has to be passed - see gpu_lower.c's mechanical backward ABI.
+@gpu
+def relu_gpu(x: []f32, y: []f32): {
+    i = gpu_index()
+    if i < len(x): {
+        if x[i] < 0.0: {
+            y[i] = 0.0
+        } else {
+            y[i] = x[i]
+        }
+    }
+}
+
+# Elementwise squared error, per element (not reduced): out[i] = (a[i]-b[i])^2.
+# Combine with sum_f32(out)/n on the host for the scalar MSE loss, or call
+# mse_elementwise_gpu_backward directly to get dL/da, dL/db per element from
+# an upstream gradient (typically 1/n everywhere, if this feeds sum_f32).
+@gpu
+def mse_elementwise_gpu(a: []f32, b: []f32, sqerr: []f32): {
+    i = gpu_index()
+    if i < len(a): {
+        d = a[i] - b[i]
+        sqerr[i] = d * d
+    }
+}
+
+# y = x * scale + shift, elementwise, both scale and shift trainable scalars
+# (their gradients come out as grad_scale_partial/grad_shift_partial - sum
+# them on the host, or with sum_f32, to get the actual scalar gradient).
+# This is the building block for a learned per-channel affine transform.
+@gpu
+def affine_gpu(x: []f32, scale: f32, shift: f32, y: []f32): {
+    i = gpu_index()
+    if i < len(x): {
+        y[i] = x[i] * scale + shift
+    }
+}
+
+# @gpu/@cpu is a single parser-wide mode, not scoped to this file: without
+# resetting it here, whatever imports this file (or whatever the library
+# concatenation order places next) would keep compiling as GPU kernels too.
+@cpu
