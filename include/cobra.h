@@ -52,6 +52,8 @@ typedef enum {
     TOKEN_COMPTIME,
     TOKEN_COMPUTE,
     TOKEN_PARALLEL,
+    TOKEN_GPU_DIRECTIVE,
+    TOKEN_CPU_DIRECTIVE,
     TOKEN_FOR,
     TOKEN_IN,
     TOKEN_RETURN,
@@ -133,7 +135,11 @@ Token lexer_next_token(Lexer *lexer);
 typedef enum {
     TARGET_DEV_CPU = 0,
     TARGET_DEV_GPU_VECTOR,
-    TARGET_DEV_NPU
+    TARGET_DEV_NPU,
+    /* A function under an `@gpu` directive: its body is lowered to a real
+       SPIR-V compute kernel (see src/gpu_lower.c), not just tagged and left
+       on the CPU path the way TARGET_DEV_GPU_VECTOR currently is. */
+    TARGET_DEV_GPU_KERNEL
 } TargetDevice;
 
 typedef enum {
@@ -450,6 +456,10 @@ typedef struct {
     size_t generic_param_count;
     char generic_param_names[COBRA_MAX_TYPE_ARGS][COBRA_MAX_IDENT_LEN];
     const CobraType *generic_param_types[COBRA_MAX_TYPE_ARGS];
+    /* Set by a top-level `@gpu` directive and cleared by `@cpu`; every `def`
+       parsed while set is tagged TARGET_DEV_GPU_KERNEL instead of CPU. A
+       file whose first directive is `@gpu` therefore targets GPU throughout. */
+    bool gpu_directive_active;
 } Parser;
 
 void parser_init(Parser *parser, const char *source);
@@ -491,6 +501,11 @@ void codegen_set_vectorize(bool enabled);
 /* Mark the build as a portable scalar emission, so unreachable AVX-backed
    library helpers are not copied into the output object. */
 void codegen_set_portable(bool enabled);
+/* --no-gpu: gpu_available()/gpu_device_count()/gpu_selftest() compile to
+   constant 0 and the GPU runtime is never linked, regardless of whether the
+   program calls them. For CI without a GPU, reproducible builds, and CPU-
+   only benchmarking baselines. */
+void codegen_set_gpu_enabled(bool enabled);
 
 /* Test-only host evaluator. It is retained for the lightweight evaluator API. */
 bool interpreter_run_function(ASTNode *root, const char *function_name, int *return_code);

@@ -6,6 +6,7 @@
  */
 
 #include "../include/cobra.h"
+#include "backend_ir/driver.h"
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
@@ -764,8 +765,8 @@ static void print_usage(void) {
     printf("Usage:\n");
     printf("  cobra init [directory]\n");
     printf("  cobra check <file.cb>\n");
-    printf("  cobra build <file.cb> [-o binary] [--target=win64|wasm32|arm64]\n");
-    printf("  cobra run <file.cb>\n");
+    printf("  cobra build <file.cb> [-o binary] [--target=win64|wasm32|arm64] [--backend=native|direct] [--no-gpu]\n");
+    printf("  cobra run <file.cb> [--backend=native|direct]\n");
     printf("  cobra test <file.cb>\n");
     printf("  cobra bench <file.cb> [--warmup N] [--runs N]\n");
     printf("  cobra fmt <file.cb>\n");
@@ -879,6 +880,274 @@ static const char *collections_runtime_path(void) {
         if (access(installed_path, R_OK) == 0) return installed_path;
     }
     return NULL;
+}
+
+static bool ast_contains_precision(ASTNode *node) {
+    if (!node) return false;
+    if (node->type == AST_FUNC_CALL &&
+        (!strcmp(node->name, "pack_f16") || !strcmp(node->name, "unpack_f16"))) return true;
+    for (size_t i = 0; i < node->child_count; i++) {
+        if (ast_contains_precision(node->children[i])) return true;
+    }
+    return false;
+}
+
+static const char *precision_runtime_path(void) {
+    static char installed_path[512];
+    if (access("runtime/cobra_precision.c", R_OK) == 0) return "runtime/cobra_precision.c";
+    const char *lib_path = getenv("COBRA_LIB_PATH");
+    if (lib_path && *lib_path) {
+        snprintf(installed_path, sizeof(installed_path), "%s/cobra_precision.c", lib_path);
+        if (access(installed_path, R_OK) == 0) return installed_path;
+    }
+    return NULL;
+}
+
+static const char *gpu_runtime_path(void) {
+    static char installed_path[512];
+    if (access("runtime/cobra_gpu.c", R_OK) == 0) return "runtime/cobra_gpu.c";
+    const char *lib_path = getenv("COBRA_LIB_PATH");
+    if (lib_path && *lib_path) {
+        snprintf(installed_path, sizeof(installed_path), "%s/cobra_gpu.c", lib_path);
+        if (access(installed_path, R_OK) == 0) return installed_path;
+    }
+    return NULL;
+}
+
+bool cobra_gpu_lower_function(const ASTNode *program, const ASTNode *fn, FILE *out);
+bool cobra_gpu_lower_backward(const ASTNode *program, const ASTNode *fn, FILE *out,
+                               int *out_buffer_count, char out_buffer_names[][COBRA_MAX_IDENT_LEN],
+                               int *out_scalar_count, char out_scalar_names[][COBRA_MAX_IDENT_LEN],
+                               CobraTypeKind *out_scalar_types, char *out_output_buf);
+
+static bool ast_has_gpu_kernel(ASTNode *program) {
+    if (!program) return false;
+    for (size_t i = 0; i < program->child_count; i++) {
+        ASTNode *fn = program->children[i];
+        if (fn->type == AST_FUNCTION && fn->target_device == TARGET_DEV_GPU_KERNEL) return true;
+    }
+    return false;
+}
+
+static const char *gpu_glsl_scalar_c_type(CobraTypeKind k) {
+    if (k == COBRA_TYPE_F32 || k == COBRA_TYPE_F64) return "float";
+    return "int32_t";
+}
+
+/* Lowers every @gpu-tagged top-level function in `program` to SPIR-V (via
+   glslangValidator) and writes a generated C source file with the embedded
+   SPIR-V plus one wrapper function per kernel, matching the ABI
+   emit_gpu_kernel_call in codegen.c produces at each call site:
+   (float *buf, int64_t count, <scalars>...). Returns the generated file's
+   path, or NULL on failure (with a message already printed to stderr). */
+static const char *build_gpu_kernels_file(ASTNode *program, const char *output_binary) {
+    static char out_path[512];
+    snprintf(out_path, sizeof(out_path), "%s_gpu_kernels.c", output_binary);
+    FILE *out = fopen(out_path, "w");
+    if (!out) { fprintf(stderr, "[codegen] failed to create %s\n", out_path); return NULL; }
+    fprintf(out, "#include <stdint.h>\n#include <stddef.h>\n");
+    fprintf(out, "extern int64_t cobra_gpu_run_kernel_n(const uint32_t *spirv, size_t spirv_words, float **buffers, const int64_t *lens, int64_t nbuffers, const void *push_blob, size_t push_blob_size);\n");
+    fprintf(out, "extern int64_t cobra_gpu_run_kernel_resident(const uint32_t *spirv, size_t spirv_words, const int64_t *handles, int64_t nbuffers, const void *push_blob, size_t push_blob_size);\n");
+    fprintf(out, "extern int64_t cobra_gpu_resident_len(int64_t handle);\n\n");
+
+    bool ok = true;
+    for (size_t i = 0; i < program->child_count && ok; i++) {
+        ASTNode *fn = program->children[i];
+        if (fn->type != AST_FUNCTION || fn->target_device != TARGET_DEV_GPU_KERNEL) continue;
+
+        char glsl_path[512], spv_path[512];
+        snprintf(glsl_path, sizeof(glsl_path), "%s_%s.comp", output_binary, fn->name);
+        snprintf(spv_path, sizeof(spv_path), "%s_%s.spv", output_binary, fn->name);
+        FILE *glsl = fopen(glsl_path, "w");
+        if (!glsl) { fprintf(stderr, "[codegen] failed to create %s\n", glsl_path); ok = false; break; }
+        bool lowered = cobra_gpu_lower_function(program, fn, glsl);
+        fclose(glsl);
+        if (!lowered) { remove(glsl_path); ok = false; break; }
+
+        const char *spv_argv[] = {"glslangValidator", "-V", glsl_path, "-o", spv_path, NULL};
+        int status = run_process(spv_argv);
+        remove(glsl_path);
+        if (!process_succeeded(status)) {
+            fprintf(stderr, "[codegen] @gpu kernel '%s': glslangValidator failed (is it installed?)\n", fn->name);
+            ok = false; break;
+        }
+
+        FILE *spv = fopen(spv_path, "rb");
+        if (!spv) { fprintf(stderr, "[codegen] failed to read %s\n", spv_path); ok = false; break; }
+        fseek(spv, 0, SEEK_END);
+        long spv_size = ftell(spv);
+        fseek(spv, 0, SEEK_SET);
+        if (spv_size <= 0 || spv_size % 4 != 0) {
+            fprintf(stderr, "[codegen] @gpu kernel '%s': malformed SPIR-V output\n", fn->name);
+            fclose(spv); remove(spv_path); ok = false; break;
+        }
+        size_t word_count = (size_t)spv_size / 4;
+        uint32_t *words = malloc((size_t)spv_size);
+        if (!words || fread(words, 1, (size_t)spv_size, spv) != (size_t)spv_size) {
+            fprintf(stderr, "[codegen] @gpu kernel '%s': failed to read SPIR-V\n", fn->name);
+            fclose(spv); free(words); remove(spv_path); ok = false; break;
+        }
+        fclose(spv);
+        remove(spv_path);
+
+        fprintf(out, "static const uint32_t __cobra_gpu_spirv_%s[] = {", fn->name);
+        for (size_t w = 0; w < word_count; w++) fprintf(out, "%s%uu", w ? "," : "", words[w]);
+        fprintf(out, "};\n");
+        free(words);
+
+        char buf_names[8][COBRA_MAX_IDENT_LEN]; int buf_count = 0;
+        char scalar_names[16][COBRA_MAX_IDENT_LEN]; CobraTypeKind scalar_types[16]; int scalar_count = 0;
+        for (size_t p = 0; p < fn->child_count; p++) {
+            ASTNode *param = fn->children[p];
+            if (param->type != AST_PARAM) continue;
+            if (param->declared_type == COBRA_TYPE_SLICE_F32) {
+                if (buf_count < 8) snprintf(buf_names[buf_count++], COBRA_MAX_IDENT_LEN, "%s", param->name);
+            } else if (scalar_count < 16) {
+                snprintf(scalar_names[scalar_count], COBRA_MAX_IDENT_LEN, "%s", param->name);
+                scalar_types[scalar_count] = param->declared_type;
+                scalar_count++;
+            }
+        }
+
+        /* Push-constant layout matches what gpu_lower.c emitted in the GLSL
+           source: one uint length per buffer (declaration order), then each
+           scalar in declaration order. */
+        fprintf(out, "int64_t %s(float **__bufs, int64_t *__lens", fn->name);
+        for (int s = 0; s < scalar_count; s++)
+            fprintf(out, ", %s %s", gpu_glsl_scalar_c_type(scalar_types[s]), scalar_names[s]);
+        fprintf(out, ") {\n");
+        fprintf(out, "    struct { ");
+        for (int b = 0; b < buf_count; b++) fprintf(out, "uint32_t l%d; ", b);
+        for (int s = 0; s < scalar_count; s++) fprintf(out, "%s f%d; ", gpu_glsl_scalar_c_type(scalar_types[s]), s);
+        fprintf(out, "} __push;\n");
+        for (int b = 0; b < buf_count; b++) fprintf(out, "    __push.l%d = (uint32_t)__lens[%d];\n", b, b);
+        for (int s = 0; s < scalar_count; s++) fprintf(out, "    __push.f%d = %s;\n", s, scalar_names[s]);
+        fprintf(out, "    return cobra_gpu_run_kernel_n(__cobra_gpu_spirv_%s, %zu, __bufs, __lens, %d, &__push, sizeof(__push));\n",
+                fn->name, word_count, buf_count);
+        fprintf(out, "}\n\n");
+
+        /* Resident fast path: `<kernel>_gpu(...)`. Buffer parameters become
+           i64 handles (from gpu_alloc_f32) in the same declaration position;
+           lengths come from the resident table via cobra_gpu_resident_len,
+           since the wrapper only has handles on hand, not raw counts. */
+        bool param_is_buf[32]; char param_names[32][COBRA_MAX_IDENT_LEN]; CobraTypeKind param_types[32];
+        int param_count = 0;
+        for (size_t p = 0; p < fn->child_count && param_count < 32; p++) {
+            ASTNode *param = fn->children[p];
+            if (param->type != AST_PARAM) continue;
+            bool is_buf = param->declared_type == COBRA_TYPE_SLICE_F32;
+            param_is_buf[param_count] = is_buf;
+            snprintf(param_names[param_count], COBRA_MAX_IDENT_LEN, "%s", param->name);
+            param_types[param_count] = is_buf ? COBRA_TYPE_I64 : param->declared_type;
+            param_count++;
+        }
+
+        fprintf(out, "int64_t %s_gpu(", fn->name);
+        for (int p = 0; p < param_count; p++)
+            fprintf(out, "%s%s %s", p ? ", " : "",
+                    param_is_buf[p] ? "int64_t" : gpu_glsl_scalar_c_type(param_types[p]), param_names[p]);
+        fprintf(out, ") {\n");
+        fprintf(out, "    int64_t __handles[%d] = {", buf_count);
+        { int bi = 0; for (int p = 0; p < param_count; p++) if (param_is_buf[p]) fprintf(out, "%s%s", bi++ ? ", " : "", param_names[p]); }
+        fprintf(out, "};\n");
+        fprintf(out, "    struct { ");
+        for (int b = 0; b < buf_count; b++) fprintf(out, "uint32_t l%d; ", b);
+        for (int s = 0; s < scalar_count; s++) fprintf(out, "%s f%d; ", gpu_glsl_scalar_c_type(scalar_types[s]), s);
+        fprintf(out, "} __push;\n");
+        for (int b = 0; b < buf_count; b++) fprintf(out, "    __push.l%d = (uint32_t)cobra_gpu_resident_len(__handles[%d]);\n", b, b);
+        for (int s = 0; s < scalar_count; s++) fprintf(out, "    __push.f%d = %s;\n", s, scalar_names[s]);
+        fprintf(out, "    return cobra_gpu_run_kernel_resident(__cobra_gpu_spirv_%s, %zu, __handles, %d, &__push, sizeof(__push));\n",
+                fn->name, word_count, buf_count);
+        fprintf(out, "}\n\n");
+
+        /* Reverse-mode gradient kernel, if this kernel is elementwise
+           enough to qualify (see cobra_gpu_lower_backward). Not every @gpu
+           kernel does - this is attempted opportunistically and skipped
+           (not an error) when it doesn't apply. */
+        {
+            char bglsl_path[512], bspv_path[512];
+            snprintf(bglsl_path, sizeof(bglsl_path), "%s_%s_backward.comp", output_binary, fn->name);
+            snprintf(bspv_path, sizeof(bspv_path), "%s_%s_backward.spv", output_binary, fn->name);
+            FILE *bglsl = fopen(bglsl_path, "w");
+            int gb_count = 0, gs_count = 0;
+            char gb_names[8][COBRA_MAX_IDENT_LEN];
+            char gs_names[16][COBRA_MAX_IDENT_LEN];
+            CobraTypeKind gs_types[16];
+            char output_buf_name[COBRA_MAX_IDENT_LEN];
+            bool eligible = bglsl && cobra_gpu_lower_backward(program, fn, bglsl, &gb_count, gb_names,
+                                                               &gs_count, gs_names, gs_types, output_buf_name);
+            if (bglsl) fclose(bglsl);
+            if (eligible) {
+                const char *bspv_argv[] = {"glslangValidator", "-V", bglsl_path, "-o", bspv_path, NULL};
+                int bstatus = run_process(bspv_argv);
+                remove(bglsl_path);
+                if (process_succeeded(bstatus)) {
+                    FILE *bspv = fopen(bspv_path, "rb");
+                    if (bspv) {
+                        fseek(bspv, 0, SEEK_END);
+                        long bspv_size = ftell(bspv);
+                        fseek(bspv, 0, SEEK_SET);
+                        uint32_t *bwords = (bspv_size > 0 && bspv_size % 4 == 0) ? malloc((size_t)bspv_size) : NULL;
+                        if (bwords && fread(bwords, 1, (size_t)bspv_size, bspv) == (size_t)bspv_size) {
+                            size_t bword_count = (size_t)bspv_size / 4;
+                            fprintf(out, "static const uint32_t __cobra_gpu_spirv_%s_backward[] = {", fn->name);
+                            for (size_t w = 0; w < bword_count; w++) fprintf(out, "%s%uu", w ? "," : "", bwords[w]);
+                            fprintf(out, "};\n");
+
+                            /* ABI: (float **bufs, int64_t *lens, <original scalars>), matching
+                               emit_gpu_backward_call in codegen.c exactly - bufs/lens together
+                               hold [grad_out, <original buffers>, <grad_<buffer> outputs>,
+                               <grad_<scalar>_partial outputs>], all sharing the same dispatch
+                               length (bufs[0]/lens[0] is grad_out, whose length is the kernel's
+                               own dispatch domain). */
+                            int total_bufs = 1 + 2 * gb_count + gs_count;
+                            fprintf(out, "int64_t %s_backward(float **__bufs, int64_t *__lens", fn->name);
+                            for (int s = 0; s < gs_count; s++) fprintf(out, ", %s %s", gpu_glsl_scalar_c_type(gs_types[s]), gs_names[s]);
+                            fprintf(out, ") {\n");
+                            fprintf(out, "    struct { uint32_t klen;");
+                            for (int s = 0; s < gs_count; s++) fprintf(out, " float f%d;", s);
+                            fprintf(out, " } __push;\n");
+                            fprintf(out, "    __push.klen = (uint32_t)__lens[0];\n");
+                            for (int s = 0; s < gs_count; s++) fprintf(out, "    __push.f%d = %s;\n", s, gs_names[s]);
+                            fprintf(out, "    return cobra_gpu_run_kernel_n(__cobra_gpu_spirv_%s_backward, %zu, __bufs, __lens, %d, &__push, sizeof(__push));\n",
+                                    fn->name, bword_count, total_bufs);
+                            fprintf(out, "}\n\n");
+                        }
+                        free(bwords);
+                        fclose(bspv);
+                    }
+                }
+                remove(bspv_path);
+            } else {
+                remove(bglsl_path);
+            }
+        }
+    }
+    fclose(out);
+    if (!ok) { remove(out_path); return NULL; }
+    return out_path;
+}
+
+static bool ast_contains_gpu(ASTNode *node) {
+    if (!node) return false;
+    if (node->type == AST_FUNC_CALL &&
+        (!strcmp(node->name, "gpu_available") || !strcmp(node->name, "gpu_device_count") ||
+         !strcmp(node->name, "gpu_selftest") || !strcmp(node->name, "gpu_should_dispatch") ||
+         /* matmul_f32/dense_f32/relu_f32/sum_f32/mean_f32/max_f32 all
+            auto-dispatch to GPU under the hood (see emit_gemm/emit_relu/
+            emit_reduce in codegen.c), so the runtime must be linked whenever
+            these appear, even though the source never names a gpu_* call. */
+         !strcmp(node->name, "matmul_f32") || !strcmp(node->name, "dense_f32") ||
+         !strcmp(node->name, "relu_f32") || !strcmp(node->name, "sum_f32") ||
+         !strcmp(node->name, "mean_f32") || !strcmp(node->name, "max_f32") ||
+         !strcmp(node->name, "gpu_alloc_f32") || !strcmp(node->name, "gpu_upload_f32") ||
+         !strcmp(node->name, "gpu_download_f32") || !strcmp(node->name, "gpu_free_resident") ||
+         !strcmp(node->name, "gpu_batch_begin") || !strcmp(node->name, "gpu_batch_end") ||
+         !strcmp(node->name, "matmul_f32_backward"))) return true;
+    for (size_t i = 0; i < node->child_count; i++) {
+        if (ast_contains_gpu(node->children[i])) return true;
+    }
+    return false;
 }
 
 static bool ast_contains_collections(ASTNode *node) {
@@ -1491,10 +1760,15 @@ int main(int argc, char **argv) {
     size_t bench_runs = 10;
     bool opt_vectorize = true;
     bool portable_cpu = false;
+    bool use_isolated_backend = false;
+    bool use_object_emitter = false;
+    bool use_gpu = true;
 
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_binary = argv[++i];
+        } else if (strcmp(argv[i], "--no-gpu") == 0) {
+            use_gpu = false;
         } else if (strcmp(argv[i], "-O0") == 0) {
             opt_vectorize = false;
         } else if (strcmp(argv[i], "-O1") == 0 || strcmp(argv[i], "-O2") == 0 ||
@@ -1531,7 +1805,21 @@ int main(int argc, char **argv) {
             target = TARGET_MACOS_ARM64;
         } else if (strcmp(argv[i], "--target=wasm") == 0 || strcmp(argv[i], "--target=wasm32") == 0) {
             target = TARGET_WASM32;
+        } else if (strcmp(argv[i], "--backend=native") == 0) {
+            use_isolated_backend = true;
+            use_object_emitter = false;
+        } else if (strcmp(argv[i], "--backend=native-object") == 0) {
+            use_isolated_backend = true;
+            use_object_emitter = true;
+        } else if (strcmp(argv[i], "--backend=direct") == 0) {
+            use_isolated_backend = false;
+            use_object_emitter = false;
         }
+    }
+
+    if (use_isolated_backend && target != TARGET_LINUX_X86_64) {
+        fprintf(stderr, "Error: --backend=native currently supports only the Linux x86-64 target\n");
+        return 1;
     }
 
     if (strcmp(command, "bench") == 0 && bench_runs == 0) {
@@ -1544,6 +1832,7 @@ int main(int argc, char **argv) {
     if (!host_supports_avx2()) opt_vectorize = false;
     codegen_set_vectorize(opt_vectorize);
     codegen_set_portable(portable_cpu);
+    codegen_set_gpu_enabled(use_gpu);
 
     CobraProjectConfig project_config;
     if (!discover_project_manifest(source_path, &project_config)) return 1;
@@ -1672,8 +1961,15 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    /* All other native compilation paths use the same ownership/type validation as tests. */
-    if (strcmp(command, "test") != 0) {
+    /* All other native compilation paths use the same ownership/type validation as tests.
+       The isolated backend (--backend=native*) skips this: it runs its own complete,
+       independent verification (bir_build_program's HIR/SSA checks, then mir_verify)
+       over the reparsed user module, and its ownership/type rules are not always
+       identical to the legacy validator's (e.g. freeing an owned slice received as a
+       function parameter is valid there but rejected here), so gating on this pass
+       would reject isolated-backend programs the isolated backend can legitimately
+       compile and verify on its own. */
+    if (strcmp(command, "test") != 0 && !use_isolated_backend) {
         CobraIR compile_ir;
         if (!cobra_ir_build(program, &compile_ir)) {
             free(combined_source);
@@ -1729,7 +2025,9 @@ int main(int argc, char **argv) {
     }
 
     char asm_path[256];
-    if (strstr(output_binary, ".s") || strstr(output_binary, ".wat")) {
+    if (use_object_emitter) {
+        snprintf(asm_path, sizeof(asm_path), "%s.o", output_binary);
+    } else if (strstr(output_binary, ".s") || strstr(output_binary, ".wat")) {
         snprintf(asm_path, sizeof(asm_path), "%s", output_binary);
     } else {
         snprintf(asm_path, sizeof(asm_path), "%s.s", output_binary);
@@ -1765,14 +2063,60 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    if (!codegen_generate_assembly(program, asm_path, target)) {
+    if (use_isolated_backend) {
+        /* The isolated backend covers a narrow language subset and cannot
+           parse the standard library that combined_source always carries.
+           Reparse just the user's own module (imports included, library
+           prelude excluded) so a program that only uses subset features has
+           a real chance to compile; anything still out of scope is rejected
+           below with a diagnostic instead of silently falling back. */
+        CobraSourceBuffer isolated_buffer = {0};
+        CobraModulePaths isolated_module_paths = {0};
+        if (!load_cobra_module(source_path, &project_config, &isolated_module_paths,
+                               &isolated_buffer)) {
+            fprintf(stderr, "Error: --backend=native could not load '%s'\n", source_path);
+            free(isolated_buffer.data);
+            free(combined_source);
+            ast_free(program);
+            return 1;
+        }
+        Parser isolated_parser;
+        parser_init(&isolated_parser, isolated_buffer.data);
+        ASTNode *isolated_program = parser_parse_program(&isolated_parser);
+        if (!annotate_source_locations(isolated_program, &isolated_buffer)) {
+            fprintf(stderr, "Error: --backend=native could not parse '%s'\n", source_path);
+            free(isolated_buffer.data);
+            ast_free(isolated_program);
+            free(combined_source);
+            ast_free(program);
+            return 1;
+        }
+        char bir_err[512] = {0};
+        bool isolated_ok = use_object_emitter
+            ? bir_backend_compile_program_object(isolated_program, source_path, asm_path,
+                                                 bir_err, sizeof(bir_err))
+            : bir_backend_compile_program(isolated_program, source_path, asm_path,
+                                          bir_err, sizeof(bir_err));
+        free(isolated_buffer.data);
+        ast_free(isolated_program);
+        if (!isolated_ok) {
+            fprintf(stderr, "Error: --backend=%s code generation failed: %s\n",
+                    use_object_emitter ? "native-object" : "native",
+                    bir_err[0] ? bir_err : "unknown error");
+            free(combined_source);
+            ast_free(program);
+            return 1;
+        }
+    } else if (!codegen_generate_assembly(program, asm_path, target)) {
         fprintf(stderr, "Error: Code generation failed\n");
         free(combined_source);
         ast_free(program);
         return 1;
     }
 
-    printf("[codegen] Assembly generated: %s\n", asm_path);
+    printf("[codegen] %s generated: %s (%s backend)\n",
+           use_object_emitter ? "Object" : "Assembly", asm_path,
+           use_object_emitter ? "native-object" : use_isolated_backend ? "native" : "direct");
 
     if (strcmp(command, "emit-asm") == 0) {
         free(combined_source);
@@ -1780,16 +2124,54 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    /* The isolated backend's list[T] buffer opcodes call libc malloc/free/
+       memcpy directly and never need runtime/cobra_collections.c, but its
+       dict[K]V opcodes do call into it (cobra_dict_*). Link it in whenever
+       it can be found regardless of backend, but only hard-require it for
+       the direct backend: an isolated-backend program that doesn't actually
+       use dict[K]V would otherwise fail to link outside the Cobra source
+       tree for no reason, and one that does will get a clear "undefined
+       reference to cobra_dict_*" linker error instead of a silent
+       miscompile if the runtime truly can't be found. */
     const char *runtime = (program_has_parallel && target == TARGET_LINUX_X86_64) ? parallel_runtime_path() : NULL;
     const char *collections_runtime = program_has_collections ? collections_runtime_path() : NULL;
+    bool program_has_gpu_kernel = ast_has_gpu_kernel(program);
+    if (program_has_gpu_kernel && !use_gpu) {
+        fprintf(stderr, "[codegen] program defines an @gpu kernel; --no-gpu is incompatible with it\n");
+        free(combined_source);
+        ast_free(program);
+        return 1;
+    }
+    bool program_has_gpu = (use_gpu && ast_contains_gpu(program)) || program_has_gpu_kernel;
+    const char *gpu_runtime = program_has_gpu ? gpu_runtime_path() : NULL;
+    const char *gpu_kernels_file = program_has_gpu_kernel ? build_gpu_kernels_file(program, output_binary) : NULL;
+    if (program_has_gpu_kernel && !gpu_kernels_file) {
+        free(combined_source);
+        ast_free(program);
+        return 1;
+    }
     if (program_has_parallel && target == TARGET_LINUX_X86_64 && !runtime) {
         fprintf(stderr, "[codegen] @parallel runtime not found; set COBRA_LIB_PATH or run from the Cobra source tree\n");
         free(combined_source);
         ast_free(program);
         return 1;
     }
-    if (program_has_collections && !collections_runtime) {
+    if (program_has_collections && !use_isolated_backend && !collections_runtime) {
         fprintf(stderr, "[codegen] collections runtime not found\n");
+        free(combined_source);
+        ast_free(program);
+        return 1;
+    }
+    if (program_has_gpu && !gpu_runtime) {
+        fprintf(stderr, "[codegen] gpu runtime not found; set COBRA_LIB_PATH or run from the Cobra source tree\n");
+        free(combined_source);
+        ast_free(program);
+        return 1;
+    }
+    bool program_has_precision = ast_contains_precision(program);
+    const char *precision_runtime = program_has_precision ? precision_runtime_path() : NULL;
+    if (program_has_precision && !precision_runtime) {
+        fprintf(stderr, "[codegen] precision runtime not found; set COBRA_LIB_PATH or run from the Cobra source tree\n");
         free(combined_source);
         ast_free(program);
         return 1;
@@ -1804,6 +2186,12 @@ int main(int argc, char **argv) {
         build_argv[build_argc++] = "-pthread";
     }
     if (collections_runtime) build_argv[build_argc++] = collections_runtime;
+    if (gpu_runtime) {
+        build_argv[build_argc++] = gpu_runtime;
+        build_argv[build_argc++] = "-ldl";
+    }
+    if (precision_runtime) build_argv[build_argc++] = precision_runtime;
+    if (gpu_kernels_file) build_argv[build_argc++] = gpu_kernels_file;
     build_argc = append_import_libraries(program, build_argv, build_argc, 300);
     if (build_argc < 0) {
         free(combined_source);

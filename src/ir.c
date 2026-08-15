@@ -661,6 +661,43 @@ static bool is_sum_builtin(const char *name) {
            !strcmp(name, "unwrap_err");
 }
 
+static bool is_gpu_builtin(const char *name) {
+    return strcmp(name, "gpu_available") == 0 || strcmp(name, "gpu_device_count") == 0 ||
+           strcmp(name, "gpu_selftest") == 0;
+}
+
+static bool is_gpu_dispatch_builtin(const char *name) {
+    return strcmp(name, "gpu_should_dispatch") == 0;
+}
+
+/* Only meaningful inside an @gpu kernel body (src/gpu_lower.c translates it
+   to gl_GlobalInvocationID.x); type-checked everywhere so ordinary functions
+   get a clear "undefined function" error instead of gpu_index silently
+   type-checking as some other builtin. */
+static bool is_gpu_index_builtin(const char *name) {
+    return strcmp(name, "gpu_index") == 0;
+}
+
+/* GPU-resident buffer lifecycle - allocate/upload/download/free a device
+   buffer that stays on the GPU across many kernel dispatches instead of
+   round-tripping through the host on every call (see runtime/cobra_gpu.c's
+   cobra_gpu_alloc_f32 family and cobra_gpu_run_kernel_resident). */
+static bool is_gpu_resident_alloc_builtin(const char *name) {
+    return strcmp(name, "gpu_alloc_f32") == 0;
+}
+static bool is_gpu_resident_xfer_builtin(const char *name) {
+    return strcmp(name, "gpu_upload_f32") == 0 || strcmp(name, "gpu_download_f32") == 0;
+}
+static bool is_gpu_resident_free_builtin(const char *name) {
+    return strcmp(name, "gpu_free_resident") == 0;
+}
+/* Batches a sequence of resident kernel calls into one CPU<->GPU sync round
+   trip instead of one per call - see cobra_gpu_batch_begin/end in
+   runtime/cobra_gpu.c. */
+static bool is_gpu_batch_builtin(const char *name) {
+    return strcmp(name, "gpu_batch_begin") == 0 || strcmp(name, "gpu_batch_end") == 0;
+}
+
 static bool is_python_aggregate_builtin(const char *name) {
     return strcmp(name, "sum") == 0 || strcmp(name, "min") == 0 ||
            strcmp(name, "max") == 0 || strcmp(name, "any") == 0 ||
@@ -1592,6 +1629,19 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
             CobraTypeKind type = COBRA_TYPE_UNKNOWN;
             IRLocal *local = find_local_entry(ctx, node->name);
             if (!local) {
+                /* A bare identifier that isn't a variable but does name a
+                   top-level function is a function reference: its value is
+                   the function's address (i64), for use with
+                   call_i64_i64/call_f32_f32 (see codegen.c's AST_VAR_REF
+                   fallback and the two indirect-call builtins). This is
+                   deliberately narrow - a raw address plus a fixed calling
+                   convention the caller must get right, not a real closure
+                   or a typed function-pointer system. */
+                ASTNode *fn_ref = find_function(ctx, node->name);
+                if (fn_ref) {
+                    node->value_type = COBRA_TYPE_I64;
+                    return node->value_type;
+                }
                 char message[160];
                 snprintf(message, sizeof(message), "undefined variable '%s'", node->name);
                 ir_error(ctx, node, message);
@@ -2231,6 +2281,25 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                 node->value_type = COBRA_TYPE_VOID;
                 return node->value_type;
             }
+            if (!strcmp(node->name, "matmul_f32_backward")) {
+                /* (a, b, dc, da, db, M, N, K) -> i64; standard matmul
+                   gradient for C[M,N] = A[M,K] @ B[K,N] (see
+                   cobra_gpu_matmul_backward_f32 in runtime/cobra_gpu.c). */
+                if (node->child_count != 8) {
+                    ir_error(ctx, node, "matmul_f32_backward requires (a, b, dc, da, db, M, N, K)");
+                } else {
+                    for (int i = 0; i < 5; i++) {
+                        if (infer_expr(node->children[i], ctx) != COBRA_TYPE_SLICE_F32)
+                            ir_error(ctx, node, "matmul_f32_backward's buffer arguments must be []f32");
+                    }
+                    for (int i = 5; i < 8; i++) {
+                        if (infer_expr(node->children[i], ctx) != COBRA_TYPE_I64)
+                            ir_error(ctx, node, "matmul_f32_backward's M/N/K arguments must be i64");
+                    }
+                }
+                node->value_type = COBRA_TYPE_I64;
+                return node->value_type;
+            }
             if (is_tensor_builtin(node->name)) {
                 validate_tensor_builtin(node, ctx);
             if (strcmp(node->name, "matmul_f32") == 0) {
@@ -2248,6 +2317,218 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                     node->value_type = COBRA_TYPE_F32;
                 }
                 return node->value_type;
+            }
+            if (is_gpu_builtin(node->name)) {
+                if (node->child_count != 0) {
+                    ir_error(ctx, node, "gpu builtins take no arguments");
+                }
+                node->value_type = COBRA_TYPE_I64;
+                return node->value_type;
+            }
+            if (is_gpu_dispatch_builtin(node->name)) {
+                if (node->child_count != 1) {
+                    ir_error(ctx, node, "gpu_should_dispatch requires one i64 element-count argument");
+                } else {
+                    CobraTypeKind arg_type = infer_expr(node->children[0], ctx);
+                    if (arg_type != COBRA_TYPE_I64) {
+                        ir_error(ctx, node, "gpu_should_dispatch requires an i64 element-count argument");
+                    }
+                }
+                node->value_type = COBRA_TYPE_I64;
+                return node->value_type;
+            }
+            if (is_gpu_index_builtin(node->name)) {
+                if (node->child_count != 0) ir_error(ctx, node, "gpu_index takes no arguments");
+                node->value_type = COBRA_TYPE_I64;
+                return node->value_type;
+            }
+            if (is_gpu_resident_alloc_builtin(node->name)) {
+                if (node->child_count != 1 || infer_expr(node->children[0], ctx) != COBRA_TYPE_I64) {
+                    ir_error(ctx, node, "gpu_alloc_f32 requires one i64 element-count argument");
+                }
+                node->value_type = COBRA_TYPE_I64;
+                return node->value_type;
+            }
+            if (is_gpu_resident_xfer_builtin(node->name)) {
+                bool upload = !strcmp(node->name, "gpu_upload_f32");
+                if (node->child_count != 2) {
+                    ir_error(ctx, node, "gpu_upload_f32/gpu_download_f32 require (handle, host_buffer)");
+                } else {
+                    CobraTypeKind handle_type = infer_expr(node->children[0], ctx);
+                    CobraTypeKind buf_type = infer_expr(node->children[1], ctx);
+                    if (handle_type != COBRA_TYPE_I64) ir_error(ctx, node, "the resident handle argument must be i64");
+                    if (buf_type != COBRA_TYPE_SLICE_F32) ir_error(ctx, node, "the host buffer argument must be []f32");
+                    (void)upload;
+                }
+                node->value_type = COBRA_TYPE_I64;
+                return node->value_type;
+            }
+            if (is_gpu_resident_free_builtin(node->name)) {
+                if (node->child_count != 1 || infer_expr(node->children[0], ctx) != COBRA_TYPE_I64) {
+                    ir_error(ctx, node, "gpu_free_resident requires one i64 handle argument");
+                }
+                node->value_type = COBRA_TYPE_I64;
+                return node->value_type;
+            }
+            if (is_gpu_batch_builtin(node->name)) {
+                if (node->child_count != 0) ir_error(ctx, node, "gpu_batch_begin/gpu_batch_end take no arguments");
+                node->value_type = COBRA_TYPE_I64;
+                return node->value_type;
+            }
+            /* Indirect calls through a function reference (a bare function
+               name used as a value - see AST_VAR_REF above). Deliberately
+               narrow: two fixed signatures, no closures, no captured
+               state - the caller is responsible for func_ptr actually
+               pointing at a function matching the chosen signature, same
+               trust model as an inline asm block. This is what lets a
+               struct hold "which kernel to call" as a real value (a
+               `dispatch: i64` field set to `&my_kernel`), enabling a
+               genuine runtime-dispatched Sequential-style layer list
+               instead of hand-written branch-per-layer-kind code. */
+            if (!strcmp(node->name, "call_i64_i64") || !strcmp(node->name, "call_f32_f32")) {
+                bool is_f32 = !strcmp(node->name, "call_f32_f32");
+                if (node->child_count != 2) {
+                    ir_error(ctx, node, "call_i64_i64/call_f32_f32 require (func_ptr, arg)");
+                } else {
+                    if (infer_expr(node->children[0], ctx) != COBRA_TYPE_I64)
+                        ir_error(ctx, node, "the func_ptr argument must be i64 (a function reference)");
+                    CobraTypeKind arg_type = infer_expr(node->children[1], ctx);
+                    CobraTypeKind want = is_f32 ? COBRA_TYPE_F32 : COBRA_TYPE_I64;
+                    if (arg_type != want)
+                        ir_error(ctx, node, is_f32 ? "call_f32_f32's argument must be f32" : "call_i64_i64's argument must be i64");
+                }
+                node->value_type = is_f32 ? COBRA_TYPE_F32 : COBRA_TYPE_I64;
+                return node->value_type;
+            }
+            /* Mixed-precision storage: fp16-pack/unpack an f32 buffer into a
+               []u8 byte buffer (2 bytes per element) for half the memory/
+               disk footprint. Compute stays f32 - see runtime/
+               cobra_precision.c's file header for why. */
+            if (!strcmp(node->name, "pack_f16")) {
+                /* pack_f16(f32_src, u8_dst, count) -> i64 */
+                if (node->child_count != 3) {
+                    ir_error(ctx, node, "pack_f16 requires (f32_src, u8_dst, count)");
+                } else {
+                    if (infer_expr(node->children[0], ctx) != COBRA_TYPE_SLICE_F32) ir_error(ctx, node, "pack_f16's source argument must be []f32");
+                    if (infer_expr(node->children[1], ctx) != COBRA_TYPE_SLICE_U8) ir_error(ctx, node, "pack_f16's destination argument must be []u8");
+                    if (infer_expr(node->children[2], ctx) != COBRA_TYPE_I64) ir_error(ctx, node, "pack_f16's count argument must be i64");
+                }
+                node->value_type = COBRA_TYPE_I64;
+                return node->value_type;
+            }
+            if (!strcmp(node->name, "unpack_f16")) {
+                /* unpack_f16(u8_src, f32_dst, count) -> i64 */
+                if (node->child_count != 3) {
+                    ir_error(ctx, node, "unpack_f16 requires (u8_src, f32_dst, count)");
+                } else {
+                    if (infer_expr(node->children[0], ctx) != COBRA_TYPE_SLICE_U8) ir_error(ctx, node, "unpack_f16's source argument must be []u8");
+                    if (infer_expr(node->children[1], ctx) != COBRA_TYPE_SLICE_F32) ir_error(ctx, node, "unpack_f16's destination argument must be []f32");
+                    if (infer_expr(node->children[2], ctx) != COBRA_TYPE_I64) ir_error(ctx, node, "unpack_f16's count argument must be i64");
+                }
+                node->value_type = COBRA_TYPE_I64;
+                return node->value_type;
+            }
+            /* `<kernel>_gpu(...)` calls a @gpu kernel's resident fast path:
+               buffer parameters take an i64 handle (from gpu_alloc_f32)
+               instead of a []f32 host array, so this is checked separately
+               from an ordinary call to the kernel's own (host) name. */
+            {
+                size_t name_len = strlen(node->name);
+                if (name_len > 4 && !strcmp(node->name + name_len - 4, "_gpu")) {
+                    char base_name[COBRA_MAX_IDENT_LEN];
+                    snprintf(base_name, sizeof(base_name), "%.*s", (int)(name_len - 4), node->name);
+                    ASTNode *kernel = find_function(ctx, base_name);
+                    if (kernel && kernel->target_device == TARGET_DEV_GPU_KERNEL) {
+                        size_t param_i = 0;
+                        for (size_t i = 0; i < kernel->child_count; i++) {
+                            ASTNode *p = kernel->children[i];
+                            if (p->type != AST_PARAM) continue;
+                            if (param_i >= node->child_count) {
+                                ir_error(ctx, node, "too few arguments to resident kernel call");
+                                break;
+                            }
+                            CobraTypeKind arg_type = infer_expr(node->children[param_i], ctx);
+                            bool is_buf = p->declared_type == COBRA_TYPE_SLICE_F32;
+                            if (is_buf && arg_type != COBRA_TYPE_I64) {
+                                ir_error(ctx, node, "resident kernel buffer arguments must be i64 handles (from gpu_alloc_f32)");
+                            } else if (!is_buf && arg_type != p->declared_type) {
+                                ir_error(ctx, node, "resident kernel scalar argument type mismatch");
+                            }
+                            param_i++;
+                        }
+                        if (param_i != node->child_count) {
+                            ir_error(ctx, node, "too many arguments to resident kernel call");
+                        }
+                        node->value_type = COBRA_TYPE_I64;
+                        return node->value_type;
+                    }
+                }
+            }
+            /* `<kernel>_backward(...)` calls the compiler-generated reverse-
+               mode gradient kernel for an elementwise @gpu kernel (see
+               cobra_gpu_lower_backward in gpu_lower.c). Its signature is
+               derived mechanically from the forward kernel's own params -
+               not every forward kernel actually qualifies for autodiff
+               (while loops, non-elementwise indexing, etc. disqualify it),
+               and that eligibility is only known during the later GLSL
+               lowering pass, so an ineligible kernel's `_backward` call
+               type-checks fine here and fails at link time instead
+               ("undefined reference"), which is still a loud compile-time
+               failure, just a later one. */
+            {
+                size_t name_len = strlen(node->name);
+                if (name_len > 9 && !strcmp(node->name + name_len - 9, "_backward")) {
+                    char base_name[COBRA_MAX_IDENT_LEN];
+                    snprintf(base_name, sizeof(base_name), "%.*s", (int)(name_len - 9), node->name);
+                    ASTNode *kernel = find_function(ctx, base_name);
+                    if (kernel && kernel->target_device == TARGET_DEV_GPU_KERNEL) {
+                        int nbuf = 0, nscalar = 0;
+                        for (size_t i = 0; i < kernel->child_count; i++) {
+                            ASTNode *p = kernel->children[i];
+                            if (p->type != AST_PARAM) continue;
+                            if (p->declared_type == COBRA_TYPE_SLICE_F32) nbuf++; else nscalar++;
+                        }
+                        size_t expected = 1 + (size_t)nbuf * 2 + (size_t)nscalar * 2;
+                        if (node->child_count != expected) {
+                            ir_error(ctx, node, "backward kernel call has the wrong argument count "
+                                     "(expected grad_out, original buffers, original scalars, "
+                                     "grad_<buffer> outputs, grad_<scalar>_partial outputs)");
+                        } else {
+                            /* Order matches emit_gpu_backward_call in codegen.c exactly:
+                               grad_out, original buffers, original scalars,
+                               grad_<buffer> outputs, grad_<scalar>_partial outputs. */
+                            size_t idx = 0;
+                            if (infer_expr(node->children[idx], ctx) != COBRA_TYPE_SLICE_F32) {
+                                ir_error(ctx, node, "the grad_out argument must be []f32");
+                            }
+                            idx++;
+                            for (size_t i = 0; i < kernel->child_count; i++) {
+                                ASTNode *p = kernel->children[i];
+                                if (p->type != AST_PARAM || p->declared_type != COBRA_TYPE_SLICE_F32) continue;
+                                if (infer_expr(node->children[idx], ctx) != COBRA_TYPE_SLICE_F32) {
+                                    ir_error(ctx, node, "backward kernel buffer arguments must be []f32");
+                                }
+                                idx++;
+                            }
+                            for (size_t i = 0; i < kernel->child_count; i++) {
+                                ASTNode *p = kernel->children[i];
+                                if (p->type != AST_PARAM || p->declared_type == COBRA_TYPE_SLICE_F32) continue;
+                                if (infer_expr(node->children[idx], ctx) != p->declared_type) {
+                                    ir_error(ctx, node, "backward kernel scalar argument type mismatch");
+                                }
+                                idx++;
+                            }
+                            for (int i = 0; i < nbuf + nscalar; i++) {
+                                if (infer_expr(node->children[idx], ctx) != COBRA_TYPE_SLICE_F32) {
+                                    ir_error(ctx, node, "backward kernel gradient-output arguments must be []f32");
+                                }
+                                idx++;
+                            }
+                        }
+                        node->value_type = COBRA_TYPE_I64;
+                        return node->value_type;
+                    }
+                }
             }
             ASTNode *function = find_function(ctx, node->name);
             if (function) {

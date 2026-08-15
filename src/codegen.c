@@ -31,9 +31,11 @@
    --cpu=portable disables it (see main.c). */
 static bool g_opt_vectorize = true;
 static bool g_portable_cpu = false;
+static bool g_gpu_enabled = true;
 
 void codegen_set_vectorize(bool enabled) { g_opt_vectorize = enabled; }
 void codegen_set_portable(bool enabled) { g_portable_cpu = enabled; }
+void codegen_set_gpu_enabled(bool enabled) { g_gpu_enabled = enabled; }
 
 typedef enum { SYM_SCALAR = 0, SYM_ARRAY, SYM_SLICE, SYM_TENSOR, SYM_F32, SYM_LIST, SYM_DICT, SYM_STRUCT, SYM_BOOL, SYM_OPTION, SYM_RESULT } SymbolKind;
 
@@ -1291,7 +1293,15 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
                 return;
             }
             VarSymbol *s = find_symbol(cg, node->name);
-            if (!s) { fprintf(stderr, "CodeGen Error: Undefined variable '%s'\n", node->name); exit(EXIT_FAILURE); }
+            if (!s) {
+                /* A bare identifier that isn't a local is a function
+                   reference (ir.c already confirmed it names a real
+                   top-level function): its value is the function's address,
+                   for use with call_i64_i64/call_f32_f32. */
+                ASTNode *fn_ref = find_function(cg, node->name);
+                if (fn_ref) { fprintf(cg->out, "    lea rax, [rip+%s]\n", node->name); return; }
+                fprintf(stderr, "CodeGen Error: Undefined variable '%s'\n", node->name); exit(EXIT_FAILURE);
+            }
             if (is_sum_symbol_type(s->type)) fprintf(cg->out, "    lea rax, [rbp-%d]\n", s->tag_offset);
             else if (s->kind == SYM_STRUCT) {
                 if (s->indirect) fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n", s->array_base);
@@ -1516,7 +1526,19 @@ static void emit_fill(CodeGen *cg, ASTNode *n) {
 
 static void emit_relu(CodeGen *cg, ASTNode *n) {
     const char *name = n->children[0]->name; int label = cg->label_count++;
-    emit_load_buffer_ptr(cg, name, "rbx"); emit_load_buffer_len(cg, name, "rcx");
+    /* rbx is callee-saved, so it survives the gpu_* calls below untouched;
+       rcx (the length) is caller-saved and must be reloaded after any call. */
+    emit_load_buffer_ptr(cg, name, "rbx");
+    if (g_gpu_enabled) {
+        int gpu_skip = cg->label_count++;
+        emit_load_buffer_len(cg, name, "rdi");
+        fprintf(cg->out, "    call cobra_gpu_should_dispatch@PLT\n    cmp rax, 0\n    je .Lrelu_gpu_skip_%d\n", gpu_skip);
+        fprintf(cg->out, "    mov rdi, rbx\n");
+        emit_load_buffer_len(cg, name, "rsi");
+        fprintf(cg->out, "    call cobra_gpu_relu_f32@PLT\n    cmp rax, 0\n    jne .Lrelu_done_%d\n", label);
+        fprintf(cg->out, ".Lrelu_gpu_skip_%d:\n", gpu_skip);
+    }
+    emit_load_buffer_len(cg, name, "rcx");
     fprintf(cg->out, "    xor rdx, rdx\n    pxor xmm1, xmm1\n.Lrelu_%d:\n    cmp rdx, rcx\n    jae .Lrelu_done_%d\n    movss xmm0, DWORD PTR [rbx + rdx*4]\n    maxss xmm0, xmm1\n    movss DWORD PTR [rbx + rdx*4], xmm0\n    inc rdx\n    jmp .Lrelu_%d\n.Lrelu_done_%d:\n", label, label, label, label);
 }
 
@@ -1528,9 +1550,36 @@ static void emit_reduce(CodeGen *cg, ASTNode *n, const char *op) {
     int tail = cg->label_count++;
     int done = cg->label_count++;
     bool is_max = !strcmp(op, "max");
+    bool is_mean = !strcmp(op, "mean");
     const char *opv = is_max ? "max" : "add";
+    int end_label = cg->label_count++;
 
     emit_load_buffer_ptr(cg, name, "rbx");
+
+    /* rbx (data pointer) is callee-saved and survives the calls below; rcx
+       (length) is caller-saved and gets reloaded fresh both after the
+       dispatch check and again below for the CPU fallback path. */
+    if (g_gpu_enabled) {
+        int gpu_skip = cg->label_count++;
+        int result_slot = reserve(cg, 8);
+        emit_load_buffer_len(cg, name, "rdi");
+        fprintf(cg->out, "    call cobra_gpu_should_dispatch@PLT\n    cmp rax, 0\n    je .Lreduce_gpu_skip_%d\n", gpu_skip);
+        fprintf(cg->out, "    mov rdi, rbx\n");
+        emit_load_buffer_len(cg, name, "rsi");
+        fprintf(cg->out, "    mov rdx, %d\n    lea rcx, [rbp-%d]\n    call cobra_gpu_reduce_f32@PLT\n    cmp rax, 0\n    je .Lreduce_gpu_skip_%d\n",
+                is_max ? 1 : 0, result_slot, gpu_skip);
+        fprintf(cg->out, "    movss xmm0, DWORD PTR [rbp-%d]\n", result_slot);
+        if (is_mean) {
+            int mean_zero = cg->label_count++;
+            emit_load_buffer_len(cg, name, "rcx");
+            fprintf(cg->out, "    cmp rcx, 0\n    je .Lreduce_gpu_mean_zero_%d\n    cvtsi2ss xmm1, rcx\n    divss xmm0, xmm1\n    jmp .Lreduce_end_%d\n.Lreduce_gpu_mean_zero_%d:\n    xorps xmm0, xmm0\n    jmp .Lreduce_end_%d\n",
+                    mean_zero, end_label, mean_zero, end_label);
+        } else {
+            fprintf(cg->out, "    jmp .Lreduce_end_%d\n", end_label);
+        }
+        fprintf(cg->out, ".Lreduce_gpu_skip_%d:\n", gpu_skip);
+    }
+
     emit_load_buffer_len(cg, name, "rcx");
 
     /* Four independent accumulators break the FP dependency chain the same
@@ -1622,6 +1671,7 @@ static void emit_reduce(CodeGen *cg, ASTNode *n, const char *op) {
                 ".Lmean_done_%d:\n",
                 label, mean_done, label, mean_done);
     }
+    fprintf(cg->out, ".Lreduce_end_%d:\n", end_label);
 }
 
 static void emit_math(CodeGen *cg, ASTNode *n) {
@@ -1860,6 +1910,38 @@ static void emit_gemm(CodeGen *cg, const char *a, const char *b, const char *c, 
     emit_expr(cg, m); fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", COBRA_SCR_M);
     emit_expr(cg, n); fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", COBRA_SCR_N);
     emit_expr(cg, k); fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", COBRA_SCR_K);
+    /* Automatic GPU dispatch: no gpu_* call is required in source. Runtime
+       checks element count against COBRA_GPU_DISPATCH_THRESHOLD and picks
+       whichever GPU cobra_vk_pick_device finds (any Vulkan ICD - AMD, Intel,
+       NVIDIA, Apple via MoltenVK), so this is vendor-neutral by construction.
+       cobra_gpu_matmul_f32 returns 0 on any failure (no device, OOM, driver
+       reject), in which case the AVX2 kernel below runs unchanged - the GPU
+       path is strictly additive and never regresses correctness. The dispatch
+       check must run before any buffer pointer is loaded into r8-r11: those
+       are caller-saved under the SysV ABI, so a call clobbers them. */
+    if (g_gpu_enabled) {
+        int gpu_skip = cg->label_count++;
+        fprintf(cg->out,
+            "    mov rax, QWORD PTR [rbp-%d]\n    imul rax, QWORD PTR [rbp-%d]\n    imul rax, QWORD PTR [rbp-%d]\n"
+            "    mov rdi, rax\n    call cobra_gpu_should_dispatch@PLT\n    cmp rax, 0\n    je .Lmm_gpu_skip_%d\n",
+            COBRA_SCR_M, COBRA_SCR_N, COBRA_SCR_K, gpu_skip);
+        emit_load_buffer_ptr(cg, a, "rdi");
+        emit_load_buffer_ptr(cg, b, "rsi");
+        emit_load_buffer_ptr(cg, c, "rdx");
+        fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    mov r8, QWORD PTR [rbp-%d]\n    mov r9, QWORD PTR [rbp-%d]\n",
+                COBRA_SCR_M, COBRA_SCR_N, COBRA_SCR_K);
+        fprintf(cg->out, "    sub rsp, 16\n");
+        if (add_bias) {
+            emit_load_buffer_ptr(cg, bias, "rax");
+            fprintf(cg->out, "    mov QWORD PTR [rsp], rax\n    mov QWORD PTR [rsp+8], 1\n");
+        } else {
+            fprintf(cg->out, "    mov QWORD PTR [rsp], 0\n    mov QWORD PTR [rsp+8], 0\n");
+        }
+        fprintf(cg->out, "    call cobra_gpu_matmul_f32@PLT\n    add rsp, 16\n    cmp rax, 0\n    jne .Lmm_done_%d\n",
+                label);
+        fprintf(cg->out, ".Lmm_gpu_skip_%d:\n", gpu_skip);
+    }
+
     emit_load_buffer_ptr(cg, a, "r8");
     emit_load_buffer_ptr(cg, b, "r9");
     emit_load_buffer_ptr(cg, c, "r10");
@@ -1938,6 +2020,42 @@ static void emit_gemm(CodeGen *cg, const char *a, const char *b, const char *c, 
     fprintf(cg->out, "    movss DWORD PTR [r10 + rdx*4], xmm0\n    inc QWORD PTR [rbp-%d]\n    jmp .Lmm_j_%d\n.Lmm_next_i_%d:\n    inc QWORD PTR [rbp-%d]\n    jmp .Lmm_i_%d\n.Lmm_done_%d:\n    vzeroupper\n", COBRA_SCR_J, label, label, COBRA_SCR_I, label, label);
 }
 
+/* matmul_f32_backward(a, b, dc, da, db, M, N, K) -> i64. Calls
+   cobra_gpu_matmul_backward_f32(a_ptr, b_ptr, dc_ptr, da_ptr, db_ptr, M, N, K)
+   directly - buffer arguments must be plain variables (same restriction as
+   the @gpu kernel call paths above), M/N/K are ordinary i64 expressions.
+   SysV passes the first 6 args in rdi/rsi/rdx/rcx/r8/r9 and the rest on the
+   stack, so N and K (args 7 and 8) go through a 16-byte-aligned stack push. */
+static void emit_matmul_backward(CodeGen *cg, ASTNode *n) {
+    if (n->child_count != 8) {
+        fprintf(stderr, "CodeGen Error: matmul_f32_backward requires (a, b, dc, da, db, M, N, K)\n");
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < 5; i++) {
+        if (n->children[i]->type != AST_VAR_REF) {
+            fprintf(stderr, "CodeGen Error: matmul_f32_backward's buffer arguments must be plain variables\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+    int scratch = reserve(cg, 8 * 8);
+    static const char *ptr_regs[5] = {"rdi", "rsi", "rdx", "rcx", "r8"};
+    for (int i = 0; i < 5; i++) {
+        emit_load_buffer_ptr(cg, n->children[i]->name, "rax");
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", scratch - 8 * i);
+    }
+    for (int i = 5; i < 8; i++) {
+        emit_expr(cg, n->children[i]);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", scratch - 8 * i);
+    }
+    for (int i = 0; i < 5; i++)
+        fprintf(cg->out, "    mov %s, QWORD PTR [rbp-%d]\n", ptr_regs[i], scratch - 8 * i);
+    fprintf(cg->out, "    mov r9, QWORD PTR [rbp-%d]\n", scratch - 8 * 5); /* M */
+    fprintf(cg->out, "    sub rsp, 16\n");
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rsp], rax\n", scratch - 8 * 6);   /* N */
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rsp+8], rax\n", scratch - 8 * 7); /* K */
+    fprintf(cg->out, "    call cobra_gpu_matmul_backward_f32@PLT\n    add rsp, 16\n");
+}
+
 static void emit_matmul(CodeGen *cg, ASTNode *n) {
     emit_gemm(cg, n->children[0]->name, n->children[1]->name, n->children[2]->name,
               n->children[3], n->children[4], n->children[5], false, NULL);
@@ -1947,8 +2065,305 @@ static void emit_dense(CodeGen *cg, ASTNode *n) {
               n->children[4], n->children[5], n->children[6], true, n->children[2]->name);
 }
 
+/* Calls a user `@gpu` kernel. Its body was lowered to SPIR-V and wrapped in
+   a real C function of the same name by the generated <program>_gpu_kernels.c
+   (see src/gpu_lower.c / main.c), with signature
+   (float **bufs, int64_t *lens, <scalar params in declaration order>) - not
+   Cobra's normal calling convention, so this bypasses the generic argument
+   marshalling below entirely. Buffer parameters may appear in any position
+   and there may be more than one; each buffer argument at the call site
+   must still be a plain variable (arbitrary buffer-valued expressions
+   aren't supported). Scalars beyond 4 int/8 float still silently lose their
+   value (no stack-spill path here yet), matching the pre-existing register
+   budget for the ordinary call path this bypasses. */
+enum { GPU_CALL_MAX_ARGS = 32 };
+
+/* Shared marshalling core for both a direct @gpu kernel call and a
+   `<kernel>_backward` call: both wrappers share the (float **bufs,
+   int64_t *lens, <scalars>) ABI, differing only in which call-site
+   arguments are buffers vs. scalars and what the callee symbol is named. */
+static void emit_gpu_wrapper_call(CodeGen *cg, ASTNode *call, const char *callee_name,
+                                   const bool *arg_is_buffer, const CobraTypeKind *arg_scalar_type,
+                                   int nparams, int nbuf, int nscalar) {
+    for (int i = 0; i < nparams; i++) {
+        if (arg_is_buffer[i] && call->children[i]->type != AST_VAR_REF) {
+            fprintf(stderr, "CodeGen Error: '%s' call must pass buffer arguments as plain variables\n", callee_name);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+    /* Scratch layout: nbuf buffer pointers, nbuf buffer lengths (two
+       parallel arrays the wrapper receives as float** / int64_t*), then one
+       8-byte slot per scalar argument. */
+    int scratch = reserve(cg, 8 * (2 * nbuf + nscalar > 0 ? 2 * nbuf + nscalar : 1));
+    int bufs_base = scratch, lens_base = scratch - 8 * nbuf;
+    int scalar_base = lens_base - 8 * nbuf;
+
+    int buf_idx = 0, scalar_idx = 0;
+    for (int i = 0; i < nparams; i++) {
+        if (arg_is_buffer[i]) {
+            emit_load_buffer_ptr(cg, call->children[i]->name, "rax");
+            fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", bufs_base - 8 * buf_idx);
+            emit_load_buffer_len(cg, call->children[i]->name, "rax");
+            fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", lens_base - 8 * buf_idx);
+            buf_idx++;
+        } else {
+            int slot = scalar_base - 8 * scalar_idx;
+            emit_expr(cg, call->children[i]);
+            if (arg_scalar_type[i] == COBRA_TYPE_F32) {
+                if (!expression_is_float(call->children[i])) fprintf(cg->out, "    cvtsi2ss xmm0, rax\n");
+                fprintf(cg->out, "    movss DWORD PTR [rbp-%d], xmm0\n", slot);
+            } else {
+                fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", slot);
+            }
+            scalar_idx++;
+        }
+    }
+
+    static const char *gp_regs[4] = {"rdx", "rcx", "r8", "r9"};
+    int gp_idx = 0, sse_idx = 0;
+    fprintf(cg->out, "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n", bufs_base, lens_base);
+    scalar_idx = 0;
+    for (int i = 0; i < nparams; i++) {
+        if (arg_is_buffer[i]) continue;
+        int slot = scalar_base - 8 * scalar_idx;
+        if (arg_scalar_type[i] == COBRA_TYPE_F32) {
+            if (sse_idx < 8) fprintf(cg->out, "    movss %s, DWORD PTR [rbp-%d]\n", SYSV_XMM_REGS[sse_idx], slot);
+            sse_idx++;
+        } else {
+            if (gp_idx < 4) fprintf(cg->out, "    mov %s, QWORD PTR [rbp-%d]\n", gp_regs[gp_idx], slot);
+            gp_idx++;
+        }
+        scalar_idx++;
+    }
+    fprintf(cg->out, "    call %s@PLT\n", callee_name);
+}
+
+/* Calls a user `@gpu` kernel. Its body was lowered to SPIR-V and wrapped in
+   a real C function of the same name by the generated <program>_gpu_kernels.c
+   (see src/gpu_lower.c / main.c), with signature
+   (float **bufs, int64_t *lens, <scalar params in declaration order>) - not
+   Cobra's normal calling convention, so this bypasses the generic argument
+   marshalling below entirely. Buffer parameters may appear in any position
+   and there may be more than one; each buffer argument at the call site
+   must still be a plain variable (arbitrary buffer-valued expressions
+   aren't supported). Scalars beyond 4 int/8 float still silently lose their
+   value (no stack-spill path here yet), matching the pre-existing register
+   budget for the ordinary call path this bypasses. */
+static void emit_gpu_kernel_call(CodeGen *cg, ASTNode *call, ASTNode *fn) {
+    bool arg_is_buffer[GPU_CALL_MAX_ARGS];
+    CobraTypeKind arg_scalar_type[GPU_CALL_MAX_ARGS];
+    int nparams = 0, nbuf = 0, nscalar = 0;
+    for (size_t i = 0; i < fn->child_count && nparams < GPU_CALL_MAX_ARGS; i++) {
+        ASTNode *p = fn->children[i];
+        if (p->type != AST_PARAM) continue;
+        bool is_buf = p->declared_type == COBRA_TYPE_SLICE_F32;
+        arg_is_buffer[nparams] = is_buf;
+        arg_scalar_type[nparams] = is_buf ? COBRA_TYPE_UNTYPED : p->declared_type;
+        if (is_buf) nbuf++; else nscalar++;
+        nparams++;
+    }
+    if ((int)call->child_count != nparams) {
+        fprintf(stderr, "CodeGen Error: @gpu kernel '%s' called with %zu arguments, expected %d\n",
+                call->name, call->child_count, nparams);
+        exit(EXIT_FAILURE);
+    }
+    emit_gpu_wrapper_call(cg, call, call->name, arg_is_buffer, arg_scalar_type, nparams, nbuf, nscalar);
+}
+
+/* Calls `<kernel>_backward`, the compiler-generated reverse-mode gradient
+   kernel for an elementwise @gpu kernel (see cobra_gpu_lower_backward in
+   gpu_lower.c). Its ABI is derived mechanically from the forward kernel
+   `fn`'s own params: grad_out, then fn's original buffers, then fn's
+   original scalars, then one grad_<buffer> output per original buffer, then
+   one grad_<scalar>_partial output per original scalar - all buffer-shaped
+   arguments (including the gradient outputs) go through the same
+   (float**, int64_t*) wrapper ABI as a direct kernel call. Whether the
+   wrapper actually exists (the forward kernel might not have qualified for
+   autodiff) is not known here - an ineligible kernel fails at link time
+   with "undefined reference", not here. */
+static void emit_gpu_backward_call(CodeGen *cg, ASTNode *call, ASTNode *fn, const char *backward_name) {
+    bool arg_is_buffer[GPU_CALL_MAX_ARGS];
+    CobraTypeKind arg_scalar_type[GPU_CALL_MAX_ARGS];
+    int nparams = 0, nbuf = 0, nscalar = 0, orig_nbuf = 0, orig_nscalar = 0;
+    for (size_t i = 0; i < fn->child_count; i++) {
+        ASTNode *p = fn->children[i];
+        if (p->type != AST_PARAM) continue;
+        if (p->declared_type == COBRA_TYPE_SLICE_F32) orig_nbuf++; else orig_nscalar++;
+    }
+    /* grad_out */
+    if (nparams < GPU_CALL_MAX_ARGS) { arg_is_buffer[nparams] = true; arg_scalar_type[nparams] = COBRA_TYPE_UNTYPED; nparams++; nbuf++; }
+    /* original buffers (read) */
+    for (int i = 0; i < orig_nbuf && nparams < GPU_CALL_MAX_ARGS; i++) { arg_is_buffer[nparams] = true; arg_scalar_type[nparams] = COBRA_TYPE_UNTYPED; nparams++; nbuf++; }
+    /* original scalars, in declared order/type */
+    for (size_t i = 0; i < fn->child_count && nparams < GPU_CALL_MAX_ARGS; i++) {
+        ASTNode *p = fn->children[i];
+        if (p->type != AST_PARAM || p->declared_type == COBRA_TYPE_SLICE_F32) continue;
+        arg_is_buffer[nparams] = false; arg_scalar_type[nparams] = p->declared_type; nparams++; nscalar++;
+    }
+    /* grad_<buffer> outputs */
+    for (int i = 0; i < orig_nbuf && nparams < GPU_CALL_MAX_ARGS; i++) { arg_is_buffer[nparams] = true; arg_scalar_type[nparams] = COBRA_TYPE_UNTYPED; nparams++; nbuf++; }
+    /* grad_<scalar>_partial outputs */
+    for (int i = 0; i < orig_nscalar && nparams < GPU_CALL_MAX_ARGS; i++) { arg_is_buffer[nparams] = true; arg_scalar_type[nparams] = COBRA_TYPE_UNTYPED; nparams++; nbuf++; }
+
+    if ((int)call->child_count != nparams) {
+        fprintf(stderr, "CodeGen Error: '%s' called with %zu arguments, expected %d\n",
+                backward_name, call->child_count, nparams);
+        exit(EXIT_FAILURE);
+    }
+    emit_gpu_wrapper_call(cg, call, backward_name, arg_is_buffer, arg_scalar_type, nparams, nbuf, nscalar);
+}
+
+/* Calls a @gpu kernel's resident fast path: `<kernel>_gpu(...)`, wrapped by
+   the generated <program>_gpu_kernels.c as
+   (int64_t handle_or_scalar, ...) - every argument is a plain 8-byte scalar
+   (buffer parameters take an i64 handle from gpu_alloc_f32 instead of a
+   []f32 array), so this is ordinary SysV register marshalling with no
+   pointer/length array construction, unlike emit_gpu_kernel_call above. */
+static void emit_gpu_resident_call(CodeGen *cg, ASTNode *call, ASTNode *fn) {
+    enum { GPU_RESIDENT_MAX_ARGS = 16 };
+    CobraTypeKind arg_type[GPU_RESIDENT_MAX_ARGS];
+    int nparams = 0;
+    for (size_t i = 0; i < fn->child_count && nparams < GPU_RESIDENT_MAX_ARGS; i++) {
+        ASTNode *p = fn->children[i];
+        if (p->type != AST_PARAM) continue;
+        arg_type[nparams++] = (p->declared_type == COBRA_TYPE_SLICE_F32) ? COBRA_TYPE_I64 : p->declared_type;
+    }
+    if ((int)call->child_count != nparams) {
+        fprintf(stderr, "CodeGen Error: '%s' called with %zu arguments, expected %d\n", call->name, call->child_count, nparams);
+        exit(EXIT_FAILURE);
+    }
+
+    int base = reserve(cg, 8 * (nparams > 0 ? nparams : 1));
+    for (int i = 0; i < nparams; i++) {
+        int slot = base - 8 * i;
+        emit_expr(cg, call->children[i]);
+        if (arg_type[i] == COBRA_TYPE_F32) {
+            if (!expression_is_float(call->children[i])) fprintf(cg->out, "    cvtsi2ss xmm0, rax\n");
+            fprintf(cg->out, "    movss DWORD PTR [rbp-%d], xmm0\n", slot);
+        } else {
+            fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", slot);
+        }
+    }
+    static const char *gp_regs[6] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
+    int gp_idx = 0, sse_idx = 0;
+    for (int i = 0; i < nparams; i++) {
+        int slot = base - 8 * i;
+        if (arg_type[i] == COBRA_TYPE_F32) {
+            if (sse_idx < 8) fprintf(cg->out, "    movss %s, DWORD PTR [rbp-%d]\n", SYSV_XMM_REGS[sse_idx], slot);
+            sse_idx++;
+        } else {
+            if (gp_idx < 6) fprintf(cg->out, "    mov %s, QWORD PTR [rbp-%d]\n", gp_regs[gp_idx], slot);
+            gp_idx++;
+        }
+    }
+    fprintf(cg->out, "    call %s@PLT\n", call->name);
+}
+
 static void emit_call(CodeGen *cg, ASTNode *n) {
     if (is_region_alloc(cg, n)) { emit_region_alloc(cg, n); return; }
+    {
+        ASTNode *gpu_fn = find_function(cg, n->name);
+        if (gpu_fn && gpu_fn->target_device == TARGET_DEV_GPU_KERNEL) { emit_gpu_kernel_call(cg, n, gpu_fn); return; }
+    }
+    {
+        size_t name_len = strlen(n->name);
+        if (name_len > 4 && !strcmp(n->name + name_len - 4, "_gpu")) {
+            char base_name[COBRA_MAX_IDENT_LEN];
+            snprintf(base_name, sizeof(base_name), "%.*s", (int)(name_len - 4), n->name);
+            ASTNode *kernel = find_function(cg, base_name);
+            if (kernel && kernel->target_device == TARGET_DEV_GPU_KERNEL) { emit_gpu_resident_call(cg, n, kernel); return; }
+        }
+    }
+    {
+        size_t name_len = strlen(n->name);
+        if (name_len > 9 && !strcmp(n->name + name_len - 9, "_backward")) {
+            char base_name[COBRA_MAX_IDENT_LEN];
+            snprintf(base_name, sizeof(base_name), "%.*s", (int)(name_len - 9), n->name);
+            ASTNode *kernel = find_function(cg, base_name);
+            if (kernel && kernel->target_device == TARGET_DEV_GPU_KERNEL) { emit_gpu_backward_call(cg, n, kernel, n->name); return; }
+        }
+    }
+    if (!strcmp(n->name, "gpu_alloc_f32")) {
+        emit_expr(cg, n->children[0]);
+        fprintf(cg->out, "    mov rdi, rax\n    call cobra_gpu_alloc_f32@PLT\n");
+        return;
+    }
+    if (!strcmp(n->name, "gpu_upload_f32") || !strcmp(n->name, "gpu_download_f32")) {
+        bool upload = !strcmp(n->name, "gpu_upload_f32");
+        int handle_slot = reserve(cg, 8);
+        emit_expr(cg, n->children[0]);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", handle_slot);
+        const char *buf_name = n->children[1]->name;
+        if (upload) {
+            fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n", handle_slot);
+            emit_load_buffer_ptr(cg, buf_name, "rsi");
+            emit_load_buffer_len(cg, buf_name, "rdx");
+            fprintf(cg->out, "    call cobra_gpu_upload_f32@PLT\n");
+        } else {
+            fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n", handle_slot);
+            emit_load_buffer_ptr(cg, buf_name, "rsi");
+            emit_load_buffer_len(cg, buf_name, "rdx");
+            fprintf(cg->out, "    call cobra_gpu_download_f32@PLT\n");
+        }
+        return;
+    }
+    if (!strcmp(n->name, "gpu_free_resident")) {
+        emit_expr(cg, n->children[0]);
+        fprintf(cg->out, "    mov rdi, rax\n    call cobra_gpu_free_resident@PLT\n");
+        return;
+    }
+    if (!strcmp(n->name, "gpu_batch_begin") || !strcmp(n->name, "gpu_batch_end")) {
+        fprintf(cg->out, "    call cobra_%s@PLT\n", n->name);
+        return;
+    }
+    if (!strcmp(n->name, "call_i64_i64") || !strcmp(n->name, "call_f32_f32")) {
+        /* Indirect call through a function-reference value (see ir.c's
+           AST_VAR_REF fallback: a bare function name evaluates to its
+           address). The target address is stashed on the stack (not kept
+           in a register) across evaluating the arg expression, which may
+           itself contain calls that clobber any register; it's reloaded
+           into r10 (caller-saved, not a SysV argument register) right
+           before the indirect `call r10`. */
+        bool is_f32 = !strcmp(n->name, "call_f32_f32");
+        int ptr_slot = reserve(cg, 8);
+        emit_expr(cg, n->children[0]);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", ptr_slot);
+        emit_expr(cg, n->children[1]);
+        if (!is_f32) fprintf(cg->out, "    mov rdi, rax\n");
+        fprintf(cg->out, "    mov r10, QWORD PTR [rbp-%d]\n    call r10\n", ptr_slot);
+        return;
+    }
+    if (!strcmp(n->name, "pack_f16") || !strcmp(n->name, "unpack_f16")) {
+        /* pack_f16(f32_src, u8_dst, count) / unpack_f16(u8_src, f32_dst, count)
+           -> cobra_pack_f16/cobra_unpack_f16(src_ptr, dst_ptr, count). Both
+           buffer arguments must be plain variables (same restriction as the
+           other buffer-consuming builtins in this file). */
+        if (n->child_count != 3 || n->children[0]->type != AST_VAR_REF || n->children[1]->type != AST_VAR_REF) {
+            fprintf(stderr, "CodeGen Error: %s requires (buffer, buffer, count) with plain-variable buffers\n", n->name);
+            exit(EXIT_FAILURE);
+        }
+        int count_slot = reserve(cg, 8);
+        emit_expr(cg, n->children[2]);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", count_slot);
+        emit_load_buffer_ptr(cg, n->children[0]->name, "rdi");
+        emit_load_buffer_ptr(cg, n->children[1]->name, "rsi");
+        fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n    call cobra_%s@PLT\n",
+                count_slot, n->name);
+        return;
+    }
+    if (!strcmp(n->name, "gpu_available") || !strcmp(n->name, "gpu_device_count") ||
+        !strcmp(n->name, "gpu_selftest")) {
+        if (!g_gpu_enabled) { fprintf(cg->out, "    xor eax, eax\n"); return; }
+        fprintf(cg->out, "    call cobra_%s@PLT\n", n->name);
+        return;
+    }
+    if (!strcmp(n->name, "gpu_should_dispatch")) {
+        if (!g_gpu_enabled || n->child_count != 1) { fprintf(cg->out, "    xor eax, eax\n"); return; }
+        emit_expr(cg, n->children[0]);
+        fprintf(cg->out, "    mov rdi, rax\n    call cobra_gpu_should_dispatch@PLT\n");
+        return;
+    }
     if (!strcmp(n->name, "concat")) { emit_string_concat(cg, n); return; }
     if (!strcmp(n->name, "some") || !strcmp(n->name, "none") ||
         !strcmp(n->name, "ok") || !strcmp(n->name, "err")) {
@@ -2091,6 +2506,7 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
     if (!strcmp(n->name, "max_f32")) { emit_reduce(cg, n, "max"); return; }
     if (!strcmp(n->name, "dense_f32")) { emit_dense(cg, n); return; }
     if (!strcmp(n->name, "matmul_f32")) { emit_matmul(cg, n); return; }
+    if (!strcmp(n->name, "matmul_f32_backward")) { emit_matmul_backward(cg, n); return; }
     if (!strcmp(n->name, "exp_f32") || !strcmp(n->name, "sqrt_f32") || !strcmp(n->name, "tanh_f32") || !strcmp(n->name, "log_f32") || !strcmp(n->name, "pow_f32")) { emit_math(cg, n); return; }
     if (!strcmp(n->name, "free")) {
         if (n->child_count && n->children[0]->type == AST_VAR_REF) {
@@ -2908,6 +3324,28 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             }
             if (n->child_count == 0) return;
             ASTNode *v = n->children[0];
+            {
+                /* Reassigning an existing struct local (`b = a`, no `: Type`
+                   annotation - that's the declared_type==STRUCT case above)
+                   is a whole-value member-wise copy, not a pointer store.
+                   Falling through to the generic scalar path below would
+                   overwrite the destination's first 8 bytes with the
+                   source's address instead of copying its fields. */
+                VarSymbol *existing_struct = find_symbol(cg, n->name);
+                if (existing_struct && existing_struct->kind == SYM_STRUCT &&
+                    (v->type == AST_VAR_REF ||
+                     (v->type == AST_MEMBER_ACCESS && v->value_type == COBRA_TYPE_STRUCT))) {
+                    int size = struct_storage_size(cg, existing_struct->type_name);
+                    emit_struct_address(cg, v);
+                    fprintf(cg->out, "    mov rsi, rax\n");
+                    if (existing_struct->indirect)
+                        fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n", existing_struct->array_base);
+                    else
+                        fprintf(cg->out, "    lea rdi, [rbp-%d]\n", existing_struct->array_base);
+                    emit_copy_memory(cg, "rsi", "rdi", size);
+                    return;
+                }
+            }
             CobraTypeKind sum_type = n->declared_type;
             if (sum_type != COBRA_TYPE_OPTION && sum_type != COBRA_TYPE_RESULT &&
                 (v->value_type == COBRA_TYPE_OPTION || v->value_type == COBRA_TYPE_RESULT))
@@ -3476,6 +3914,7 @@ static bool generate(ASTNode *root, const char *path, TargetPlatform target, boo
     fputs(".text", f);
     fputc(10, f);
     for (size_t i = 0; i < root->child_count; i++) { ASTNode *fn = root->children[i];        if (fn->type == AST_FUNCTION && fn->generic_param_count == 0 &&
+            fn->target_device != TARGET_DEV_GPU_KERNEL &&
             !(test_mode && !strncmp(fn->name, "main", 4)) &&
             (!g_portable_cpu || !codegen_is_nn_function(fn) ||
              codegen_nn_function_is_reachable(root, fn)))

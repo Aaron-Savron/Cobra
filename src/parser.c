@@ -1326,6 +1326,7 @@ static ASTNode *parse_function(Parser *parser) {
     expect(parser, TOKEN_IDENTIFIER, "Expected function name");
 
     ASTNode *fn_node = parser_create_node_at(parser, AST_FUNCTION, fn_name, function_token);
+    if (parser->gpu_directive_active) fn_node->target_device = TARGET_DEV_GPU_KERNEL;
 
     size_t previous_generic_count = parser->generic_param_count;
     parser->generic_param_count = 0;
@@ -1455,6 +1456,16 @@ ASTNode *parser_parse_program(Parser *parser) {
     cobra_type_arena_init(root->canonical_arena);
     parser->canonical_arena = root->canonical_arena;
     while (!match(parser, TOKEN_EOF)) {
+        if (match(parser, TOKEN_GPU_DIRECTIVE)) {
+            advance_token(parser);
+            parser->gpu_directive_active = true;
+            continue;
+        }
+        if (match(parser, TOKEN_CPU_DIRECTIVE)) {
+            advance_token(parser);
+            parser->gpu_directive_active = false;
+            continue;
+        }
         if (match(parser, TOKEN_UNKNOWN)) {
             fprintf(stderr, "%s:%d:%d: error: unexpected token '%s'\n",
                     parser->source_file, parser->current_token.line, parser->current_token.col, parser->current_token.text);
