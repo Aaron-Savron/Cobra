@@ -252,6 +252,7 @@ A match without `else` must cover every variant. An `else` arm handles the remai
 | `len` | Built-in byte/array length operator |
 | `string` | Immutable native NUL-terminated byte string passed as one pointer |
 | `concat` | Allocate an owned string containing two strings joined together |
+| `string_from_bytes` | Allocate an owned string by copying `len` bytes out of a `[]u8` buffer |
 | `starts_with` / `ends_with` / `contains` | Native string predicates returning integer booleans |
 | `char_at` | Bounds-checked byte lookup |
 | `string_free` | Release an owned concatenated string |
@@ -437,7 +438,7 @@ for index, value in enumerate(values): {
 
 ## Native strings
 
-Strings are immutable NUL-terminated byte strings represented by one native pointer. Literals and typed `string` parameters/returns use the ordinary GPR ABI without a hidden object header. `+` and `concat(a, b)` allocate a new owned string; comparisons are lexicographic; `starts_with`, `ends_with`, and `contains` return integer booleans; `char_at` returns a byte and traps on invalid indexes. Release concatenated or functions proven to return fresh concatenation storage with `string_free`; literals and borrowed forwarded values are not owned. Source escapes decode `\\n`, `\\r`, `\\t`, `\\\\`, and `\\\"`.
+Strings are immutable NUL-terminated byte strings represented by one native pointer. Literals and typed `string` parameters/returns use the ordinary GPR ABI without a hidden object header. `+` and `concat(a, b)` allocate a new owned string; comparisons are lexicographic; `starts_with`, `ends_with`, and `contains` return integer booleans; `char_at` returns a byte and traps on invalid indexes. Release concatenated or functions proven to return fresh concatenation storage with `string_free`; literals and borrowed forwarded values are not owned. `string_from_bytes(buf, len)` allocates and copies `len` bytes out of a `[]u8` buffer plus a NUL terminator, producing an owned string usable anywhere a string is (including as a `dict[string]...` key) from runtime-derived data such as parsed input or file contents, not just source literals and concatenation. Source escapes decode `\\n`, `\\r`, `\\t`, `\\\\`, and `\\\"`.
 
 See `docs/STRING_FOUNDATION.md` and `examples/31_string_foundation.cb`.
 
