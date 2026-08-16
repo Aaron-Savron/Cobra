@@ -1685,6 +1685,11 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
                     fprintf(cg->out, "    cmp rbx, 0\n    je .Ldiv_zero_%d\n    cqo\n    idiv rbx\n    jmp .Ldiv_done_%d\n.Ldiv_zero_%d:\n", fail, fail, fail);
                     emit_failure_at(cg, node, "division by zero");
                     fprintf(cg->out, ".Ldiv_done_%d:\n", fail);
+                } else if (!strcmp(node->name, "%")) {
+                    int fail = cg->label_count++;
+                    fprintf(cg->out, "    cmp rbx, 0\n    je .Lmod_zero_%d\n    cqo\n    idiv rbx\n    mov rax, rdx\n    jmp .Lmod_done_%d\n.Lmod_zero_%d:\n", fail, fail, fail);
+                    emit_failure_at(cg, node, "modulo by zero");
+                    fprintf(cg->out, ".Lmod_done_%d:\n", fail);
                 } else { fprintf(cg->out, "    cmp rax, rbx\n"); const char *set = !strcmp(node->name, "==") ? "sete" : !strcmp(node->name, "!=") ? "setne" : !strcmp(node->name, "<") ? "setl" : !strcmp(node->name, ">") ? "setg" : !strcmp(node->name, "<=") ? "setle" : "setge"; fprintf(cg->out, "    %s al\n    movzx eax, al\n", set); }
                 fprintf(cg->out, "    pop rbx\n");
             }
@@ -3539,7 +3544,25 @@ static bool try_emit_parallel(CodeGen *cg, ASTNode *n) {
     }
     if (!source || !par_buffer_ok(cg, source)) return false;
     ASTNode *body = loop->children[1];
-    if (body->type != AST_PROGRAM || !vec_body_pure(cg, body, loop->name)) return false;
+    if (body->type != AST_PROGRAM || !vec_body_pure(cg, body, loop->name)) {
+        if (body && body->type == AST_PROGRAM) {
+            for (size_t i = 0; i < body->child_count; i++) {
+                ASTNode *s = body->children[i];
+                if (s->type == AST_FOR_LOOP || s->type == AST_WHILE_STMT) {
+                    if (s->source_file[0] && s->source_line > 0) {
+                        fprintf(stderr, "%s:%d: note: @parallel loop body contains a nested loop and will run sequentially "
+                                        "(nested loops inside @parallel are not currently parallelized)\n",
+                                s->source_file, s->source_line);
+                    } else {
+                        fprintf(stderr, "note: @parallel loop body contains a nested loop and will run sequentially "
+                                        "(nested loops inside @parallel are not currently parallelized)\n");
+                    }
+                    break;
+                }
+            }
+        }
+        return false;
+    }
 
     ParCapture bufs[PAR_MAX_CAPTURES];
     ParCapture scals[PAR_MAX_CAPTURES];
