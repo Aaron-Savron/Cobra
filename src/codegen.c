@@ -3572,6 +3572,11 @@ static void par_collect(CodeGen *cg, ASTNode *node, const char *loop_var,
             }
             return;
         case AST_ARRAY_INDEX:
+        /* AST_INDEX_ASSIGN stores its target buffer's name directly on the
+           node itself, not as an AST_ARRAY_INDEX child, so a write to a
+           different buffer than the loop's own iteration source needs the
+           same capture here or the worker function never declares it. */
+        case AST_INDEX_ASSIGN:
             if (par_buffer_ok(cg, node->name)) {
                 bool seen = false;
                 for (int i = 0; i < *nb; i++)
@@ -3589,12 +3594,13 @@ static void par_collect(CodeGen *cg, ASTNode *node, const char *loop_var,
         par_collect(cg, node->children[i], loop_var, bufs, nb, scals, ns, depth + 1);
 }
 
-static bool try_emit_parallel(CodeGen *cg, ASTNode *n) {
+/* Shared by both the explicit `@parallel:` block and automatic detection
+   on a bare `for i in len(buf):` loop. `report_nested_note` is only true
+   for the explicit form, since printing a fallback note for every ordinary
+   nested-loop `for` loop in a program that never asked for parallelism
+   would be noise, not a diagnostic. */
+static bool try_emit_parallel_loop(CodeGen *cg, ASTNode *loop, bool report_nested_note) {
     if (!cg->opt_vectorize || cg->target != TARGET_LINUX_X86_64) return false;
-    if (!n || n->child_count != 1) return false;
-    ASTNode *block = n->children[0];
-    if (!block || block->type != AST_PROGRAM || block->child_count != 1) return false;
-    ASTNode *loop = block->children[0];
     if (loop->type != AST_FOR_LOOP || loop->child_count < 2) return false;
     ASTNode *target = loop->children[0];
     const char *source = NULL;
@@ -3610,7 +3616,7 @@ static bool try_emit_parallel(CodeGen *cg, ASTNode *n) {
     if (!source || !par_buffer_ok(cg, source)) return false;
     ASTNode *body = loop->children[1];
     if (body->type != AST_PROGRAM || !vec_body_pure(cg, body, loop->name)) {
-        if (body && body->type == AST_PROGRAM) {
+        if (report_nested_note && body && body->type == AST_PROGRAM) {
             for (size_t i = 0; i < body->child_count; i++) {
                 ASTNode *s = body->children[i];
                 if (s->type == AST_FOR_LOOP || s->type == AST_WHILE_STMT) {
@@ -3711,6 +3717,14 @@ static void flush_pending_parallel(CodeGen *cg) {
     cg->pending_parallel_count = 0;
 }
 
+/* Explicit `@parallel: { for ... }` block form. */
+static bool try_emit_parallel(CodeGen *cg, ASTNode *n) {
+    if (!n || n->child_count != 1) return false;
+    ASTNode *block = n->children[0];
+    if (!block || block->type != AST_PROGRAM || block->child_count != 1) return false;
+    return try_emit_parallel_loop(cg, block->children[0], true);
+}
+
 static void emit_loop_owned_cleanup(CodeGen *cg, ASTNode *body);
 
 static void emit_for(CodeGen *cg, ASTNode *n) {
@@ -3723,6 +3737,22 @@ static void emit_for(CodeGen *cg, ASTNode *n) {
         (is_enumerate && target->child_count && target->children[0]->type == AST_VAR_REF ?
          target->children[0]->name : (element ? target->name : NULL)) : NULL;
     int step = 0;
+
+    /* Automatic multi-core dispatch: a bare `for i in len(values):` loop
+       that passes the exact same index-purity proof required inside an
+       explicit `@parallel:` block is dispatched to the worker pool without
+       needing the annotation. The runtime threshold in cobra_parallel_for
+       already falls back to inline sequential execution of the same
+       vectorized body for small ranges, so this is safe to attempt
+       unconditionally: eligible loops only ever get faster or unchanged,
+       never a behavior change, since the proof forbids captures, calls,
+       reductions, and nested loops, and each worker only ever writes the
+       indices in its own disjoint chunk. */
+    if (target && (target->type == AST_LEN_EXPR ||
+                   (target->type == AST_FUNC_CALL && !strcmp(target->name, "range"))) &&
+        try_emit_parallel_loop(cg, n, false)) {
+        return;
+    }
 
     /* User-loop auto-vectorization: an index-pure `for i in len(values):`
        over f32 buffers lowers straight to AVX2 with a scalar tail. */

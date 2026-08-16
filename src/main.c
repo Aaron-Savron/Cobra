@@ -862,9 +862,26 @@ static bool ast_contains_compute(ASTNode *node) {
     return false;
 }
 
+/* A bare `for i in len(x):` or `for i in range(len(x)):` loop is now
+   auto-dispatched to the parallel worker pool by codegen when its body
+   proves index-pure over an f32 buffer, without needing an explicit
+   `@parallel:` block. This walk has no type information, so it can't
+   confirm f32-ness the way codegen does; it over-approximates on loop
+   shape alone, which only ever costs linking the (pthread-only, no heavy
+   deps) parallel runtime for a program that turns out not to need it. */
+static bool ast_for_loop_could_auto_parallelize(ASTNode *node) {
+    if (node->type != AST_FOR_LOOP || node->child_count < 1) return false;
+    ASTNode *target = node->children[0];
+    if (target->type == AST_LEN_EXPR) return true;
+    if (target->type == AST_FUNC_CALL && !strcmp(target->name, "range") &&
+        target->child_count == 1 && target->children[0]->type == AST_LEN_EXPR) return true;
+    return false;
+}
+
 static bool ast_contains_parallel(ASTNode *node) {
     if (!node) return false;
     if (node->type == AST_PARALLEL_BLOCK) return true;
+    if (ast_for_loop_could_auto_parallelize(node)) return true;
     for (size_t i = 0; i < node->child_count; i++) {
         if (ast_contains_parallel(node->children[i])) return true;
     }

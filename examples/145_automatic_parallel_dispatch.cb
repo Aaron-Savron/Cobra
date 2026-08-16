@@ -1,0 +1,53 @@
+# A plain `for i in len(buf):` loop over f32 buffers that passes the same
+# index-purity proof required inside an explicit @parallel: block is now
+# dispatched to the worker pool automatically, with no annotation needed.
+# The runtime's own size threshold falls back to sequential execution of
+# the same vectorized body for small ranges, so this is purely additive:
+# eligible loops only get faster, correctness is unchanged either way.
+
+def square_in_place(values: []f32): {
+    for i in len(values): {
+        values[i] = values[i] * values[i]
+    }
+}
+
+def scale_into(src: []f32, dst: []f32, factor: f32): {
+    for i in len(src): {
+        dst[i] = src[i] * factor
+    }
+}
+
+def test_auto_parallel_in_place(): {
+    n = 4096
+    values = alloc_f32(n)
+    fill_f32(values, 3.0)
+    square_in_place(values)
+    assert(values[0] == 9.0)
+    assert(values[n - 1] == 9.0)
+    return 0
+}
+
+def test_auto_parallel_cross_buffer(): {
+    n = 4096
+    src = alloc_f32(n)
+    dst = alloc_f32(n)
+    fill_f32(src, 2.0)
+    scale_into(src, dst, 5.0)
+    assert(dst[0] == 10.0)
+    assert(dst[n - 1] == 10.0)
+    return 0
+}
+
+def test_auto_parallel_small_range_still_correct(): {
+    n = 8
+    values = alloc_f32(n)
+    fill_f32(values, 4.0)
+    square_in_place(values)
+    assert(values[0] == 16.0)
+    assert(values[n - 1] == 16.0)
+    return 0
+}
+
+def main(): {
+    print(1)
+}

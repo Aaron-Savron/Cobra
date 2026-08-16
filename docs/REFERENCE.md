@@ -532,6 +532,8 @@ On Linux x86_64, a proven `@parallel` loop is lowered to a standalone worker fun
 
 `@parallel` is therefore complementary rather than mandatory: users can write ordinary Cobra model code and libraries, use automatic SIMD when one core is enough, and keep the multi-core annotation ready for large independent element-wise stages. `examples/27_parallel_kernels.cb` covers the small-range fallback and the large worker path.
 
+A bare `for i in len(values):` loop that passes the same index-purity proof is now dispatched to the worker pool automatically, without writing `@parallel:` at all. The explicit annotation still works exactly as before and is the only form that prints the nested-loop fallback note; automatic detection stays silent on ineligible loops since most ordinary loops were never asking to be parallelized. The runtime's existing size threshold means this is purely additive: an eligible loop only ever runs faster or the same, never differently, since the underlying proof and dispatch mechanism are identical either way. `examples/145_automatic_parallel_dispatch.cb` covers in-place and cross-buffer automatic dispatch.
+
 ## Neural Network Reference Library (lib/nn.cb)
 
 `lib/nn.cb` is auto-prepended to every program after `lib/std.cb` by the same mechanism that makes the standard library available: model math is always in scope, with no import syntax and zero runtime library. Every function in it is ordinary Cobra code composed from the native AVX2 builtins (`matmul_f32`, `dense_f32`, reductions), the libm intrinsics, and auto-vectorized user loops:
