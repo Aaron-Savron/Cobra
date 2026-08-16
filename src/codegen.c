@@ -3653,6 +3653,41 @@ static void par_collect(CodeGen *cg, ASTNode *node, const char *loop_var,
         par_collect(cg, node->children[i], loop_var, bufs, nb, scals, ns, depth + 1);
 }
 
+static void par_report_note(ASTNode *loc, const char *reason) {
+    if (loc && loc->source_file[0] && loc->source_line > 0) {
+        fprintf(stderr, "%s:%d: note: @parallel loop %s and will run sequentially\n",
+                loc->source_file, loc->source_line, reason);
+    } else {
+        fprintf(stderr, "note: @parallel loop %s and will run sequentially\n", reason);
+    }
+}
+
+static bool par_body_contains_call(ASTNode *node) {
+    if (!node) return false;
+    if (node->type == AST_FUNC_CALL) return true;
+    for (size_t i = 0; i < node->child_count; i++)
+        if (par_body_contains_call(node->children[i])) return true;
+    return false;
+}
+
+/* A reduction assigns a scalar from an expression that itself reads that
+   same scalar, accumulating a result across iterations (e.g. `sum = sum +
+   buf[i]`) - the classic pattern the elementwise lowering cannot express. */
+static bool par_body_contains_reduction(ASTNode *body) {
+    if (!body || body->type != AST_PROGRAM) return false;
+    for (size_t i = 0; i < body->child_count; i++) {
+        ASTNode *s = body->children[i];
+        if (s->type != AST_ASSIGN || s->child_count != 1) continue;
+        ASTNode *rhs = s->children[0];
+        if (!rhs || rhs->type != AST_BINARY_OP) continue;
+        for (size_t j = 0; j < rhs->child_count; j++) {
+            ASTNode *operand = rhs->children[j];
+            if (operand && operand->type == AST_VAR_REF && !strcmp(operand->name, s->name)) return true;
+        }
+    }
+    return false;
+}
+
 /* Shared by both the explicit `@parallel:` block and automatic detection
    on a bare `for i in len(buf):` loop. `report_nested_note` is only true
    for the explicit form, since printing a fallback note for every ordinary
@@ -3672,10 +3707,16 @@ static bool try_emit_parallel_loop(CodeGen *cg, ASTNode *loop, bool report_neste
                target->children[0]->children[0]->type == AST_VAR_REF) {
         source = target->children[0]->children[0]->name;
     }
-    if (!source || !par_buffer_ok(cg, source)) return false;
+    if (!source || !par_buffer_ok(cg, source)) {
+        if (report_nested_note && source && find_symbol(cg, source)) {
+            par_report_note(loop, "does not iterate a []f32 buffer (non-f32 ranges are not currently parallelized)");
+        }
+        return false;
+    }
     ASTNode *body = loop->children[1];
     if (body->type != AST_PROGRAM || !vec_body_pure(cg, body, loop->name)) {
         if (report_nested_note && body && body->type == AST_PROGRAM) {
+            bool reported = false;
             for (size_t i = 0; i < body->child_count; i++) {
                 ASTNode *s = body->children[i];
                 if (s->type == AST_FOR_LOOP || s->type == AST_WHILE_STMT) {
@@ -3687,8 +3728,20 @@ static bool try_emit_parallel_loop(CodeGen *cg, ASTNode *loop, bool report_neste
                         fprintf(stderr, "note: @parallel loop body contains a nested loop and will run sequentially "
                                         "(nested loops inside @parallel are not currently parallelized)\n");
                     }
+                    reported = true;
                     break;
                 }
+            }
+            if (!reported && par_body_contains_call(body)) {
+                par_report_note(loop, "calls a function (calls are not currently parallelized)");
+                reported = true;
+            }
+            if (!reported && par_body_contains_reduction(body)) {
+                par_report_note(loop, "performs a reduction (reductions are not currently parallelized)");
+                reported = true;
+            }
+            if (!reported) {
+                par_report_note(loop, "is not a supported elementwise pattern");
             }
         }
         return false;
@@ -3699,7 +3752,12 @@ static bool try_emit_parallel_loop(CodeGen *cg, ASTNode *loop, bool report_neste
     int nb = 0, ns = 0;
     snprintf(bufs[nb++].name, sizeof(bufs[0].name), "%.63s", source);
     par_collect(cg, body, loop->name, bufs, &nb, scals, &ns, 0);
-    if (nb > PAR_MAX_CAPTURES || ns > PAR_MAX_CAPTURES) return false;
+    if (nb > PAR_MAX_CAPTURES || ns > PAR_MAX_CAPTURES) {
+        if (report_nested_note) {
+            par_report_note(loop, "captures too many distinct buffers or scalars (hidden scalar captures are limited)");
+        }
+        return false;
+    }
     if (cg->pending_parallel_count >= 16) return false;
 
     int worker = cg->label_count++;
