@@ -233,7 +233,7 @@ match phase: {
 }
 ```
 
-A match without `else` must cover every variant. An `else` arm handles the remaining variants. Duplicate cases, unknown variants, mixed enum types, and non-exhaustive matches are rejected before assembly generation. Payload-carrying enums are a later milestone; this first form is intentionally a small, direct foundation for state machines and structured application errors. See `examples/60_enum_match.cb`.
+A match without `else` must cover every variant. An `else` arm handles the remaining variants. Duplicate cases, unknown variants, mixed enum types, and non-exhaustive matches are rejected before assembly generation. Each arm gets its own local scope, the same as an `if`/`else` branch, so two arms may each declare a local with the same name without colliding. Payload-carrying enums are a later milestone; this first form is intentionally a small, direct foundation for state machines and structured application errors. See `examples/60_enum_match.cb` and `examples/149_match_arm_scoping.cb`.
 
 ## Language Keywords
 

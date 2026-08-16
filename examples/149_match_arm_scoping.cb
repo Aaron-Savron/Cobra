@@ -1,0 +1,46 @@
+enum Phase: {
+    Idle,
+    Running,
+    Failed = 7,
+}
+
+def score_with_shadowed_local(phase: Phase) -> i64: {
+    match phase: {
+        case Phase.Idle: {
+            let value: i64 = 10
+            return value
+        }
+        case Phase.Running: {
+            let value: i64 = 20
+            return value
+        }
+        case Phase.Failed: {
+            let value: i64 = 30
+            return value
+        }
+    }
+    return -1
+}
+
+def score_with_else_shadow(phase: Phase) -> i64: {
+    match phase: {
+        case Phase.Idle: {
+            let msg: i64 = 1
+            return msg
+        }
+        else: {
+            let msg: i64 = 2
+            return msg
+        }
+    }
+    return -1
+}
+
+def test_match_arm_scoping(): {
+    assert(score_with_shadowed_local(Phase.Idle) == 10)
+    assert(score_with_shadowed_local(Phase.Running) == 20)
+    assert(score_with_shadowed_local(Phase.Failed) == 30)
+    assert(score_with_else_shadow(Phase.Idle) == 1)
+    assert(score_with_else_shadow(Phase.Running) == 2)
+    return 0
+}

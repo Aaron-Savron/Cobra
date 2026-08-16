@@ -3202,6 +3202,20 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
 static void validate_statement(ASTNode *node, IRContext *ctx);
 static void validate_block(ASTNode *block, IRContext *ctx);
 
+/* Each match arm is mutually exclusive with every other arm, exactly like an
+   if/else branch, so it gets the same saved-locals scope: a local declared
+   in one arm must not collide with or leak into another arm. */
+static void validate_match_arm_block(ASTNode *block, IRContext *ctx) {
+    IRLocal saved_locals[128];
+    size_t saved_count = ctx->count;
+    memcpy(saved_locals, ctx->locals, sizeof(saved_locals));
+    size_t branch_base = saved_count;
+    validate_block(block, ctx);
+    merge_branch_borrows(saved_locals, &saved_count, ctx->locals, ctx->count, branch_base);
+    memcpy(ctx->locals, saved_locals, sizeof(saved_locals));
+    ctx->count = saved_count;
+}
+
 static void validate_match_statement(ASTNode *node, IRContext *ctx) {
     if (!node || node->child_count < 2) {
         ir_error(ctx, node, "match requires a value and at least one arm");
@@ -3235,12 +3249,12 @@ static void validate_match_statement(ASTNode *node, IRContext *ctx) {
         if (arm->is_default_case) {
             if (has_default) ir_error(ctx, arm, "match may contain only one else arm");
             has_default = true;
-            validate_block(arm->children[0], ctx);
+            validate_match_arm_block(arm->children[0], ctx);
             continue;
         }
         if (strcmp(arm->match_type_name, enum_decl->name) != 0) {
             ir_error(ctx, arm, "match case belongs to a different enum");
-            validate_block(arm->children[0], ctx);
+            validate_match_arm_block(arm->children[0], ctx);
             continue;
         }
         int value = find_enum_variant(ctx, arm->match_type_name, arm->secondary_name);
@@ -3259,7 +3273,7 @@ static void validate_match_statement(ASTNode *node, IRContext *ctx) {
                 covered++;
             }
         }
-        validate_block(arm->children[0], ctx);
+        validate_match_arm_block(arm->children[0], ctx);
     }
     if (!has_default && covered != enum_decl->variant_count) {
         ir_error(ctx, node, "non-exhaustive match requires an else arm");
