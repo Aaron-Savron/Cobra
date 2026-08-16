@@ -252,6 +252,7 @@ Token lexer_next_token(Lexer *lexer) {
             break;
         case '*': token.type = TOKEN_STAR; break;
         case '/': token.type = TOKEN_SLASH; break;
+        case '%': token.type = TOKEN_PERCENT; break;
         case '.': token.type = TOKEN_DOT; break;
         case '@':
             {

@@ -1,0 +1,23 @@
+# The % operator: integer remainder, matching idiv's rdx result. Rejects
+# float operands and constant-zero divisors, same as / does for division.
+
+def test_modulo_basic(): {
+    assert(10 % 3 == 1)
+    assert(9 % 3 == 0)
+    assert(1 % 5 == 1)
+    return 0
+}
+
+def test_modulo_negative(): {
+    assert(-7 % 3 == -1)
+    assert(7 % -3 == 1)
+    return 0
+}
+
+def test_modulo_prng_seed(): {
+    let seed: i64 = 123456789
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    assert(seed >= 0)
+    assert(seed < 2147483648)
+    return 0
+}

@@ -969,7 +969,7 @@ static ASTNode *parse_primary(Parser *parser) {
 }
 
 static bool is_multiplicative(Parser *parser) {
-    return match(parser, TOKEN_STAR) || match(parser, TOKEN_SLASH);
+    return match(parser, TOKEN_STAR) || match(parser, TOKEN_SLASH) || match(parser, TOKEN_PERCENT);
 }
 
 static bool is_additive(Parser *parser) {

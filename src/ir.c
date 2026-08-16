@@ -1990,8 +1990,13 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
         case AST_BINARY_OP: {
             CobraTypeKind left = infer_expr(node->children[0], ctx);
             CobraTypeKind right = infer_expr(node->children[1], ctx);
-            if (strcmp(node->name, "/") == 0 && expression_is_const_zero(node->children[1])) {
-                ir_error(ctx, node, "division by zero");
+            if ((strcmp(node->name, "/") == 0 || strcmp(node->name, "%") == 0) &&
+                expression_is_const_zero(node->children[1])) {
+                ir_error(ctx, node, strcmp(node->name, "/") == 0 ? "division by zero" : "modulo by zero");
+            }
+            if (strcmp(node->name, "%") == 0 &&
+                (left == COBRA_TYPE_F32 || right == COBRA_TYPE_F32)) {
+                ir_error(ctx, node, "'%' requires integer operands");
             }
             if (left == COBRA_TYPE_STRING || right == COBRA_TYPE_STRING) {
                 if ((strcmp(node->name, "+") == 0 && left == COBRA_TYPE_STRING && right == COBRA_TYPE_STRING) ||
