@@ -941,16 +941,38 @@ static bool struct_shape_matches(ASTNode *decl, const CobraType *type) {
     return true;
 }
 
-static bool type_contains_generic_param(const CobraType *type) {
+static bool type_contains_generic_param_guarded(const CobraType *type,
+                                                 const CobraType *const stack[],
+                                                 size_t depth, bool *cyclic) {
     if (!type) return false;
     if (type->kind == COBRA_TYPE_GENERIC_PARAM) return true;
+    if (depth >= COBRA_TYPE_RECURSION_LIMIT || in_stack(stack, depth, type)) {
+        *cyclic = true;
+        return false;
+    }
+    const CobraType *next_stack[COBRA_TYPE_RECURSION_LIMIT];
+    memcpy(next_stack, stack, depth * sizeof(*stack));
+    next_stack[depth] = type;
     for (size_t i = 0; i < type->generic_arg_count; i++) {
-        if (type_contains_generic_param(type->generic_args[i])) return true;
+        if (type_contains_generic_param_guarded(type->generic_args[i], next_stack, depth + 1, cyclic))
+            return true;
+        if (*cyclic) return false;
     }
     for (size_t i = 0; i < type->field_count; i++) {
-        if (type_contains_generic_param(type->fields[i].type)) return true;
+        if (type_contains_generic_param_guarded(type->fields[i].type, next_stack, depth + 1, cyclic))
+            return true;
+        if (*cyclic) return false;
     }
     return false;
+}
+
+/* A struct that reaches itself through a field (directly, or through a
+   generic wrapper like list[T]) has no finite layout. type->populating only
+   catches the direct-field case; this walk catches the general one before
+   cobra_type_finalize would otherwise recurse over the same cycle forever. */
+static bool type_contains_generic_param(const CobraType *type, bool *cyclic) {
+    const CobraType *stack[COBRA_TYPE_RECURSION_LIMIT] = {0};
+    return type_contains_generic_param_guarded(type, stack, 0, cyclic);
 }
 
 static const CobraType *cobra_type_struct_layout_depth(CobraTypeArena *arena, ASTNode *root,
@@ -1051,7 +1073,13 @@ static const CobraType *cobra_type_struct_layout_depth(CobraTypeArena *arena, AS
     }
     /* Generic templates retain their placeholder fields until a call site
        supplies a scalar argument. They are definitions, not ABI-ready values. */
-    if (type_contains_generic_param(type)) return type;
+    bool cyclic = false;
+    bool has_generic_param = type_contains_generic_param(type, &cyclic);
+    if (cyclic) {
+        type_error(arena, "struct '%s' cannot contain itself", name);
+        return NULL;
+    }
+    if (has_generic_param) return type;
     if (!cobra_type_finalize(arena, type)) return NULL;
     return type;
 }

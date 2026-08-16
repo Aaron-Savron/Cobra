@@ -1,0 +1,8 @@
+struct Node: {
+    value: i64,
+    children: list[Node]
+}
+
+def main(): {
+    return 0
+}
