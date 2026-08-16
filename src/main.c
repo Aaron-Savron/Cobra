@@ -1618,6 +1618,20 @@ static bool run_native_tests(ASTNode *program, const char *source_path) {
         remove(runner_path);
         return false;
     }
+    /* matmul_f32/dense_f32/relu_f32/sum_f32/mean_f32/max_f32 auto-dispatch
+       to GPU under the hood (see emit_gemm/emit_relu/emit_reduce in
+       codegen.c), so any program that reaches them - directly or, as here,
+       transitively through the always-linked lib/nn.cb prelude's
+       conv2d_f32/dense_relu_f32/etc - needs the GPU runtime linked even in
+       `cobra test`, exactly like the `cobra build` path already does. */
+    bool program_has_gpu = ast_contains_gpu(program);
+    const char *gpu_runtime = program_has_gpu ? gpu_runtime_path() : NULL;
+    if (program_has_gpu && !gpu_runtime) {
+        fprintf(stderr, "[test] gpu runtime not found; set COBRA_LIB_PATH or run from the Cobra source tree\n");
+        remove(asm_path);
+        remove(runner_path);
+        return false;
+    }
     const char *build_argv[300];
     int build_argc = 0;
     build_argv[build_argc++] = "gcc";
@@ -1629,6 +1643,10 @@ static bool run_native_tests(ASTNode *program, const char *source_path) {
         build_argv[build_argc++] = "-pthread";
     }
     if (collections_runtime) build_argv[build_argc++] = collections_runtime;
+    if (gpu_runtime) {
+        build_argv[build_argc++] = gpu_runtime;
+        build_argv[build_argc++] = "-ldl";
+    }
     build_argc = append_import_libraries(program, build_argv, build_argc, 300);
     if (build_argc < 0) {
         remove(asm_path);
