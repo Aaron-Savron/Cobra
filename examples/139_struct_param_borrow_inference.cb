@@ -1,0 +1,90 @@
+# Whole-program struct-parameter borrow inference (memory design phase 1).
+# A struct parameter the callee never mutates or lets escape is passed by
+# aliasing the caller's pointer instead of copying; a parameter the callee
+# mutates, returns, or forwards elsewhere still gets a private copy, so the
+# by-value semantics documented in 72_struct_parameters.cb are unaffected.
+
+struct Point: { x: i64, y: i64 }
+struct Box: { top: Point, bottom: Point, tag: i64 }
+struct Holder: { tag: string }
+
+def point_score(point: Point) -> i64: {
+    return point.x * 10 + point.y
+}
+
+def point_mutate(point: Point) -> i64: {
+    point.x = 99
+    point.y = 101
+    return point.x + point.y
+}
+
+def box_score(box: Box) -> i64: {
+    return box.top.x * 10 + box.bottom.y + box.tag
+}
+
+def mutate_box(box: Box) -> i64: {
+    box.top.x = 70
+    box.bottom.y = 5
+    return box.top.x + box.bottom.y
+}
+
+def forward_score(point: Point) -> i64: {
+    return point_score(point)
+}
+
+def test_borrowed_read_only_param_unaffected_by_caller(): {
+    let point: Point
+    point.x = 3
+    point.y = 4
+
+    assert(point_score(point) == 34)
+    assert(point.x == 3)
+    assert(point.y == 4)
+    return 0
+}
+
+def test_mutating_param_still_gets_private_copy(): {
+    let point: Point
+    point.x = 3
+    point.y = 4
+
+    assert(point_mutate(point) == 200)
+    assert(point.x == 3)
+    assert(point.y == 4)
+    return 0
+}
+
+def test_nested_struct_read_and_mutate(): {
+    let box: Box
+    box.top.x = 3
+    box.top.y = 4
+    box.bottom.x = 8
+    box.bottom.y = 9
+    box.tag = 2
+
+    assert(box_score(box) == 41)
+    assert(mutate_box(box) == 75)
+    assert(box.top.x == 3)
+    assert(box.bottom.y == 9)
+    return 0
+}
+
+def test_interprocedural_passthrough_stays_borrowed(): {
+    let point: Point
+    point.x = 5
+    point.y = 6
+
+    assert(forward_score(point) == 56)
+    assert(point.x == 5)
+    assert(point.y == 6)
+    return 0
+}
+
+def test_field_write_from_existing_variable(): {
+    let src: string = "hello"
+    let h: Holder
+    h.tag = src
+    assert(h.tag == "hello")
+    assert(src == "hello")
+    return 0
+}

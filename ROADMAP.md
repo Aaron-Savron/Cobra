@@ -1111,3 +1111,67 @@ test confirming no double free when combined with a user's own `free()`.
 Still deferred: closure-environment frees, and list/dict locals declared
 via a function-call initializer (`let zs = returns_a_list()`) rather than a
 literal, which are not yet tracked as owned at all on the caller side.
+
+## Whole-program struct-parameter borrow inference (memory design phase 1)
+
+A struct parameter is passed as one pointer ABI slot; previously every
+non-`out` parameter unconditionally copied `struct_storage_size` bytes into
+private frame storage at function entry, since the callee is otherwise free
+to mutate its own copy without the caller observing it (documented,
+tested by-value semantics - see `examples/72_struct_parameters.cb`). That
+copy is now skipped when a whole-body scan proves the callee neither writes
+to the parameter (whole reassignment, a field write at any nesting depth
+via `AST_MEMBER_ASSIGN`, or copying it elsewhere as an rvalue) nor lets it
+escape (return it, or pass it to a further call that doesn't itself prove
+the same safety) - see `compute_param_borrowed`/`param_use_escapes` in
+src/codegen.c. When proven safe, the parameter aliases the caller's pointer
+directly, reusing the exact same `VarSymbol.indirect` mechanism `out`
+parameters already use - never a new addressing path.
+
+This is a real, memoized, cycle-safe interprocedural analysis, not a
+single-function heuristic: a struct argument forwarded unchanged to another
+function recursively consults that callee's own summary (computed lazily,
+cached per `(function, parameter)` pair) and stays classified safe if the
+callee also proves it safe - verified with an 80-function synthetic
+pass-through chain compiling and running correctly, and with `emit-asm`
+showing the per-call-site 16-byte copy genuinely gone from every link in
+the chain. Self- and mutual recursion are handled by marking an in-progress
+summary conservative (escaping) rather than an unbounded fixpoint, so the
+analysis provably terminates. A call through a `dyn Trait` value, an
+indirect `fn(...)->...` value, or any callee this pass can't resolve (FFI,
+`import c`, builtins) is always treated as escaping, since none of those
+have a summary to consult - matches this session's established boundary
+for exact analysis.
+
+Benchmarked both compile-time and runtime cost explicitly, per the
+"must not become latent" requirement this phase was built under: compiling
+the full `examples/*.cb` corpus is unchanged (31.1s vs. 31.4s baseline,
+within noise); a 100M-call loop passing an 8-field struct runs in ~1.02s
+against a ~1.22s baseline for the same binary before this change (~16-18%
+faster, reproduced across repeated runs) - this phase makes call-heavy
+struct-passing code faster, not slower, exactly because the eliminated copy
+is real instruction and memory-traffic overhead, not just a bookkeeping
+cost.
+
+While building and testing this, found and fixed a real, pre-existing
+double-free bug in the phase 1-3 auto-free work above: `autofree_scan_disqualify`
+only recognized a struct field write when it appeared as an `AST_ASSIGN`
+node with `secondary_name` set, but `candidate.field = value` (including
+nested `candidate.a.b = value`) actually parses to a distinct
+`AST_MEMBER_ASSIGN` node with the base identifier name preserved through
+the whole access chain - meaning "field populated from an existing
+variable" (the exact case the auto-free soundness comment already claimed
+to reject) was silently never being disqualified for this node shape. A
+struct local with a field assigned from an existing owned variable (e.g.
+`let h: Holder; h.tag = some_string;`) could be auto-freed while the
+assigned-from variable still held a live pointer to the same allocation,
+producing a real double-free. Fixed with the same check `AST_MEMBER_ASSIGN`
+handling this phase's own scan needed anyway; verified with a targeted
+repro (`free(): invalid pointer` before the fix, correct output after) and
+the full regression suite.
+
+Deferred, matching the rigor-checked design's own staging: region
+assignment/merging (phase 2/3 of the wider design) and extending
+caller-allocated returns beyond the struct/sum `sret` that already exists.
+This phase only changes the borrow-vs-move decision at direct call sites;
+nothing here changes what gets freed or when.

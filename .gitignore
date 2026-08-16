@@ -2,6 +2,8 @@
 
 # Build & Assembly Artifacts
 cobra
+cobra-type-tests
+cobra-backend-ir-tests
 output
 output.s
 *.s

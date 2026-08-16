@@ -162,6 +162,18 @@ typedef struct {
        per-call mov instructions into a freshly malloc'd block. */
     char dyn_vtables_emitted[128][COBRA_MAX_IDENT_LEN * 2];
     int dyn_vtable_count;
+    /* Whole-program struct-parameter borrow summary cache (memory design
+       phase 1). Keyed "<fn_name>|<param_name>". state: 0 = not started,
+       1 = in progress (cycle guard - a parameter reached through recursion
+       before its own scan finishes conservatively resolves to escaping),
+       2 = done. See compute_param_borrowed. */
+    struct {
+        char fn_name[COBRA_MAX_IDENT_LEN];
+        char param_name[COBRA_MAX_IDENT_LEN];
+        int state;
+        bool borrowed;
+    } param_summary_cache[512];
+    int param_summary_count;
 } CodeGen;
 
 static const char *SYSV_REGS[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
@@ -3726,6 +3738,106 @@ static bool struct_type_has_owned_scalar_fields(CodeGen *cg, const char *type_na
     return struct_canonical_has_owned_payload(canonical, 0);
 }
 
+/* --- Whole-program struct-parameter borrow inference (memory design phase 1) ---
+   A struct parameter is passed as a single pointer ABI slot (see
+   cobra_type_abi_slots); today every non-`out` parameter unconditionally
+   copies struct_storage_size bytes into private frame storage at function
+   entry (emit_function's COBRA_TYPE_STRUCT branch) so the callee can freely
+   mutate its own copy without the caller observing it, matching
+   examples/72_struct_parameters.cb's documented by-value semantics.
+
+   That copy is only needed when the callee's body could either mutate the
+   parameter or let a reference to it outlive the call (assign it elsewhere,
+   return it, or pass it to a further call that itself doesn't prove the same
+   safety). When neither is true, aliasing the caller's pointer directly -
+   exactly the mechanism `out` parameters already use via VarSymbol.indirect -
+   is behaviorally identical and skips the copy. compute_param_borrowed
+   decides this per (function, parameter) with a memoized, cycle-safe
+   recursive scan; a call through a `dyn Trait` or an unresolvable callee
+   (FFI/import) is always treated as escaping, since neither has a summary
+   this pass can consult. */
+static bool compute_param_borrowed(CodeGen *cg, ASTNode *fn, const char *param_name);
+
+static bool param_use_escapes(CodeGen *cg, const ASTNode *n, const char *param_name) {
+    if (!n) return false;
+    if (n->type == AST_MEMBER_ASSIGN || n->type == AST_INDEX_ASSIGN) {
+        /* box.field = v / box.top.x = v: the base identifier name is
+           preserved through the whole access chain (see parse_primary's
+           member-chain construction), so a direct name match here is a
+           write through the parameter at any nesting depth. */
+        if (!strcmp(n->name, param_name)) return true;
+    }
+    if (n->type == AST_ASSIGN || n->type == AST_VAR_DECL) {
+        bool is_field_write = n->secondary_name[0] != '\0';
+        if (!strcmp(n->name, param_name)) {
+            /* Any write through the parameter's own name - whole reassignment
+               or a field store - mutates the memory an alias would share
+               with the caller. */
+            return true;
+        }
+        if (n->child_count > 0 && n->children[0]->type == AST_VAR_REF &&
+            !strcmp(n->children[0]->name, param_name)) {
+            return true; /* copied elsewhere as an rvalue */
+        }
+        (void)is_field_write;
+    }
+    if (n->type == AST_RETURN) {
+        for (size_t i = 0; i < n->child_count; i++)
+            if (n->children[i]->type == AST_VAR_REF && !strcmp(n->children[i]->name, param_name))
+                return true;
+    }
+    if (n->type == AST_FUNC_CALL) {
+        bool any_arg_is_param = false;
+        for (size_t i = 0; i < n->child_count; i++)
+            if (n->children[i]->type == AST_VAR_REF && !strcmp(n->children[i]->name, param_name))
+                any_arg_is_param = true;
+        if (any_arg_is_param) {
+            /* Qualified calls (module/dyn Trait/static-dispatch method
+               syntax) and indirect fn(...)->... calls have no statically
+               resolvable single callee summary to consult here - treat
+               conservatively as escaping. */
+            if (n->qualifier[0] || n->is_indirect_call) return true;
+            ASTNode *callee = find_function(cg, n->name);
+            if (!callee) return true; /* FFI/imported/builtin: opaque */
+            for (size_t i = 0; i < n->child_count; i++) {
+                if (n->children[i]->type != AST_VAR_REF || strcmp(n->children[i]->name, param_name)) continue;
+                ASTNode *callee_param = function_param_node(cg, n->name, i);
+                if (!callee_param || callee_param->declared_type != COBRA_TYPE_STRUCT) return true;
+                if (!compute_param_borrowed(cg, callee, callee_param->name)) return true;
+            }
+        }
+    }
+    for (size_t i = 0; i < n->child_count; i++)
+        if (param_use_escapes(cg, n->children[i], param_name)) return true;
+    return false;
+}
+
+static bool compute_param_borrowed(CodeGen *cg, ASTNode *fn, const char *param_name) {
+    int slot = -1;
+    for (int i = 0; i < cg->param_summary_count; i++) {
+        if (!strcmp(cg->param_summary_cache[i].fn_name, fn->name) &&
+            !strcmp(cg->param_summary_cache[i].param_name, param_name)) { slot = i; break; }
+    }
+    if (slot < 0) {
+        if (cg->param_summary_count >= 512) return false; /* table exhausted: conservative */
+        slot = cg->param_summary_count++;
+        snprintf(cg->param_summary_cache[slot].fn_name, COBRA_MAX_IDENT_LEN, "%.63s", fn->name);
+        snprintf(cg->param_summary_cache[slot].param_name, COBRA_MAX_IDENT_LEN, "%.63s", param_name);
+        cg->param_summary_cache[slot].state = 0;
+    }
+    if (cg->param_summary_cache[slot].state == 1) return false; /* recursion: conservative */
+    if (cg->param_summary_cache[slot].state == 2) return cg->param_summary_cache[slot].borrowed;
+    cg->param_summary_cache[slot].state = 1;
+    bool escapes = false;
+    for (size_t i = 0; i < fn->child_count && !escapes; i++) {
+        if (fn->children[i]->type == AST_PARAM) continue;
+        escapes = param_use_escapes(cg, fn->children[i], param_name);
+    }
+    cg->param_summary_cache[slot].borrowed = !escapes;
+    cg->param_summary_cache[slot].state = 2;
+    return !escapes;
+}
+
 typedef struct { char name[COBRA_MAX_IDENT_LEN]; const ASTNode *decl_node; } AutofreeCandidate;
 
 /* Walk the whole function body; disqualify a candidate the moment it's used
@@ -3768,6 +3880,24 @@ static void autofree_scan_disqualify(const ASTNode *n, AutofreeCandidate *cands,
                        !strcmp(n->children[0]->name, cands[k].name) &&
                        strcmp(n->name, cands[k].name) != 0) {
                 disq[k] = true; /* candidate copied elsewhere as an rvalue */
+            }
+        }
+    }
+    /* `candidate.field = value` (and nested `candidate.a.b = value`) parses
+       to AST_MEMBER_ASSIGN, not AST_ASSIGN with secondary_name set - the base
+       identifier name is preserved through the whole access chain (see
+       parse_primary), so a name match here is exactly the "field write"
+       case the comment above already documents. Populating a field from an
+       existing variable gives that variable's storage a second owner (the
+       candidate's would-be freed field), so it must disqualify the same way
+       - this was previously unreachable dead code for this node shape, a
+       real double-free hole for e.g. `let h: Holder; h.tag = some_string`. */
+    if (n->type == AST_MEMBER_ASSIGN) {
+        for (int k = 0; k < count; k++) {
+            if (disq[k] || n == cands[k].decl_node) continue;
+            if (!strcmp(n->name, cands[k].name) && n->child_count > 0 &&
+                n->children[n->child_count - 1]->type == AST_VAR_REF) {
+                disq[k] = true;
             }
         }
     }
@@ -4413,7 +4543,12 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
                update the caller without a heap object or boxed reference. */
             VarSymbol *s = ensure_struct(cg, p->name, ast_payload_name(p));
             s->qualifier = param_alias_contract(p);
-            s->indirect = param_alias_contract(p) == 2;
+            /* `out` always aliases. Otherwise, alias only when the whole-body
+               scan proves this parameter is never mutated or let to escape -
+               see compute_param_borrowed; this must stay a pure superset of
+               `out`'s existing correctness, never a substitute for it. */
+            s->indirect = param_alias_contract(p) == 2 ||
+                          compute_param_borrowed(cg, fn, p->name);
             int incoming = reserve(cg, 8);
             if (gpr < 6) {
                 fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n",
