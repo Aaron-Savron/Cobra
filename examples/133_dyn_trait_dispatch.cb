@@ -1,0 +1,38 @@
+trait Shape: {
+    def area() -> i64
+}
+
+struct Circle: { radius: i64 }
+struct Square: { side: i64 }
+
+impl Shape for Circle: {
+    def area(c: Circle) -> i64: {
+        return c.radius * c.radius * 3
+    }
+}
+
+impl Shape for Square: {
+    def area(s: Square) -> i64: {
+        return s.side * s.side
+    }
+}
+
+def describe(shape: dyn Shape) -> i64: {
+    return shape.area()
+}
+
+def test_dyn_dispatch_circle(): {
+    let c: Circle
+    c.radius = 4
+    let result = describe(c)
+    assert(result == 48)
+    return 0
+}
+
+def test_dyn_dispatch_square(): {
+    let s: Square
+    s.side = 5
+    let result = describe(s)
+    assert(result == 25)
+    return 0
+}

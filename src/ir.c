@@ -25,6 +25,8 @@ typedef struct {
     unsigned long long struct_field_initialized;
     char type_name[COBRA_MAX_IDENT_LEN];
     char error_type_name[COBRA_MAX_IDENT_LEN];
+    /* Non-empty only for a `dyn TraitName`-typed local/param. */
+    char dyn_trait_name[COBRA_MAX_IDENT_LEN];
     CobraTypeKind element_type;
     CobraTypeKind key_type;
     CobraTypeKind collection_value_type;
@@ -334,6 +336,7 @@ static bool add_local(IRContext *ctx, const char *name, CobraTypeKind type, cons
             ? local->canonical_type->mutability : COBRA_MUTABILITY_DEFAULT;
         snprintf(local->type_name, sizeof(local->type_name), "%.63s",
                  canonical_type_name(local->canonical_type));
+        snprintf(local->dyn_trait_name, sizeof(local->dyn_trait_name), "%.63s", shape_source->dyn_trait_name);
         const CobraType *local_error = cobra_type_error(local->canonical_type);
         snprintf(local->error_type_name, sizeof(local->error_type_name), "%.63s",
                  local_error && local_error->kind == COBRA_TYPE_STRUCT ? local_error->name : "");
@@ -1514,18 +1517,22 @@ static bool direct_struct_field_supported_kind(const CobraType *type, CobraOwner
     if (!type) return false;
     if (cobra_type_is_scalar(type)) return true;
     if (cobra_type_is_slice_kind(type->kind) || type->kind == COBRA_TYPE_STRING) {
-        if (nested) return false;
         bool borrowed_view = ownership == COBRA_OWNERSHIP_BORROWED &&
                (mutability == COBRA_MUTABILITY_READONLY || mutability == COBRA_MUTABILITY_OUT) &&
                region_id == -1;
         /* Owned string/slice fields (e.g. `name: string`) are stored as a
            plain pointer+length pair, byte-copied on struct assignment just
-           like every other field - the direct backend never auto-frees
-           owned locals on scope exit (only an explicit free() call or
-           region teardown releases memory), so an owned field here carries
-           no more lifetime risk than an owned local of the same type. */
+           like every other field - the direct backend's static auto-free
+           pass now walks embedded struct fields recursively (see
+           emit_struct_owned_field_frees in codegen.c), so an owned field
+           nested inside an embedded struct field carries no more lifetime
+           risk than a top-level one and no longer needs the depth-1
+           restriction. Borrowed views stay depth-1 only: their safety
+           depends on region/lifetime checks this pass doesn't thread
+           through nested struct fields. */
         bool owned_value = ownership == COBRA_OWNERSHIP_OWNED &&
                mutability == COBRA_MUTABILITY_DEFAULT && region_id == -1;
+        if (nested) return owned_value;
         return borrowed_view || owned_value;
     }
     if (type->kind != COBRA_TYPE_STRUCT) return false;
@@ -2325,6 +2332,62 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                 snprintf(message, sizeof(message), "function '%s' is private to its module", node->name);
                 ir_error(ctx, node, message);
             }
+            /* dyn TraitName coercion: a struct-typed argument passed where the
+               callee declares `dyn TraitName` must implement every method the
+               trait declares (checked the same way static dispatch resolves
+               x.method() calls, via find_impl_method), or the caller could
+               build a dispatch block with a missing/undefined slot. */
+            if (called_function) {
+                size_t dyn_arg_index = 0;
+                for (size_t i = 0; i < called_function->child_count; i++) {
+                    ASTNode *param = called_function->children[i];
+                    if (param->type != AST_PARAM) continue;
+                    if (param->dyn_trait_name[0] && dyn_arg_index < node->child_count) {
+                        ASTNode *arg = node->children[dyn_arg_index];
+                        if (arg->type == AST_VAR_REF) {
+                            IRLocal *al = find_local_entry(ctx, arg->name);
+                            if (al && al->type_name[0]) {
+                                ASTNode *trait_decl = NULL;
+                                for (size_t k = 0; k < ctx->root->child_count; k++) {
+                                    ASTNode *d = ctx->root->children[k];
+                                    if (d->type == AST_TRAIT_DECL && strcmp(d->name, param->dyn_trait_name) == 0) {
+                                        trait_decl = d;
+                                        break;
+                                    }
+                                }
+                                if (trait_decl) {
+                                    for (size_t m = 0; m < trait_decl->child_count; m++) {
+                                        if (!find_impl_method(ctx, al->type_name, trait_decl->children[m]->name)) {
+                                            char message[220];
+                                            snprintf(message, sizeof(message),
+                                                     "'%s' does not implement trait '%s' (missing method '%s')",
+                                                     al->type_name, param->dyn_trait_name, trait_decl->children[m]->name);
+                                            ir_error(ctx, node, message);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    dyn_arg_index++;
+                }
+            }
+            {
+                IRLocal *qualifier_local = node->qualifier[0] ? find_local_entry(ctx, node->qualifier) : NULL;
+                if (qualifier_local && qualifier_local->dyn_trait_name[0]) {
+                    /* obj.method(args) where obj is `dyn TraitName`-typed:
+                       genuinely dynamic dispatch, resolved at runtime through
+                       the receiver's own dispatch block (see
+                       emit_dyn_dispatch_call in src/codegen.c), not to a
+                       fixed callee here. Still type-check the arguments for
+                       borrow/move tracking, then skip the module-alias/region
+                       checks below and the ordinary call-target resolution. */
+                    for (size_t i = 0; i < node->child_count; i++) (void)infer_expr(node->children[i], ctx);
+                    node->value_type = COBRA_TYPE_I64;
+                    return node->value_type;
+                }
+            }
             if (node->qualifier[0] != '\0') {
                 if (is_active_region(ctx, node->qualifier)) {
                     /* Region-qualified calls are the arena allocator surface.
@@ -2886,6 +2949,16 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                     }
                     CobraTypeKind argument_type = infer_expr(node->children[argument_index], ctx);
                     CobraTypeKind expected = param->declared_type;
+                    if (param->dyn_trait_name[0]) {
+                        /* dyn TraitName parameter: any struct-typed argument
+                           is accepted here (trait conformance was already
+                           checked above); the canonical-type/expected-kind
+                           comparisons below don't apply since the dummy
+                           zero-arg func type carried by a dyn parameter
+                           isn't a real signature to match against. */
+                        argument_index++;
+                        continue;
+                    }
                     if (param->canonical_type && node->children[argument_index]->canonical_type &&
                         !canonical_call_compatible(param->canonical_type,
                                                    node->children[argument_index]->canonical_type)) {

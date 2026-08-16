@@ -291,6 +291,29 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
         }
         return COBRA_TYPE_ARRAY;
     }
+    if (match(parser, TOKEN_IDENTIFIER) && strcmp(parser->current_token.text, "dyn") == 0) {
+        /* Trait-object type: dyn TraitName. Reuses the fn(...)->... single-
+           pointer ABI (declared_type COBRA_TYPE_FUNC) since a trait object
+           is, at the value level, one pointer to a heap-allocated dispatch
+           block; the trait name is stashed on the owner node so IR/codegen
+           can tell this apart from an ordinary function value. See
+           emit_dyn_trait_call/emit_dyn_dispatch_call in src/codegen.c. */
+        advance_token(parser);
+        char trait_name[COBRA_MAX_IDENT_LEN];
+        copy_token_text(parser, trait_name, sizeof(trait_name), "dyn trait name");
+        expect(parser, TOKEN_IDENTIFIER, "Expected trait name after 'dyn'");
+        if (owner) {
+            snprintf(owner->dyn_trait_name, sizeof(owner->dyn_trait_name), "%.63s", trait_name);
+            /* A dummy zero-param i64-returning func type satisfies the
+               "typed declaration has canonical metadata" invariant; nothing
+               reads its param/return shape since dyn-typed values are only
+               ever called through the qualifier (method-call) codegen path,
+               never as an ordinary fn(...)->... indirect call. */
+            owner->canonical_type = cobra_type_make_func(parser->canonical_arena, NULL, 0,
+                                                          parser_component_type(parser, COBRA_TYPE_I64, NULL));
+        }
+        return COBRA_TYPE_FUNC;
+    }
     if (match(parser, TOKEN_IDENTIFIER) && strcmp(parser->current_token.text, "fn") == 0) {
         /* Non-capturing function-value type: fn(T1, T2, ...) -> R. Phase 1
            (see ROADMAP.md) restricts every component to a scalar or void

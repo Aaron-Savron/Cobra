@@ -94,6 +94,11 @@ typedef struct {
     bool indirect;
     int qualifier;
     char type_name[COBRA_MAX_IDENT_LEN];
+    /* Non-empty only for a `dyn TraitName`-typed local/param: names the
+       trait so a qualified method call on this symbol can be resolved by
+       vtable-block dispatch instead of the ordinary static-dispatch or
+       direct-call paths. See emit_dyn_trait_call/emit_dyn_dispatch_call. */
+    char dyn_trait_name[COBRA_MAX_IDENT_LEN];
 } VarSymbol;
 
 typedef struct {
@@ -424,6 +429,32 @@ static void emit_return_epilogue(CodeGen *cg) {
     fprintf(cg->out, "    mov rbx, QWORD PTR [rbp-248]\n    mov rsp, rbp\n    pop rbp\n    ret\n");
 }
 
+/* Recursively free owned string/slice fields inside `canonical`, including
+   ones nested at any depth through embedded (by-value) struct fields.
+   `array_base` is the containing local's stack-slot base (as passed to
+   `[rbp-N]`); `base_offset` accumulates the byte offset of the enclosing
+   struct field(s) walked so far, since a nested field's own `offset` is
+   relative to the start of its own struct, not the outer one. */
+static void emit_struct_owned_field_frees(CodeGen *cg, const CobraType *canonical,
+                                          int array_base, int base_offset, int depth) {
+    if (!canonical || depth > 8) return;
+    for (size_t f = 0; f < canonical->field_count; f++) {
+        const CobraTypeField *field = &canonical->fields[f];
+        if (!field->type) continue;
+        int field_offset = base_offset + (int)field->offset;
+        if (field->ownership == COBRA_OWNERSHIP_OWNED &&
+            (field->type->kind == COBRA_TYPE_STRING || cobra_type_is_slice_kind(field->type->kind))) {
+            int field_addr = array_base - field_offset;
+            fprintf(cg->out,
+                    "    mov rdi, QWORD PTR [rbp-%d]\n    cmp rdi, 0\n    je .Lautofree_skip_%d\n    call free@PLT\n.Lautofree_skip_%d:\n",
+                    field_addr, cg->label_count, cg->label_count);
+            cg->label_count++;
+        } else if (field->type->kind == COBRA_TYPE_STRUCT) {
+            emit_struct_owned_field_frees(cg, field->type, array_base, field_offset, depth + 1);
+        }
+    }
+}
+
 /* Everyday owned values are reclaimed at function exit. Raw slices and tensor
    views deliberately stay outside this path: their lifetimes are explicit and
    their pointer/length ABI remains zero-overhead. */
@@ -447,17 +478,7 @@ static void emit_scope_cleanup(CodeGen *cg, const char *skip_name) {
             const CobraType *canonical = (cg->root && cg->root->canonical_arena)
                 ? cobra_type_struct_layout(cg->root->canonical_arena, cg->root, s->type_name) : NULL;
             if (!canonical) continue;
-            for (size_t f = 0; f < canonical->field_count; f++) {
-                const CobraTypeField *field = &canonical->fields[f];
-                if (field->ownership != COBRA_OWNERSHIP_OWNED || !field->type ||
-                    !(field->type->kind == COBRA_TYPE_STRING || cobra_type_is_slice_kind(field->type->kind)))
-                    continue;
-                int field_addr = s->array_base - (int)field->offset;
-                fprintf(cg->out,
-                        "    mov rdi, QWORD PTR [rbp-%d]\n    cmp rdi, 0\n    je .Lautofree_skip_%d\n    call free@PLT\n.Lautofree_skip_%d:\n",
-                        field_addr, cg->label_count, cg->label_count);
-                cg->label_count++;
-            }
+            emit_struct_owned_field_frees(cg, canonical, s->array_base, 0, 0);
         }
     }
 }
@@ -2388,7 +2409,132 @@ static void emit_gpu_resident_call(CodeGen *cg, ASTNode *call, ASTNode *fn) {
     fprintf(cg->out, "    call %s@PLT\n", call->name);
 }
 
+static ASTNode *find_trait_decl(CodeGen *cg, const char *trait_name) {
+    if (!cg->root || !trait_name) return NULL;
+    for (size_t k = 0; k < cg->root->child_count; k++) {
+        ASTNode *d = cg->root->children[k];
+        if (d->type == AST_TRAIT_DECL && !strcmp(d->name, trait_name)) return d;
+    }
+    return NULL;
+}
+
+/* A `dyn TraitName`-typed value is one pointer to a heap block: word 0 is
+   the concrete instance's address, words 1..N are one code pointer per
+   trait method (trait declaration order), each pointing at that concrete
+   type's mangled static-dispatch impl (__impl_<Trait>_<Type>_<method>,
+   already emitted by the ordinary impl-registration path). Building this
+   block is the coercion step (struct value -> dyn Trait); reading it back
+   is emit_dyn_dispatch_call below. ir.c's cobra_ir_build already verified
+   the concrete type implements every trait method before codegen runs. */
+static void emit_dyn_trait_call(CodeGen *cg, ASTNode *n, ASTNode *fn) {
+    (void)fn;
+    int arg_slot = reserve(cg, (int)n->child_count * 8 + 8);
+    size_t param_index = 0;
+    for (size_t i = 0; i < n->child_count; i++) {
+        ASTNode *param = function_param_node(cg, n->name, param_index++);
+        ASTNode *arg = n->children[i];
+        int slot = arg_slot + (int)i * 8;
+        if (param && param->dyn_trait_name[0]) {
+            if (arg->type != AST_VAR_REF) {
+                fprintf(stderr, "CodeGen Error: dyn %s argument must be a named struct value\n", param->dyn_trait_name);
+                exit(EXIT_FAILURE);
+            }
+            VarSymbol *s = find_symbol(cg, arg->name);
+            if (!s || s->kind != SYM_STRUCT) {
+                fprintf(stderr, "CodeGen Error: '%s' is not a struct value coercible to dyn %s\n", arg->name, param->dyn_trait_name);
+                exit(EXIT_FAILURE);
+            }
+            ASTNode *trait_decl = find_trait_decl(cg, param->dyn_trait_name);
+            if (!trait_decl) {
+                fprintf(stderr, "CodeGen Error: unknown trait '%s'\n", param->dyn_trait_name);
+                exit(EXIT_FAILURE);
+            }
+            size_t method_count = trait_decl->child_count;
+            fprintf(cg->out, "    mov rdi, %d\n    call malloc@PLT\n    mov QWORD PTR [rbp-%d], rax\n",
+                    (int)(method_count + 1) * 8, slot);
+            fprintf(cg->out, "    lea rbx, [rbp-%d]\n    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rcx], rbx\n",
+                    s->array_base, slot);
+            for (size_t m = 0; m < method_count; m++) {
+                char mangled[COBRA_MAX_IDENT_LEN];
+                snprintf(mangled, sizeof(mangled), "__impl_%.31s_%.31s_%.31s",
+                         param->dyn_trait_name, s->type_name, trait_decl->children[m]->name);
+                fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    lea rax, [rip+%s]\n    mov QWORD PTR [rcx+%d], rax\n",
+                        slot, mangled, (int)(8 * (1 + m)));
+            }
+        } else if (expression_is_float_codegen(cg, arg)) {
+            emit_expr(cg, arg);
+            fprintf(cg->out, "    movss DWORD PTR [rbp-%d], xmm0\n", slot);
+        } else {
+            emit_expr(cg, arg);
+            fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", slot);
+        }
+    }
+    int gpr = 0, xmm = 0;
+    param_index = 0;
+    for (size_t i = 0; i < n->child_count; i++) {
+        ASTNode *param = function_param_node(cg, n->name, param_index++);
+        int slot = arg_slot + (int)i * 8;
+        bool is_float = param && (param->declared_type == COBRA_TYPE_F32 || param->declared_type == COBRA_TYPE_F64) &&
+                         !(param->dyn_trait_name[0]);
+        if (is_float) fprintf(cg->out, "    movss %s, DWORD PTR [rbp-%d]\n", SYSV_XMM_REGS[xmm++], slot);
+        else fprintf(cg->out, "    mov %s, QWORD PTR [rbp-%d]\n", param_reg(cg, gpr++), slot);
+    }
+    fprintf(cg->out, "    xor eax, eax\n    call %s@PLT\n", n->name);
+}
+
+/* obj.method(args) where obj's static type is `dyn TraitName` (a local or
+   parameter whose VarSymbol carries dyn_trait_name - see the COBRA_TYPE_FUNC
+   parameter-binding path in emit_function, which is unchanged from an
+   ordinary function-value parameter since a dyn-trait value is ABI-identical
+   to one: a single pointer). Genuinely dynamic: the method slot is loaded
+   from the receiver's own dispatch block at runtime, not resolved to a fixed
+   mangled symbol at compile time the way static-dispatch x.method() is. */
+static void emit_dyn_dispatch_call(CodeGen *cg, ASTNode *n, VarSymbol *recv) {
+    ASTNode *trait_decl = find_trait_decl(cg, recv->dyn_trait_name);
+    if (!trait_decl) {
+        fprintf(stderr, "CodeGen Error: unknown trait '%s'\n", recv->dyn_trait_name);
+        exit(EXIT_FAILURE);
+    }
+    int method_index = -1;
+    for (size_t m = 0; m < trait_decl->child_count; m++) {
+        if (!strcmp(trait_decl->children[m]->name, n->name)) { method_index = (int)m; break; }
+    }
+    if (method_index < 0) {
+        fprintf(stderr, "CodeGen Error: trait '%s' has no method '%s'\n", recv->dyn_trait_name, n->name);
+        exit(EXIT_FAILURE);
+    }
+    int block_slot = reserve(cg, 8);
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", recv->offset, block_slot);
+    int arg_slot = reserve(cg, (int)n->child_count * 8 + 8);
+    for (size_t i = 0; i < n->child_count; i++) {
+        ASTNode *arg = n->children[i];
+        int slot = arg_slot + (int)i * 8;
+        emit_expr(cg, arg);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", slot);
+    }
+    fprintf(cg->out, "    mov r11, QWORD PTR [rbp-%d]\n    mov rdi, QWORD PTR [r11]\n", block_slot);
+    for (size_t i = 0; i < n->child_count; i++) {
+        int slot = arg_slot + (int)i * 8;
+        fprintf(cg->out, "    mov %s, QWORD PTR [rbp-%d]\n", param_reg(cg, (int)(i + 1)), slot);
+    }
+    fprintf(cg->out, "    mov r11, QWORD PTR [rbp-%d]\n    mov r10, QWORD PTR [r11+%d]\n    xor eax, eax\n    call r10\n",
+            block_slot, (int)(8 * (1 + method_index)));
+}
+
 static void emit_call(CodeGen *cg, ASTNode *n) {
+    if (n->qualifier[0]) {
+        VarSymbol *recv = find_symbol(cg, n->qualifier);
+        if (recv && recv->dyn_trait_name[0]) { emit_dyn_dispatch_call(cg, n, recv); return; }
+    }
+    {
+        ASTNode *dyn_fn = find_function(cg, n->name);
+        if (dyn_fn) {
+            for (size_t i = 0; i < dyn_fn->child_count; i++) {
+                ASTNode *p = dyn_fn->children[i];
+                if (p->type == AST_PARAM && p->dyn_trait_name[0]) { emit_dyn_trait_call(cg, n, dyn_fn); return; }
+            }
+        }
+    }
     if (n->is_indirect_call) {
         /* f(a, b, ...) where f is a local fn(...)->... value (ir.c already
            checked argument count/types against the stored signature). Each
@@ -3471,21 +3617,34 @@ static void emit_inline_asm(CodeGen *cg, const char *source) {
     fputc('\n', cg->out);
 }
 
-/* True if `type_name` is a struct with at least one field the direct
-   backend already recognizes as heap-owned (owned string or owned slice) -
-   the exact shape the struct-field-ownership work this session made valid. */
-static bool struct_type_has_owned_scalar_fields(CodeGen *cg, const char *type_name) {
-    if (!cg->root || !cg->root->canonical_arena || !type_name || !type_name[0]) return false;
-    const CobraType *canonical = cobra_type_struct_layout(cg->root->canonical_arena, cg->root, type_name);
-    if (!canonical) return false;
+/* True if `canonical` has, directly or through an embedded (by-value) nested
+   struct field at any depth, at least one field the direct backend already
+   recognizes as heap-owned (owned string or owned slice) - the exact shape
+   the struct-field-ownership work this session made valid. Nested struct
+   fields are stored inline (contiguous, by-value), never by pointer, so
+   walking into them here is just byte-address arithmetic, not a second
+   allocation to reason about. */
+static bool struct_canonical_has_owned_payload(const CobraType *canonical, int depth) {
+    if (!canonical || depth > 8) return false;
     for (size_t i = 0; i < canonical->field_count; i++) {
         const CobraTypeField *f = &canonical->fields[i];
-        if (f->ownership == COBRA_OWNERSHIP_OWNED && f->type &&
+        if (!f->type) continue;
+        if (f->ownership == COBRA_OWNERSHIP_OWNED &&
             (f->type->kind == COBRA_TYPE_STRING || cobra_type_is_slice_kind(f->type->kind))) {
+            return true;
+        }
+        if (f->type->kind == COBRA_TYPE_STRUCT &&
+            struct_canonical_has_owned_payload(f->type, depth + 1)) {
             return true;
         }
     }
     return false;
+}
+
+static bool struct_type_has_owned_scalar_fields(CodeGen *cg, const char *type_name) {
+    if (!cg->root || !cg->root->canonical_arena || !type_name || !type_name[0]) return false;
+    const CobraType *canonical = cobra_type_struct_layout(cg->root->canonical_arena, cg->root, type_name);
+    return struct_canonical_has_owned_payload(canonical, 0);
 }
 
 typedef struct { char name[COBRA_MAX_IDENT_LEN]; const ASTNode *decl_node; } AutofreeCandidate;
@@ -4092,6 +4251,7 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
             else fprintf(cg->out, "    movss xmm15, DWORD PTR [rbp+%d]\n    movss DWORD PTR [rbp-%d], xmm15\n", 16 + stack_index++ * 8, s->offset);
         } else {
             VarSymbol *s = ensure_scalar(cg, p->name, parameter_type);
+            if (p->dyn_trait_name[0]) snprintf(s->dyn_trait_name, sizeof(s->dyn_trait_name), "%.63s", p->dyn_trait_name);
             if (gpr < 6) {
                 fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", COBRA_ARG_SAVE_BASE + gpr * 8, s->offset);
                 gpr++;

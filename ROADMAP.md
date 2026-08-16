@@ -644,12 +644,32 @@ Finish the language contracts for:
   matching impl method by name; deeper signature comparison isn't needed
   since each impl method is independently type-checked as a normal function
   anyway) - see `tests/negative/128_impl_missing_method.cb` and
-  `tests/negative/129_impl_unknown_trait.cb`. Not yet supported: dynamic
-  dispatch / trait objects (calling a trait method through a value whose
-  concrete type isn't statically known - would need a real vtable, closer to
-  the closure thunk work), generic trait bounds (`def f[T: Shape](x: T)`),
-  default trait methods, and multiple impls of the same trait for the same
-  type (last registration wins silently - not yet diagnosed).
+  `tests/negative/129_impl_unknown_trait.cb`.
+- [x] Dynamic dispatch (`dyn TraitName`), as a function parameter type only.
+  `def describe(shape: dyn Shape) -> i64: { return shape.area() }` accepts
+  any struct implementing `Shape`, dispatched at runtime
+  (examples/133_dyn_trait_dispatch.cb). Reuses the `fn(...)->...` single-
+  pointer ABI (`declared_type == COBRA_TYPE_FUNC`, `dyn_trait_name` set on
+  the AST/IR/VarSymbol node instead of a real signature): the value is one
+  pointer to a heap block `{data_ptr, method0, method1, ...}` in the trait's
+  declared method order, built at the call site
+  (`emit_dyn_trait_call`, src/codegen.c) from the argument struct's address
+  and the concrete type's existing mangled static-dispatch impls
+  (`__impl_<Trait>_<Type>_<method>` - no separate vtable symbol, no new impl
+  registration). A method call on a `dyn`-typed receiver
+  (`emit_dyn_dispatch_call`) loads the code pointer from the block at
+  `8*(1+method_index)` and calls it with the block's `data_ptr` as the
+  receiver, genuinely resolved at runtime rather than rewritten to a fixed
+  symbol the way static dispatch is. ir.c validates every trait method is
+  implemented at the coercion (call) site, reusing `find_impl_method`
+  (`tests/negative/134_dyn_trait_missing_method.cb`). Not yet supported:
+  `dyn Trait` as a `let`/return type or `list[dyn Trait]` element (only
+  function parameters coerce today), generic trait bounds
+  (`def f[T: Shape](x: T)`), default trait methods, supertraits, and
+  multiple impls of the same trait for the same type (last registration
+  wins silently - not yet diagnosed). The dispatch block is heap-allocated
+  and never freed, matching this backend's existing no-automatic-drop
+  convention for closure environments.
 - Recursion
 - Casts and explicit conversions
 - Constant evaluation
@@ -1013,5 +1033,35 @@ src/codegen.c) - it is RAII via static analysis, not a new runtime.
 Any local that fails one of these checks keeps today's behavior (leaked,
 never freed) rather than risk a double-free; precision was prioritized over
 coverage. Deferred for later phases: nested-block scope (today's sweep is
-function-scope only), recursive struct-of-struct field frees, closure
-environment frees, and collection-element frees.
+function-scope only), closure environment frees, and collection-element
+frees.
+
+## Static automatic deallocation (phase 2: recursive struct-of-struct frees)
+
+Owned string/slice fields nested inside an embedded (by-value) struct field,
+at any depth, are now freed too - `emit_struct_owned_field_frees` in
+src/codegen.c walks a struct local's canonical layout recursively, computing
+each nested field's absolute stack offset as the sum of every enclosing
+field's own offset (nested struct fields are stored inline, never by
+pointer, so this is address arithmetic, not a second allocation to reason
+about). The same phase-1 soundness conditions apply unchanged: this only
+frees fields on a candidate local that survives the whole-body disqualify
+scan (never reassigned, copied, returned, or field-populated from an
+existing variable) - a nested struct field written from an existing
+variable already disqualifies the whole outer local today, so no separate
+nested-aliasing check was needed.
+
+This also lifted a validator restriction: `direct_struct_field_supported_kind`
+in src/ir.c previously rejected any owned string/slice field nested inside
+another struct field (`nested=true` returned false unconditionally); it now
+accepts owned (not borrowed) nested fields, since codegen can now free them
+correctly. Borrowed view fields stay depth-1 only - their safety depends on
+region/lifetime checks this pass doesn't thread through nested struct
+fields.
+
+Verified with a 3M-iteration build-and-run stress test of a two-level owned
+struct (`Outer { tag: string, inner: Inner { label: string, value: i64 } }`,
+2 owned strings allocated and freed per iteration): flat 1.8MB RSS, exit 0,
+no corruption. A parallel 2M-iteration test of the disqualified "returned
+struct" pattern leaked as expected (126MB RSS) but did not crash, confirming
+the exclusion holds at scale, not just correctness at small scale.

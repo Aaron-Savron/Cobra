@@ -1,0 +1,53 @@
+# Static auto-free now walks into embedded (by-value) struct fields, so a
+# struct-of-struct with an owned string two levels deep gets that field freed
+# too, under the exact same safety conditions as a top-level owned field -
+# see emit_struct_owned_field_frees / struct_canonical_has_owned_payload in
+# codegen.c.
+
+struct Inner: { label: string, value: i64 }
+struct Outer: { tag: string, inner: Inner }
+
+def make_outer(prefix: string) -> i64: {
+    let o: Outer
+    o.tag = prefix + "-tag"
+    o.inner.label = prefix + "-inner"
+    o.inner.value = 9
+    return o.inner.value
+}
+
+def test_nested_autofree_repeated_calls(): {
+    let sum: i64 = 0
+    let i: i64 = 0
+    while i < 200000: {
+        sum = sum + make_outer("item")
+        i = i + 1
+    }
+    assert(sum == 1800000)
+}
+
+def returns_outer() -> Outer: {
+    let o: Outer
+    o.tag = "returned " + "outer"
+    o.inner.label = "returned " + "inner"
+    o.inner.value = 42
+    return o
+}
+
+def test_returned_nested_struct_not_double_freed(): {
+    let x: Outer = returns_outer()
+    assert(x.inner.value == 42)
+    assert(x.tag == "returned outer")
+    assert(x.inner.label == "returned inner")
+}
+
+def test_copied_nested_struct_not_double_freed(): {
+    let a: Outer
+    a.tag = "copy " + "source"
+    a.inner.label = "copy " + "inner"
+    a.inner.value = 3
+    let b: Outer = a
+    assert(a.inner.value == 3)
+    assert(b.inner.value == 3)
+    assert(a.inner.label == "copy inner")
+    assert(b.inner.label == "copy inner")
+}

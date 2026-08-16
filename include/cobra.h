@@ -397,6 +397,13 @@ struct ASTNode {
     char secondary_name[COBRA_MAX_IDENT_LEN];
     /* The variable a comprehension result is stored into (declaration name). */
     char comprehension_target[COBRA_MAX_IDENT_LEN];
+    /* Non-empty only when this node's type annotation was `dyn TraitName`
+       (a trait-object parameter/local). declared_type is COBRA_TYPE_FUNC in
+       that case, reusing the fn(...)->... single-pointer ABI: the value is a
+       pointer to a heap block {data_ptr, method0, method1, ...} rather than
+       a {code_ptr, env_ptr} thunk. See parse_type_into, emit_dyn_trait_call,
+       and emit_dyn_dispatch_call in src/codegen.c. */
+    char dyn_trait_name[COBRA_MAX_IDENT_LEN];
     int int_val;
     /* Full-precision literal magnitude. int_val is the low 32 bits for
        compatibility with contexts that need a small integer; literal_i64 is

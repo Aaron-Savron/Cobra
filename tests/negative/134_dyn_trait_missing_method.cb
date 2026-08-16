@@ -1,0 +1,23 @@
+trait Shape: {
+    def area() -> i64
+    def perimeter() -> i64
+}
+
+struct Circle: { radius: i64 }
+
+impl Shape for Circle: {
+    def area(c: Circle) -> i64: {
+        return c.radius * c.radius * 3
+    }
+}
+
+def describe(shape: dyn Shape) -> i64: {
+    return shape.area()
+}
+
+def test_missing_method(): {
+    let c: Circle
+    c.radius = 4
+    let result = describe(c)
+    return 0
+}
