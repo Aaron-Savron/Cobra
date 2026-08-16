@@ -1,0 +1,23 @@
+# A type implementing a trait with a supertrait must satisfy the
+# supertrait's methods too (via any impl block for that type), not just
+# the trait's own methods.
+
+struct Circle: { radius: i64 }
+
+trait Shape: {
+    def area() -> i64
+}
+
+trait Drawable: Shape: {
+    def draw() -> i64
+}
+
+impl Drawable for Circle: {
+    def draw(c: Circle) -> i64: {
+        return 1
+    }
+}
+
+def main(): {
+    return 0
+}

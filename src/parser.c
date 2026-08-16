@@ -2008,6 +2008,22 @@ static ASTNode *parse_trait_method_signature(Parser *parser) {
         advance_token(parser);
         sig->declared_type = parse_type_into(parser, "return", sig, 0);
     }
+    /* Optional default body: def name(...) -> ret: { body }. A default body
+       may not reference a receiver (the trait signature never names one -
+       each impl's method declares its own receiver param independently), so
+       it is restricted to receiver-independent logic. Body statements are
+       appended as children after the AST_PARAM children; a signature-only
+       method keeps child_count == its param count, which is how callers
+       distinguish "has a default" from "signature only" without a separate
+       flag. */
+    if (match(parser, TOKEN_COLON)) {
+        advance_token(parser);
+        expect(parser, TOKEN_LBRACE, "Expected '{' to start trait default method body");
+        while (!match(parser, TOKEN_RBRACE) && !match(parser, TOKEN_EOF)) {
+            ast_add_child(sig, parse_statement(parser));
+        }
+        expect(parser, TOKEN_RBRACE, "Expected '}' to close trait default method body");
+    }
     return sig;
 }
 
@@ -2019,6 +2035,15 @@ static ASTNode *parse_trait_declaration(Parser *parser) {
     expect(parser, TOKEN_IDENTIFIER, "Expected trait name");
     ASTNode *trait_node = parser_create_node_at(parser, AST_TRAIT_DECL, trait_name, trait_token);
     expect(parser, TOKEN_COLON, "Expected ':' after trait name");
+    /* Optional supertrait: trait Drawable: Shape: { ... }. An identifier
+       before the body's opening brace names a supertrait that any type
+       implementing this trait must also satisfy; stashed on secondary_name
+       so ir.c's conformance pass can chase the chain without a new field. */
+    if (match(parser, TOKEN_IDENTIFIER)) {
+        copy_token_text(parser, trait_node->secondary_name, sizeof(trait_node->secondary_name), "supertrait name");
+        advance_token(parser);
+        expect(parser, TOKEN_COLON, "Expected ':' after supertrait name");
+    }
     expect(parser, TOKEN_LBRACE, "Expected '{' to start trait body");
     while (!match(parser, TOKEN_RBRACE) && !match(parser, TOKEN_EOF)) {
         ast_add_child(trait_node, parse_trait_method_signature(parser));
@@ -2072,6 +2097,88 @@ static ASTNode *parse_impl_declaration(Parser *parser) {
     }
     expect(parser, TOKEN_RBRACE, "Expected '}' to close impl body");
     return impl_node;
+}
+
+/* Deep-clone an AST subtree. Mirrors src/ir.c's generic-specialization
+   clone_ast_tree exactly (small enough, and static in that file, to just
+   duplicate rather than expose across translation units). */
+static ASTNode *parser_clone_ast_tree(const ASTNode *source) {
+    if (!source) return NULL;
+    ASTNode *copy = ast_create_node(source->type, source->name);
+    if (!copy) return NULL;
+    *copy = *source;
+    copy->children = NULL;
+    copy->child_count = 0;
+    copy->child_capacity = 0;
+    for (size_t i = 0; i < source->child_count; i++) {
+        ASTNode *child = parser_clone_ast_tree(source->children[i]);
+        if (!child) return NULL;
+        ast_add_child(copy, child);
+    }
+    return copy;
+}
+
+/* Trait default methods: for every impl block that omits a method the trait
+   declares WITH a default body (child_count beyond its AST_PARAM children,
+   per parse_trait_method_signature), synthesize the missing
+   __impl_<Trait>_<Type>_<method> function by cloning the default body and
+   prepending a receiver parameter typed as the implementing struct - exactly
+   the shape a hand-written impl method already has, so no other pass needs
+   to know a default was involved. Runs once, after the whole program has
+   parsed (so every trait/impl is known regardless of declaration order),
+   before cobra_ir_build's per-function loop ever starts. */
+static void synthesize_trait_defaults(Parser *parser, ASTNode *root) {
+    if (!parser || !root) return;
+    for (size_t i = 0; i < root->child_count; i++) {
+        ASTNode *impl = root->children[i];
+        if (impl->type != AST_IMPL_DECL) continue;
+        ASTNode *trait = NULL;
+        for (size_t j = 0; j < root->child_count; j++) {
+            if (root->children[j]->type == AST_TRAIT_DECL && strcmp(root->children[j]->name, impl->name) == 0) {
+                trait = root->children[j];
+                break;
+            }
+        }
+        if (!trait) continue;
+        for (size_t m = 0; m < trait->child_count; m++) {
+            ASTNode *method = trait->children[m];
+            size_t param_count = 0;
+            while (param_count < method->child_count && method->children[param_count]->type == AST_PARAM) param_count++;
+            bool has_default = method->child_count > param_count;
+            if (!has_default) continue;
+
+            bool already_implemented = false;
+            for (size_t k = 0; k < impl->child_count; k++) {
+                if (strcmp(impl->children[k]->name, method->name) == 0) { already_implemented = true; break; }
+            }
+            if (already_implemented) continue;
+
+            char mangled_name[COBRA_MAX_IDENT_LEN];
+            snprintf(mangled_name, sizeof(mangled_name), "__impl_%.31s_%.31s_%.31s",
+                     impl->name, impl->secondary_name, method->name);
+
+            ASTNode *fn_node = parser_clone_ast_tree(method);
+            if (!fn_node) continue;
+            snprintf(fn_node->name, sizeof(fn_node->name), "%.63s", mangled_name);
+
+            ASTNode *receiver = ast_create_node(AST_PARAM, "__self");
+            receiver->declared_type = COBRA_TYPE_STRUCT;
+            receiver->canonical_type = parser_component_type(parser, COBRA_TYPE_STRUCT, impl->secondary_name);
+            /* Prepend: shift every existing child right one slot, then place
+               the receiver first, matching the {receiver, ...params, ...body}
+               shape find_impl_method's callers already build at call sites. */
+            ast_add_child(fn_node, receiver);
+            for (size_t shift = fn_node->child_count - 1; shift > 0; shift--)
+                fn_node->children[shift] = fn_node->children[shift - 1];
+            fn_node->children[0] = receiver;
+
+            ast_add_child(root, fn_node);
+
+            ASTNode *marker = ast_create_node(AST_PARAM, method->name);
+            snprintf(marker->secondary_name, sizeof(marker->secondary_name), "%.63s", mangled_name);
+            ast_add_child(impl, marker);
+        }
+    }
 }
 
 ASTNode *parser_parse_program(Parser *parser) {
@@ -2194,5 +2301,6 @@ ASTNode *parser_parse_program(Parser *parser) {
             advance_token(parser);
         }
     }
+    synthesize_trait_defaults(parser, root);
     return root;
 }

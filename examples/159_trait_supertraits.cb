@@ -1,0 +1,29 @@
+struct Circle: { radius: i64 }
+
+trait Shape: {
+    def area() -> i64
+}
+
+trait Drawable: Shape: {
+    def draw() -> i64
+}
+
+impl Shape for Circle: {
+    def area(c: Circle) -> i64: {
+        return c.radius * c.radius * 3
+    }
+}
+
+impl Drawable for Circle: {
+    def draw(c: Circle) -> i64: {
+        return 1
+    }
+}
+
+def test_supertrait_conformance(): {
+    let c: Circle
+    c.radius = 2
+    assert(c.area() == 12)
+    assert(c.draw() == 1)
+    return 0
+}

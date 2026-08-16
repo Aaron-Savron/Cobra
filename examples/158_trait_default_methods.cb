@@ -1,0 +1,40 @@
+struct Circle: { radius: i64 }
+struct Square: { side: i64 }
+
+trait Shape: {
+    def area() -> i64
+    def describe() -> string: {
+        return "a shape"
+    }
+}
+
+impl Shape for Circle: {
+    def area(c: Circle) -> i64: {
+        return c.radius * c.radius * 3
+    }
+}
+
+impl Shape for Square: {
+    def area(s: Square) -> i64: {
+        return s.side * s.side
+    }
+    def describe(s: Square) -> string: {
+        return "a square"
+    }
+}
+
+def test_default_method_used(): {
+    let c: Circle
+    c.radius = 4
+    assert(c.area() == 48)
+    assert(c.describe() == "a shape")
+    return 0
+}
+
+def test_default_method_overridden(): {
+    let s: Square
+    s.side = 5
+    assert(s.area() == 25)
+    assert(s.describe() == "a square")
+    return 0
+}
