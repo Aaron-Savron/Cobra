@@ -330,15 +330,28 @@ int64_t cobra_gpu_device_count(void) {
 int64_t cobra_gpu_available(void) { return cobra_gpu_device_count() > 0 ? 1 : 0; }
 
 /* "Language detects when it's best" policy: below this element count, fixed
-   Vulkan dispatch overhead (command buffer submission, fence wait - roughly
-   tens of microseconds even on a warm pipeline) outweighs what a simple
-   elementwise/reduction kernel saves versus AVX2 on the CPU path Cobra
-   already has. 65536 is a conservative, round threshold for that crossover;
-   callers with a more expensive per-element kernel can ignore this and
-   dispatch to the GPU at any size. Availability is cached after the first
-   check (device enumeration is not free) since callers are expected to ask
-   this once per kernel invocation. */
-#define COBRA_GPU_DISPATCH_THRESHOLD 65536
+   per-call Vulkan cost (buffer upload, command submission, fence wait,
+   readback - no residency/reuse across calls, so every dispatch pays the
+   full round trip) outweighs what the kernel saves versus AVX2 on the CPU
+   path Cobra already has.
+   Measured directly on this machine's integrated GPU (AMD Mendocino) via
+   matmul_f32, whose element count is M*N*K (total multiply-adds, the same
+   metric this threshold gates for every caller): at 68,921 MACs (just above
+   the previous 65536 threshold) GPU dispatch measured about 7.8x SLOWER per
+   call than staying on the CPU AVX2 path (0.64ms vs 0.082ms). At 1,000,000
+   MACs GPU dispatch was still clearly slower than an extrapolated CPU-only
+   estimate. By 8,000,000 MACs GPU dispatch measured faster than the CPU
+   extrapolation. 4,194,304 is a round threshold set solidly inside the
+   measured-faster region with real margin below the observed crossover,
+   not just a guess. relu/reduce kernels do less work per transferred
+   element than matmul, so if anything they need an even higher crossover
+   than matmul's - this shared threshold is conservative for them too.
+   This does not model buffer residency or reuse across repeated calls on
+   the same data (see cobra_gpu_resident_* for that path); every call
+   through this gate is priced as a one-shot round trip. Availability is
+   cached after the first check (device enumeration is not free) since
+   callers are expected to ask this once per kernel invocation. */
+#define COBRA_GPU_DISPATCH_THRESHOLD 4194304
 
 int64_t cobra_gpu_should_dispatch(int64_t element_count) {
     static int checked = 0, available = 0;
