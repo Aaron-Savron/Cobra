@@ -1,0 +1,45 @@
+# Struct locals with owned string fields that are declared bare (no
+# initializer), never reassigned, copied, passed by value, or returned, are
+# proven safe and have their owned fields freed automatically at scope exit
+# with zero runtime cost - see compute_safe_autofree_structs in codegen.c.
+
+struct Owner: { name: string, count: i64 }
+
+def make_owner(prefix: string) -> i64: {
+    let o: Owner
+    o.name = prefix + "-owner"
+    o.count = 1
+    return o.count
+}
+
+def test_autofree_repeated_calls(): {
+    let sum: i64 = 0
+    let i: i64 = 0
+    while i < 200000: {
+        sum = sum + make_owner("item")
+        i = i + 1
+    }
+    assert(sum == 200000)
+}
+
+def returns_owner() -> Owner: {
+    let o: Owner
+    o.name = "returned " + "value"
+    o.count = 7
+    return o
+}
+
+def test_returned_struct_not_double_freed(): {
+    let x: Owner = returns_owner()
+    assert(x.count == 7)
+    assert(x.name == "returned value")
+}
+
+def test_copied_struct_not_double_freed(): {
+    let a: Owner
+    a.name = "copy " + "source"
+    a.count = 3
+    let b: Owner = a
+    assert(a.count == 3)
+    assert(b.count == 3)
+}

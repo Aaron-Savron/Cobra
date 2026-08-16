@@ -980,3 +980,22 @@ arbitrary non-scalar ownership-bearing aggregate emission remains deferred.
 The main rule is:
 
 > Do not optimize or add targets until the IR can represent the values, memory, calls, and ownership rules that the language actually supports.
+
+## Static automatic deallocation (phase 1)
+
+The direct backend now auto-frees owned string/slice fields on a struct
+local at function-scope exit, with zero runtime cost, whenever a whole-body
+scan proves it sound: the local is declared bare (no initializer), never
+reassigned as a whole value, never copied into another variable, never
+passed by value to a function (already rejected separately by the IR
+checker for owned-field structs), never returned, and every owned field is
+populated only from a fresh value (a literal or expression), never copied
+in from an existing variable. This reuses the exact free@PLT codegen path
+an explicit `free()` already emits (see `emit_scope_cleanup` in
+src/codegen.c) - it is RAII via static analysis, not a new runtime.
+
+Any local that fails one of these checks keeps today's behavior (leaked,
+never freed) rather than risk a double-free; precision was prioritized over
+coverage. Deferred for later phases: nested-block scope (today's sweep is
+function-scope only), recursive struct-of-struct field frees, closure
+environment frees, and collection-element frees.

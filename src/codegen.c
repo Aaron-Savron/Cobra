@@ -143,6 +143,12 @@ typedef struct {
        after the current function's `ret`, mirroring flush_pending_parallel. */
     char fn_thunk_pending[16][COBRA_MAX_IDENT_LEN];
     int fn_thunk_pending_count;
+    /* Struct locals proven, by a whole-body scan at function entry, to never
+       be reassigned, copied elsewhere, passed as a call argument, or
+       returned. Only these may have their owned string/slice fields freed
+       automatically at scope exit; see compute_safe_autofree_structs. */
+    char safe_autofree_structs[64][COBRA_MAX_IDENT_LEN];
+    int safe_autofree_count;
 } CodeGen;
 
 static const char *SYSV_REGS[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
@@ -437,6 +443,21 @@ static void emit_scope_cleanup(CodeGen *cg, const char *skip_name) {
             fprintf(cg->out,
                     "    mov rdi, QWORD PTR [rbp-%d]\n    call free@PLT\n    mov QWORD PTR [rbp-%d], 0\n",
                     s->offset, s->offset);
+        } else if (s->kind == SYM_STRUCT) {
+            const CobraType *canonical = (cg->root && cg->root->canonical_arena)
+                ? cobra_type_struct_layout(cg->root->canonical_arena, cg->root, s->type_name) : NULL;
+            if (!canonical) continue;
+            for (size_t f = 0; f < canonical->field_count; f++) {
+                const CobraTypeField *field = &canonical->fields[f];
+                if (field->ownership != COBRA_OWNERSHIP_OWNED || !field->type ||
+                    !(field->type->kind == COBRA_TYPE_STRING || cobra_type_is_slice_kind(field->type->kind)))
+                    continue;
+                int field_addr = s->array_base - (int)field->offset;
+                fprintf(cg->out,
+                        "    mov rdi, QWORD PTR [rbp-%d]\n    cmp rdi, 0\n    je .Lautofree_skip_%d\n    call free@PLT\n.Lautofree_skip_%d:\n",
+                        field_addr, cg->label_count, cg->label_count);
+                cg->label_count++;
+            }
         }
     }
 }
@@ -3447,6 +3468,105 @@ static void emit_inline_asm(CodeGen *cg, const char *source) {
     fputc('\n', cg->out);
 }
 
+/* True if `type_name` is a struct with at least one field the direct
+   backend already recognizes as heap-owned (owned string or owned slice) -
+   the exact shape the struct-field-ownership work this session made valid. */
+static bool struct_type_has_owned_scalar_fields(CodeGen *cg, const char *type_name) {
+    if (!cg->root || !cg->root->canonical_arena || !type_name || !type_name[0]) return false;
+    const CobraType *canonical = cobra_type_struct_layout(cg->root->canonical_arena, cg->root, type_name);
+    if (!canonical) return false;
+    for (size_t i = 0; i < canonical->field_count; i++) {
+        const CobraTypeField *f = &canonical->fields[i];
+        if (f->ownership == COBRA_OWNERSHIP_OWNED && f->type &&
+            (f->type->kind == COBRA_TYPE_STRING || cobra_type_is_slice_kind(f->type->kind))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct { char name[COBRA_MAX_IDENT_LEN]; const ASTNode *decl_node; } AutofreeCandidate;
+
+/* Walk the whole function body; disqualify a candidate the moment it's used
+   anywhere that could create a second owner of its heap storage: reassigned
+   as a whole value, copied into another variable, passed as a call argument,
+   returned, or one of its fields is written from an existing variable
+   (rather than a fresh literal/expression) - any of those could leave a
+   second live pointer to the same allocation, and this pass has no way to
+   prove that pointer dies first. Candidates that survive are the narrow,
+   provably-safe case: declared bare, mutated only via field writes from
+   fresh values, and never observed anywhere else. */
+static void autofree_scan_disqualify(const ASTNode *n, AutofreeCandidate *cands, bool *disq, int count) {
+    if (!n) return;
+    if (n->type == AST_FUNC_CALL) {
+        for (size_t i = 0; i < n->child_count; i++) {
+            const ASTNode *arg = n->children[i];
+            if (arg->type != AST_VAR_REF) continue;
+            for (int k = 0; k < count; k++)
+                if (!disq[k] && !strcmp(arg->name, cands[k].name)) disq[k] = true;
+        }
+    }
+    if (n->type == AST_RETURN) {
+        for (size_t i = 0; i < n->child_count; i++) {
+            const ASTNode *rv = n->children[i];
+            if (rv->type != AST_VAR_REF) continue;
+            for (int k = 0; k < count; k++)
+                if (!disq[k] && !strcmp(rv->name, cands[k].name)) disq[k] = true;
+        }
+    }
+    if (n->type == AST_ASSIGN || n->type == AST_VAR_DECL) {
+        for (int k = 0; k < count; k++) {
+            if (disq[k] || n == cands[k].decl_node) continue;
+            bool is_field_write = n->secondary_name[0] != '\0';
+            if (!is_field_write && !strcmp(n->name, cands[k].name)) {
+                disq[k] = true; /* whole-value reassignment of the candidate */
+            } else if (is_field_write && !strcmp(n->name, cands[k].name) &&
+                       n->child_count > 0 && n->children[0]->type == AST_VAR_REF) {
+                disq[k] = true; /* field populated from an existing variable, not a fresh value */
+            } else if (n->child_count > 0 && n->children[0]->type == AST_VAR_REF &&
+                       !strcmp(n->children[0]->name, cands[k].name) &&
+                       strcmp(n->name, cands[k].name) != 0) {
+                disq[k] = true; /* candidate copied elsewhere as an rvalue */
+            }
+        }
+    }
+    for (size_t i = 0; i < n->child_count; i++) autofree_scan_disqualify(n->children[i], cands, disq, count);
+}
+
+static void autofree_collect_candidates(const ASTNode *n, CodeGen *cg, AutofreeCandidate *cands, int *count) {
+    if (!n || *count >= 64) return;
+    if ((n->type == AST_ASSIGN || n->type == AST_VAR_DECL) &&
+        n->declared_type == COBRA_TYPE_STRUCT && n->child_count == 0 &&
+        struct_type_has_owned_scalar_fields(cg, ast_payload_name(n))) {
+        snprintf(cands[*count].name, COBRA_MAX_IDENT_LEN, "%.63s", n->name);
+        cands[*count].decl_node = n;
+        (*count)++;
+    }
+    for (size_t i = 0; i < n->child_count && *count < 64; i++)
+        autofree_collect_candidates(n->children[i], cg, cands, count);
+}
+
+/* Populates cg->safe_autofree_structs with the names of bare-declared struct
+   locals in `fn` provably safe to auto-free at scope exit; see the scan
+   functions above for the exact soundness conditions. */
+static void compute_safe_autofree_structs(CodeGen *cg, ASTNode *fn) {
+    cg->safe_autofree_count = 0;
+    static AutofreeCandidate cands[64];
+    int count = 0;
+    for (size_t i = 0; i < fn->child_count; i++) autofree_collect_candidates(fn->children[i], cg, cands, &count);
+    bool disq[64] = {0};
+    for (size_t i = 0; i < fn->child_count; i++) autofree_scan_disqualify(fn->children[i], cands, disq, count);
+    for (int i = 0; i < count && cg->safe_autofree_count < 64; i++) {
+        if (!disq[i]) snprintf(cg->safe_autofree_structs[cg->safe_autofree_count++], COBRA_MAX_IDENT_LEN, "%.63s", cands[i].name);
+    }
+}
+
+static bool is_safe_autofree_struct(CodeGen *cg, const char *name) {
+    for (int i = 0; i < cg->safe_autofree_count; i++)
+        if (!strcmp(cg->safe_autofree_structs[i], name)) return true;
+    return false;
+}
+
 static void emit_statement(CodeGen *cg, ASTNode *n) {
     if (!n) return;
     switch (n->type) {
@@ -3463,6 +3583,7 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
                    no struct heap object is created. */
                 for (int off = 0; off < size; off += 8)
                     fprintf(cg->out, "    mov QWORD PTR [rbp-%d], 0\n", s->array_base - off);
+                if (n->child_count == 0 && is_safe_autofree_struct(cg, n->name)) s->owned = true;
                 if (n->child_count > 0) {
                     ASTNode *initializer = n->children[0];
                     emit_expr(cg, initializer);
@@ -3839,6 +3960,7 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
 
 static void emit_function(CodeGen *cg, ASTNode *fn) {
     cg->symbol_count = 0; cg->stack_offset = COBRA_LOCAL_BASE; cg->loop_depth = 0;
+    compute_safe_autofree_structs(cg, fn);
     cg->current_return_type = fn->declared_type;
     cg->current_return_payload_type = ast_element_kind(fn);
     cg->current_return_error_type = ast_error_kind(fn);
