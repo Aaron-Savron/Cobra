@@ -1210,3 +1210,15 @@ callee's own stack slots at entry, so an `append`/index-write inside the
 callee never touches the caller's copy. That is by-value parameter passing,
 not a return-path bug, and needs pass-by-reference semantics for list
 parameters to fix -- left for a dedicated pass.
+
+`list[T]` still cannot be a struct field. The canonical type layer models a
+list as an 8-byte reference (`COBRA_ABI_REFERENCE`, `size = 8`), but a local
+list variable is actually three separate 8-byte stack slots (data pointer,
+length, capacity -- see `ensure_list_named` in `src/codegen.c`), not one
+boxed pointer. Embedding a list in a struct field would need a real boxed
+representation (heap-allocate the three-word header, store its pointer in
+the field) plus struct-field read/write/copy codegen that dereferences
+through that box -- a second list representation alongside the flat one
+used everywhere else, not a small addition. Left undone rather than forced;
+`direct_struct_field_supported_kind` in `src/ir.c` still has no
+`COBRA_TYPE_LIST` case.
