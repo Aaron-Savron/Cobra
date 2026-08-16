@@ -4495,6 +4495,11 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
                 emit_expr(cg, n->children[0]);
                 if (n->children[0]->value_type == COBRA_TYPE_STRING) {
                     fprintf(cg->out, "    mov rsi, rax\n    lea rdi, [rip + .fmt_string]\n    xor eax, eax\n    call printf@PLT\n");
+                } else if (expression_is_float_codegen(cg, n->children[0])) {
+                    /* Float values arrive in xmm0 from emit_expr, not rax; printf's
+                       variadic float promotion expects a double, and SysV requires
+                       al to hold the vector-register argument count. */
+                    fprintf(cg->out, "    cvtss2sd xmm0, xmm0\n    lea rdi, [rip + .fmt_float]\n    mov al, 1\n    call printf@PLT\n");
                 } else {
                     fprintf(cg->out, "    mov rsi, rax\n    lea rdi, [rip + .fmt_int]\n    xor eax, eax\n    call printf@PLT\n");
                 }
@@ -4864,6 +4869,13 @@ static bool generate(ASTNode *root, const char *path, TargetPlatform target, boo
     fputs(".fmt_string:", f);
     fputc(10, f);
     fputs(".string \"%s", f);
+    fputc(92, f);
+    fputc('n', f);
+    fputc(34, f);
+    fputc(10, f);
+    fputs(".fmt_float:", f);
+    fputc(10, f);
+    fputs(".string \"%g", f);
     fputc(92, f);
     fputc('n', f);
     fputc(34, f);

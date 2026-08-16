@@ -1,0 +1,26 @@
+# print() on an f32 value used to read stale/garbage rax and format with
+# %ld, since float expressions leave their result in xmm0, not rax. Confirmed
+# via /tmp probe: print(7.0) printed the raw bit pattern of the float
+# (1088421888) instead of "7". This locks in the fix: float args now widen
+# to double and go through printf's vector-register argument slot.
+
+def test_print_float_local(): {
+    x = 7.0
+    print(x)
+    assert(x == 7.0)
+    return 0
+}
+
+def test_print_float_buffer(): {
+    a = alloc_f32(4)
+    fill_f32(a, 3.5)
+    print(a[0])
+    assert(a[0] == 3.5)
+    free(a)
+    return 0
+}
+
+def test_print_float_expr(): {
+    print(2.0 * 3.0 + 1.0)
+    return 0
+}
