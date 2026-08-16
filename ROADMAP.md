@@ -1240,31 +1240,43 @@ remains future work, tracked alongside the larger implicit-generics design
 question.
 
 Implicit-generic parameter inference, phase 1: `def name[](params)` (empty
-brackets) marks exactly one omitted-type parameter as implicitly generic,
-reusing `specialize_generic_function`/`specialize_ast_tree` unchanged -- the
+brackets) marks an omitted-type parameter as implicitly generic, reusing
+`specialize_generic_function`/`specialize_ast_tree` unchanged -- the
 omitted parameter gets the same `COBRA_TYPE_GENERIC_PARAM` placeholder an
 explicit `x: T` would (`assign_implicit_generic_param` in `src/parser.c`),
 so it is monomorphized per call site through the identical pipeline. This
 does not reverse the bare-parameter rejection above: `def name(params)`
 (no brackets) stays an error; only the new `[]` form infers. Return types
-stay fixed and explicit -- they are not generic in this phase. `export def
-name[](params)` (mirrors the existing `pub`/`private` modifier position,
-before `def`) requires at least one real call site to exist by end of
-compilation, checked once at the end of `cobra_ir_build`, so a template
-with no caller does not silently ship unchecked. A failed specialization's
-diagnostic now names both the triggering call site and the template
-declaration (`specialization_call_line/col/file` on the specialized
-`ASTNode`, set in `specialize_generic_function` from the calling
-`AST_FUNC_CALL` node).
+stay fixed and explicit -- they are not generic. `export def name[](params)`
+(mirrors the existing `pub`/`private` modifier position, before `def`)
+requires at least one real call site to exist by end of compilation,
+checked once at the end of `cobra_ir_build`, so a template with no caller
+does not silently ship unchecked. A failed specialization's diagnostic
+names both the triggering call site and the template declaration
+(`specialization_call_line/col/file` on the specialized `ASTNode`, set in
+`specialize_generic_function` from the calling `AST_FUNC_CALL` node).
 
-Deferred to phase 2: more than one inferred parameter per function (today a
-second omitted parameter is a hard compile error, not silent unification or
-partial support) -- needs lifting the single-`T` generic-parameter cap in
-both the parser (`src/parser.c`, "generic functions currently require
-exactly one identifier type parameter") and the specialization pipeline
-(`generic_param_types[COBRA_MAX_TYPE_ARGS]`, currently only index 0 is ever
-populated by either explicit or implicit generics). Phase 3: richer
-diagnostics. Deferred indefinitely: implicitly-generic functions as
-`fn(...)->...` values/closures/`dyn Trait` receivers (same restriction
-explicit `[T]` generics already have, `src/ir.c` "generic functions cannot
-be used as function values yet").
+Phase 2: more than one inferred parameter per function. Each omitted
+parameter gets its own independent generic slot (`assign_implicit_generic_param`
+now increments `fn_node->generic_param_count` per omission instead of
+erroring on a second one), up to `COBRA_MAX_TYPE_ARGS` (8) -- a 9th is a
+compile error, not silent truncation. `specialize_generic_function`/
+`find_specialization` take an argument array instead of one type, and the
+call-site binding loop in `cobra_ir_build`'s `AST_FUNC_CALL` handling maps
+each parameter to its matching slot by canonical-type pointer identity
+before calling `bind_generic_type`, rather than assuming slot 0. One real
+subtlety: substituting N slots one at a time over the whole specialized
+tree would make an unsubstituted later slot fail ABI validation mid-walk
+(a bare `COBRA_TYPE_GENERIC_PARAM` looks unresolved until every slot is
+filled), so `specialize_ast_tree_impl` takes a `validate_when_complete`
+flag -- every slot substitutes first with validation off, then a second
+pass (now a no-op for already-substituted nodes) validates once everything
+is resolved. Named `def name[T](x: T)` generics are unaffected and stay
+capped at exactly one explicit type parameter by the parser; only the
+implicit `[]` form uses the N-slot path.
+
+Phase 3: richer diagnostics beyond the two-location note already shipped.
+Deferred indefinitely: implicitly-generic functions as `fn(...)->...`
+values/closures/`dyn Trait` receivers (same restriction explicit `[T]`
+generics already have, `src/ir.c` "generic functions cannot be used as
+function values yet").

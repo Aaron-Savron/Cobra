@@ -1,0 +1,11 @@
+# def name[](...) caps implicitly-inferred parameters at COBRA_MAX_TYPE_ARGS
+# (8). A 9th omitted parameter must be rejected, not silently truncated or
+# left with an unbound generic slot.
+
+def many[](a, b, c, d, e, f, g, h, i) -> i64: {
+    return a
+}
+
+def test_many(): {
+    return many(1, 2, 3, 4, 5, 6, 7, 8, 9)
+}

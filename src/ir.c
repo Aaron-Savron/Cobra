@@ -1137,9 +1137,15 @@ static bool type_contains_generic_type(const CobraType *type,
     return false;
 }
 
-static void specialize_ast_tree(IRContext *ctx, ASTNode *node,
-                                const CobraType *parameter,
-                                const CobraType *argument) {
+/* With N independent generic slots, this runs once per slot over the whole
+   tree; a node holding a not-yet-substituted slot (still a bare
+   COBRA_TYPE_GENERIC_PARAM placeholder) must not be validated as a real ABI
+   type until every slot has been substituted, so validation only happens
+   when validate_when_complete is true (the final pass, after all slots). */
+static void specialize_ast_tree_impl(IRContext *ctx, ASTNode *node,
+                                     const CobraType *parameter,
+                                     const CobraType *argument,
+                                     bool validate_when_complete) {
     if (!node) return;
     if (node->canonical_type) {
         bool contains_parameter = type_contains_generic_type(node->canonical_type, parameter);
@@ -1150,12 +1156,22 @@ static void specialize_ast_tree(IRContext *ctx, ASTNode *node,
                 node->declared_type = node->canonical_type->kind;
             if (contains_parameter && node->value_type != COBRA_TYPE_UNTYPED)
                 node->value_type = node->canonical_type->kind;
-            if (!cobra_type_validate(ctx->canonical_arena, node->canonical_type))
+            if (validate_when_complete &&
+                node->canonical_type->kind != COBRA_TYPE_GENERIC_PARAM &&
+                !cobra_type_validate(ctx->canonical_arena, node->canonical_type))
                 ir_error(ctx, node, "generic specialization has no valid ABI representation");
         }
     }
     for (size_t i = 0; i < node->child_count; i++)
-        specialize_ast_tree(ctx, node->children[i], parameter, argument);
+        specialize_ast_tree_impl(ctx, node->children[i], parameter, argument, validate_when_complete);
+}
+
+/* Single-slot callers (explicit def foo[T](...) generics) keep the original
+   substitute-and-validate-in-one-pass behavior. */
+static void specialize_ast_tree(IRContext *ctx, ASTNode *node,
+                                const CobraType *parameter,
+                                const CobraType *argument) {
+    specialize_ast_tree_impl(ctx, node, parameter, argument, true);
 }
 
 static ASTNode *clone_ast_tree(const ASTNode *source) {
@@ -1178,23 +1194,37 @@ static ASTNode *clone_ast_tree(const ASTNode *source) {
 }
 
 static ASTNode *find_specialization(IRContext *ctx, ASTNode *generic,
-                                    const CobraType *argument) {
-    if (!ctx || !ctx->root || !generic || !argument) return NULL;
+                                    const CobraType **arguments, size_t argument_count) {
+    if (!ctx || !ctx->root || !generic || !arguments || argument_count == 0) return NULL;
     for (size_t i = 0; i < ctx->root->child_count; i++) {
         ASTNode *candidate = ctx->root->children[i];
-        if (candidate->type == AST_FUNCTION &&
-            candidate->specialized_from == generic &&
-            candidate->specialization_arg_count == 1 &&
-            candidate->specialization_args[0] &&
-            cobra_type_equal(candidate->specialization_args[0], argument)) return candidate;
+        if (candidate->type != AST_FUNCTION || candidate->specialized_from != generic ||
+            candidate->specialization_arg_count != argument_count) continue;
+        bool match = true;
+        for (size_t k = 0; k < argument_count; k++) {
+            if (!candidate->specialization_args[k] || !arguments[k] ||
+                !cobra_type_equal(candidate->specialization_args[k], arguments[k])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return candidate;
     }
     return NULL;
 }
 
+/* arguments[i] binds generic->generic_param_types[i]; each omitted parameter
+   in a def foo[](...) declaration gets its own independent slot, so a
+   function with N omitted parameters specializes against N argument types
+   here, one per slot, in declaration order. */
 static ASTNode *specialize_generic_function(IRContext *ctx, ASTNode *generic,
-                                             const CobraType *argument, const ASTNode *call_site) {
-    if (!ctx || !generic || generic->generic_param_count != 1 ||
-        !generic->generic_param_types[0] || !generic_scalar_argument(argument)) return NULL;
+                                             const CobraType **arguments, size_t argument_count,
+                                             const ASTNode *call_site) {
+    if (!ctx || !generic || generic->generic_param_count != argument_count ||
+        argument_count == 0 || argument_count > COBRA_MAX_TYPE_ARGS) return NULL;
+    for (size_t i = 0; i < argument_count; i++) {
+        if (!generic->generic_param_types[i] || !generic_scalar_argument(arguments[i])) return NULL;
+    }
     if (ctx->current_function &&
         (ctx->current_function == generic ||
          ctx->current_function->specialized_from == generic)) {
@@ -1202,9 +1232,12 @@ static ASTNode *specialize_generic_function(IRContext *ctx, ASTNode *generic,
         return NULL;
     }
     char specialized_name[COBRA_MAX_IDENT_LEN];
-    snprintf(specialized_name, sizeof(specialized_name), "%.47s__%s",
-             generic->name, cobra_type_kind_name(argument->kind));
-    ASTNode *existing = find_specialization(ctx, generic, argument);
+    int offset = snprintf(specialized_name, sizeof(specialized_name), "%.47s", generic->name);
+    for (size_t i = 0; i < argument_count && offset > 0 && (size_t)offset < sizeof(specialized_name); i++) {
+        offset += snprintf(specialized_name + offset, sizeof(specialized_name) - (size_t)offset,
+                           "__%s", cobra_type_kind_name(arguments[i]->kind));
+    }
+    ASTNode *existing = find_specialization(ctx, generic, arguments, argument_count);
     if (existing) return existing;
     ASTNode *name_collision = find_function(ctx, specialized_name);
     if (name_collision) {
@@ -1224,15 +1257,21 @@ static ASTNode *specialize_generic_function(IRContext *ctx, ASTNode *generic,
     memset(specialized->generic_param_names, 0, sizeof(specialized->generic_param_names));
     memset(specialized->generic_param_types, 0, sizeof(specialized->generic_param_types));
     specialized->specialized_from = generic;
-    specialized->specialization_arg_count = 1;
-    specialized->specialization_args[0] = argument;
+    specialized->specialization_arg_count = argument_count;
+    for (size_t i = 0; i < argument_count; i++) specialized->specialization_args[i] = arguments[i];
     if (call_site) {
         specialized->specialization_call_line = call_site->source_line;
         specialized->specialization_call_col = call_site->source_col;
         snprintf(specialized->specialization_call_file, sizeof(specialized->specialization_call_file),
                  "%.255s", call_site->source_file);
     }
-    specialize_ast_tree(ctx, specialized, generic->generic_param_types[0], argument);
+    /* Substitute every slot before validating ABI representation, since a
+       node holding an unsubstituted later slot would otherwise fail
+       validation as if it were a real (unresolved) type mid-walk. */
+    for (size_t i = 0; i < argument_count; i++)
+        specialize_ast_tree_impl(ctx, specialized, generic->generic_param_types[i], arguments[i], false);
+    for (size_t i = 0; i < argument_count; i++)
+        specialize_ast_tree_impl(ctx, specialized, generic->generic_param_types[i], arguments[i], true);
     for (size_t i = 0; i < specialized->child_count; i++) {
         ASTNode *param = specialized->children[i];
         if (param->type == AST_PARAM &&
@@ -2317,42 +2356,54 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
             }
             ASTNode *called_function = find_function(ctx, node->name);
             if (called_function && called_function->generic_param_count > 0) {
-                if (called_function->generic_param_count != 1) {
-                    ir_error(ctx, node, "generic functions currently require exactly one type parameter");
-                    called_function = NULL;
-                } else {
-                    const CobraType *binding = NULL;
-                    bool valid = true;
-                    size_t argument_index = 0;
-                    for (size_t i = 0; i < called_function->child_count; i++) {
-                        ASTNode *param = called_function->children[i];
-                        if (param->type != AST_PARAM) continue;
-                        if (argument_index >= node->child_count) {
-                            valid = false;
-                            break;
-                        }
-                        ASTNode *argument = node->children[argument_index++];
-                        infer_expr(argument, ctx);
-                        if (!bind_generic_type(param->canonical_type,
-                                               argument->canonical_type,
-                                               called_function->generic_param_types[0],
-                                               &binding)) {
-                            valid = false;
+                /* Named `[T]` generics stay capped at one type parameter by
+                   the parser; implicit `def foo[](...)` inference can bind
+                   up to COBRA_MAX_TYPE_ARGS independent slots, one per
+                   omitted parameter, so this loop is written for the
+                   general N case rather than assuming exactly one. */
+                size_t generic_count = called_function->generic_param_count;
+                const CobraType *bindings[COBRA_MAX_TYPE_ARGS] = {0};
+                bool valid = true;
+                size_t argument_index = 0;
+                for (size_t i = 0; i < called_function->child_count; i++) {
+                    ASTNode *param = called_function->children[i];
+                    if (param->type != AST_PARAM) continue;
+                    if (argument_index >= node->child_count) {
+                        valid = false;
+                        break;
+                    }
+                    ASTNode *argument = node->children[argument_index++];
+                    infer_expr(argument, ctx);
+                    size_t slot = 0;
+                    for (size_t s = 0; s < generic_count; s++) {
+                        if (param->canonical_type == called_function->generic_param_types[s]) {
+                            slot = s;
                             break;
                         }
                     }
-                    if (argument_index != node->child_count || !binding) valid = false;
-                    if (!valid) {
-                        ir_error(ctx, node, "generic call has an ambiguous, mismatched, or unsupported type argument");
+                    if (!bind_generic_type(param->canonical_type,
+                                           argument->canonical_type,
+                                           called_function->generic_param_types[slot],
+                                           &bindings[slot])) {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (argument_index != node->child_count) valid = false;
+                for (size_t s = 0; s < generic_count; s++) {
+                    if (!bindings[s]) valid = false;
+                }
+                if (!valid) {
+                    ir_error(ctx, node, "generic call has an ambiguous, mismatched, or unsupported type argument");
+                    called_function = NULL;
+                } else {
+                    ASTNode *specialized = specialize_generic_function(ctx, called_function, bindings,
+                                                                       generic_count, node);
+                    if (!specialized) {
                         called_function = NULL;
                     } else {
-                        ASTNode *specialized = specialize_generic_function(ctx, called_function, binding, node);
-                        if (!specialized) {
-                            called_function = NULL;
-                        } else {
-                            snprintf(node->name, sizeof(node->name), "%.63s", specialized->name);
-                            called_function = specialized;
-                        }
+                        snprintf(node->name, sizeof(node->name), "%.63s", specialized->name);
+                        called_function = specialized;
                     }
                 }
             }
@@ -4422,10 +4473,14 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
                 bool generic_collection = param->declared_type == COBRA_TYPE_LIST;
                 if (!generic_collection && param->canonical_type &&
                     generic_slice_kind(param->canonical_type->kind) &&
-                    param->canonical_type->mutability == COBRA_MUTABILITY_OUT &&
-                    type_contains_generic_type(param->canonical_type,
-                                               function->generic_param_types[0])) {
-                    generic_collection = true;
+                    param->canonical_type->mutability == COBRA_MUTABILITY_OUT) {
+                    for (size_t s = 0; s < function->generic_param_count; s++) {
+                        if (type_contains_generic_type(param->canonical_type,
+                                                       function->generic_param_types[s])) {
+                            generic_collection = true;
+                            break;
+                        }
+                    }
                 }
                 if (!generic_collection) continue;
                 ir_error(&root_context, param,
@@ -4595,11 +4650,20 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
         check_canonical_tree(&ctx, function);
         if (ctx.errors > 0 && function->specialized_from && function->specialization_call_file[0]) {
             const char *template_name = function->specialized_from->name;
+            char arg_list[128];
+            size_t arg_offset = 0;
+            for (size_t k = 0; k < function->specialization_arg_count && arg_offset < sizeof(arg_list); k++) {
+                int written = snprintf(arg_list + arg_offset, sizeof(arg_list) - arg_offset, "%s%s",
+                                       k > 0 ? ", " : "",
+                                       function->specialization_args[k]
+                                           ? cobra_type_kind_name(function->specialization_args[k]->kind)
+                                           : "?");
+                if (written > 0) arg_offset += (size_t)written;
+            }
             fprintf(stderr, "%s:%d:%d: note: in specialization of %s() with (%s): "
                              "errors above are from the template at %s:%d:%d\n",
                     function->specialization_call_file, function->specialization_call_line,
-                    function->specialization_call_col, template_name,
-                    function->specialization_args[0] ? cobra_type_kind_name(function->specialization_args[0]->kind) : "?",
+                    function->specialization_call_col, template_name, arg_list,
                     function->specialized_from->source_file, function->specialized_from->source_line,
                     function->specialized_from->source_col);
         }

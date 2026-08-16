@@ -1,0 +1,36 @@
+# Phase 2: def name[](...) supports N independently-inferred parameters,
+# not just one. Each omitted parameter gets its own generic slot (no
+# unification between distinct parameter names), monomorphized together
+# per call site through the same specialize_generic_function pipeline.
+
+def add[](a, b) -> i64: {
+    return a + b
+}
+
+def add_f32[](a, b) -> f32: {
+    return a + b
+}
+
+def scale[](x, factor: i64) -> i64: {
+    return x * factor
+}
+
+def test_multi_param_i64(): {
+    let r: i64 = add(3, 4)
+    assert(r == 7)
+    return 0
+}
+
+def test_multi_param_f32_independent_specialization(): {
+    let a: i64 = add(3, 4)
+    assert(a == 7)
+    let b: f32 = add_f32(1.5, 2.5)
+    assert(b == 4.0)
+    return 0
+}
+
+def test_mixed_generic_and_concrete_param(): {
+    let r: i64 = scale(6, 7)
+    assert(r == 42)
+    return 0
+}

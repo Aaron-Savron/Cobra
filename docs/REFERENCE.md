@@ -118,16 +118,18 @@ def apply(f: fn(i64, i64) -> i64, x: i64, y: i64) -> i64: {
 apply(def(a: i64, b: i64) -> i64: { return a * b }, 6, 7)  # 42
 ```
 
-## Implicit Generic Parameters (phase 1)
+## Implicit Generic Parameters
 
-`def name[](params)` (empty brackets, no named type parameter) marks exactly
-one parameter left without a `: type` annotation as implicitly generic: it is
-monomorphized per call site through the same specialization pipeline as an
+`def name[](params)` (empty brackets, no named type parameter) marks every
+parameter left without a `: type` annotation as implicitly generic: each
+omitted parameter gets its own independent slot (no unification between
+distinct parameter names, up to `COBRA_MAX_TYPE_ARGS` = 8), monomorphized
+together per call site through the same specialization pipeline as an
 explicit `def name[T](x: T)`, instead of being rejected the way a bare
 parameter is under `def name(params)` (a bare parameter with no brackets at
 all is always a compile-time error - see Type Foundation above). The return
-type and every other parameter must still be an explicit, fixed, non-generic
-type; only one inferred parameter per function is supported in this phase.
+type and any explicitly-typed parameter must still be a fixed, non-generic
+type.
 
 ```cobra
 def double_it[](x) -> i64: { return x * 2 }
@@ -135,6 +137,12 @@ def times_ten[](x) -> f32: { return x * 10.0 }
 
 double_it(21)   # 42, specialized for i64
 times_ten(7.0)  # 70.0, an independent specialization for f32
+
+def add[](a, b) -> i64: { return a + b }
+def scale[](x, factor: i64) -> i64: { return x * factor }
+
+add(3, 4)      # 7, two independently-inferred parameters
+scale(6, 7)    # 42, one inferred parameter plus one fixed-type parameter
 ```
 
 `export def name[](params)` requires at least one call site to exist by end

@@ -1743,27 +1743,28 @@ static ASTNode *parse_struct_declaration(Parser *parser) {
    ordinary bare-parameter error: it gets the same COBRA_TYPE_GENERIC_PARAM
    placeholder an explicit `x: T` would, so it flows through the existing
    specialize_generic_function/specialize_ast_tree monomorphization pipeline
-   unchanged. Phase 1 allows exactly one such parameter per function; a
-   second omitted parameter is a hard error rather than silently unifying
-   with the first or being left untyped. */
+   unchanged. Each omitted parameter gets its own independent generic slot
+   (no unification between distinct parameter names), up to
+   COBRA_MAX_TYPE_ARGS. */
 static void assign_implicit_generic_param(Parser *parser, ASTNode *fn_node, ASTNode *param,
-                                          bool is_implicit_generic_fn,
-                                          const CobraType **implicit_generic_type) {
+                                          bool is_implicit_generic_fn) {
     if (!is_implicit_generic_fn) return;
-    if (*implicit_generic_type) {
-        fprintf(stderr, "%s:%d:%d: error: phase 1 only supports one inferred parameter per function; "
-                         "multiple inferred parameters are not yet supported\n",
-                parser->source_file, parser->current_token.line, parser->current_token.col);
+    if (fn_node->generic_param_count >= COBRA_MAX_TYPE_ARGS) {
+        fprintf(stderr, "%s:%d:%d: error: too many inferred parameters (max %d)\n",
+                parser->source_file, parser->current_token.line, parser->current_token.col,
+                COBRA_MAX_TYPE_ARGS);
         exit(1);
     }
-    *implicit_generic_type = cobra_type_make(parser->canonical_arena, COBRA_TYPE_GENERIC_PARAM,
-                                             "__auto", NULL, NULL, NULL, NULL,
+    size_t index = fn_node->generic_param_count++;
+    char slot_name[COBRA_MAX_IDENT_LEN];
+    snprintf(slot_name, sizeof(slot_name), "__auto%zu", index);
+    const CobraType *slot_type = cobra_type_make(parser->canonical_arena, COBRA_TYPE_GENERIC_PARAM,
+                                             slot_name, NULL, NULL, NULL, NULL,
                                              COBRA_OWNERSHIP_VALUE, COBRA_MUTABILITY_DEFAULT, -1);
     param->declared_type = COBRA_TYPE_GENERIC_PARAM;
-    param->canonical_type = *implicit_generic_type;
-    snprintf(fn_node->generic_param_names[0], COBRA_MAX_IDENT_LEN, "__auto");
-    fn_node->generic_param_types[0] = *implicit_generic_type;
-    fn_node->generic_param_count = 1;
+    param->canonical_type = slot_type;
+    snprintf(fn_node->generic_param_names[index], COBRA_MAX_IDENT_LEN, "%s", slot_name);
+    fn_node->generic_param_types[index] = slot_type;
 }
 
 /* Shared by named `def foo(...)` declarations and anonymous closure
@@ -1819,7 +1820,6 @@ static ASTNode *parse_function_signature_and_body(Parser *parser, ASTNode *fn_no
     // Alias contracts use contextual qualifiers (out/readonly) after the
     // colon, so existing code that names a variable `out` keeps working.
     bool is_implicit_generic_fn = saw_generic_brackets && parser->generic_param_count == 0;
-    const CobraType *implicit_generic_type = NULL;
     if (!match(parser, TOKEN_RPAREN)) {
         if (match(parser, TOKEN_IDENTIFIER)) {
             ASTNode *param = parser_create_node(parser, AST_PARAM, parser->current_token.text);
@@ -1839,8 +1839,7 @@ static ASTNode *parse_function_signature_and_body(Parser *parser, ASTNode *fn_no
                 param->declared_type = parse_type_into(parser, "parameter", param, alias_qualifier);
 
             } else {
-                assign_implicit_generic_param(parser, fn_node, param, is_implicit_generic_fn,
-                                              &implicit_generic_type);
+                assign_implicit_generic_param(parser, fn_node, param, is_implicit_generic_fn);
             }
 
             while (match(parser, TOKEN_COMMA)) {
@@ -1862,8 +1861,7 @@ static ASTNode *parse_function_signature_and_body(Parser *parser, ASTNode *fn_no
                         p->declared_type = parse_type_into(parser, "parameter", p, alias_qualifier);
 
                     } else {
-                        assign_implicit_generic_param(parser, fn_node, p, is_implicit_generic_fn,
-                                                      &implicit_generic_type);
+                        assign_implicit_generic_param(parser, fn_node, p, is_implicit_generic_fn);
                     }
                 }
             }
