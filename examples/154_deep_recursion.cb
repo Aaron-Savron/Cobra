@@ -1,0 +1,27 @@
+# Function frames are now sized to each function's actual local usage
+# instead of a flat 4096-byte reservation, raising the safe recursion depth
+# far above what the old constant allowed for small-frame functions.
+
+def descend(n: i64) -> i64: {
+    if n <= 0: {
+        return 0
+    }
+    return 1 + descend(n - 1)
+}
+
+def sum_down(n: i64, acc: i64) -> i64: {
+    if n <= 0: {
+        return acc
+    }
+    return sum_down(n - 1, acc + n)
+}
+
+def test_deep_recursion_small_frame(): {
+    assert(descend(15000) == 15000)
+    return 0
+}
+
+def test_deep_recursion_correct_accumulation(): {
+    assert(sum_down(1000, 0) == 500500)
+    return 0
+}

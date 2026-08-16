@@ -1280,3 +1280,47 @@ Deferred indefinitely: implicitly-generic functions as `fn(...)->...`
 values/closures/`dyn Trait` receivers (same restriction explicit `[T]`
 generics already have, `src/ir.c` "generic functions cannot be used as
 function values yet").
+
+Function frames were a flat `sub rsp, 4096` regardless of a function's
+actual local/temp usage (`COBRA_FRAME_BYTES`, `emit_function` in
+`src/codegen.c`), capping safe recursion depth at ~2000 calls universally
+-- even a zero-local function paid the same reservation as one that
+genuinely needed 4KB. Fixed: `emit_function` now buffers a function's
+whole prologue+body through `open_memstream`, reads the real peak
+`cg->stack_offset` reached during compilation once the body is done
+(reserve() only ever grows it, so the value at the end is the true peak,
+not an underestimate), and patches the placeholder `sub rsp, 4096` text to
+the real 16-byte-aligned size before flushing to the real output. This is
+purely a text patch on the already-emitted prologue line -- no new
+runtime mechanism, no change to how locals get their offsets. Measured
+result on this machine (8MB `ulimit -s`): a trivial small-frame recursive
+function's safe depth went from ~2200 to ~25000-30000 (roughly 12x);
+depth and computed values verified correct, not just "didn't crash" (see
+`examples/154_deep_recursion.cb`). @parallel workers and fn-value thunks
+(`flush_pending_parallel`/`flush_pending_fn_thunks`) get their own
+separate function frames emitted after this function's frame size is
+captured and flushed, so they're unaffected and still use the flat
+`COBRA_FRAME_BYTES` reservation -- narrowing that is future work.
+
+Tightening the frame size exposed two real, previously-latent bugs that
+the old 4096-byte margin had silently absorbed -- both fixed alongside
+the frame-size change, since shipping the tighter frame without them
+would have reintroduced stack corruption for real programs:
+1. Multi-argument call marshalling (`emit_call`'s `slot = temp + i * 24`)
+   used `reserve()`'s return value (the TOP of the newly reserved region)
+   as if it were the region's base, then walked to increasingly higher
+   offsets for each argument -- overrunning the reservation by
+   `(child_count-1)*24` bytes for any call with 2+ arguments. Fixed by
+   anchoring from `call_arg_base = temp - child_count*24` instead, so
+   every argument's slot stays within what was actually reserved. See
+   `examples/155_frame_size_regression_coverage.cb`'s
+   `test_seven_argument_call`.
+2. Struct/list/dict/tensor return values pass a caller-allocated sret
+   pointer (`result_temp`) to the callee, but the callee's write loop
+   addresses it as the NEAR end and walks to deeper offsets
+   (`[rax-0]` .. `[rax-(result_size-8)]`), not toward `rbp` -- the caller
+   was only reserving up to `result_temp` itself, not the additional
+   `result_size-8` bytes the callee actually writes past it. Fixed by
+   reserving that extra depth too. See the same example's
+   `test_struct_return_round_trip` (a struct value round-tripped through
+   two chained calls, the exact shape that segfaulted before this fix).

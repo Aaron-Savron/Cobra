@@ -1,0 +1,41 @@
+# Tightening each function's frame to its actual usage (155/154) exposed two
+# pre-existing bugs previously masked by the old flat 4096-byte margin:
+# multi-argument call marshalling walked past its reserved scratch region,
+# and struct/tensor/list/dict sret destinations were undersized relative to
+# how the callee's write loop actually walks past the pointer it's given.
+
+struct Point3: { x: i64, y: i64, z: i64 }
+
+def make_point(x: i64, y: i64, z: i64) -> Point3: {
+    let p: Point3
+    p.x = x
+    p.y = y
+    p.z = z
+    return p
+}
+
+def identity_point(p: Point3) -> Point3: {
+    return p
+}
+
+def round_trip_point(p: Point3) -> Point3: {
+    return identity_point(p)
+}
+
+def sum_seven(a: i64, b: i64, c: i64, d: i64, e: i64, f: i64, g: i64) -> i64: {
+    return a + b + c + d + e + f + g
+}
+
+def test_struct_return_round_trip(): {
+    let p: Point3 = make_point(3, 4, 5)
+    let result: Point3 = round_trip_point(p)
+    assert(result.x == 3)
+    assert(result.y == 4)
+    assert(result.z == 5)
+    return 0
+}
+
+def test_seven_argument_call(): {
+    assert(sum_seven(1, 2, 3, 4, 5, 6, 7) == 28)
+    return 0
+}

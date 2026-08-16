@@ -3102,16 +3102,26 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
         if (tensor_return || struct_return || list_return || dict_return) {
             cg->stack_offset += result_size;
             result_temp = cg->stack_offset;
+            /* The callee's sret write loop addresses this pointer as its near
+               end and walks to DEEPER offsets ([rax-0] .. [rax-(result_size-8)]),
+               not toward rbp - reserve that extra depth too, or the write
+               range extends past what was actually accounted for here. */
+            cg->stack_offset += result_size - 8;
         } else {
             cg->stack_offset += result_size;
             result_temp = cg->stack_offset - result_size + 8;
         }
     }
     int temp = reserve(cg, (int)n->child_count * 24 + 16);
+    /* reserve() returns the top (highest/most-negative) offset of the newly
+       reserved region, not its base - anchor slot arithmetic from that top
+       downward so every arg's 24-byte stride stays inside what was actually
+       reserved, instead of walking past it by (child_count-1)*24 bytes. */
+    int call_arg_base = temp - (int)n->child_count * 24;
     for (int i = (int)n->child_count - 1; i >= 0; i--) {
         CobraTypeKind t = function_param_type(cg, n->name, (size_t)i);
         ASTNode *arg = n->children[i];
-        int slot = temp + i * 24;
+        int slot = call_arg_base + i * 24;
         if (t == COBRA_TYPE_SLICE || t == COBRA_TYPE_SLICE_F32 || t == COBRA_TYPE_SLICE_U8) {
             if (arg->type != AST_VAR_REF) { fprintf(stderr, "CodeGen Error: slice arguments must be named buffers\n"); exit(EXIT_FAILURE); }
             emit_load_buffer_ptr(cg, arg->name, "rax");
@@ -3164,7 +3174,7 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
     if (compound_return) fprintf(cg->out, "    lea rdi, [rbp-%d]\n", result_temp);
     for (size_t i = 0; i < n->child_count; i++) {
         CobraTypeKind t = function_param_type(cg, n->name, i);
-        int slot = temp + (int)i * 24;
+        int slot = call_arg_base + (int)i * 24;
         if (t == COBRA_TYPE_F32 || t == COBRA_TYPE_F64) {
             if (xmm < 8) fprintf(cg->out, "    movss %s, DWORD PTR [rbp-%d]\n", SYSV_XMM_REGS[xmm++], slot);
             else { fprintf(cg->out, "    movss xmm15, DWORD PTR [rbp-%d]\n    movss DWORD PTR [rsp+%d], xmm15\n", slot, stack_index * 8); stack_index++; }
@@ -4667,6 +4677,24 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
     bool list_return = fn->declared_type == COBRA_TYPE_LIST;
     bool dict_return = fn->declared_type == COBRA_TYPE_DICT;
     bool compound_return = tensor_return || sum_return || struct_return || list_return || dict_return;
+
+    /* The exact stack frame a function needs is only known after its whole
+       body has been compiled (reserve() grows cg->stack_offset monotonically
+       as locals/temps are seen). Buffer this function's emission in memory so
+       the flat COBRA_FRAME_BYTES placeholder below can be patched to the real
+       size once compilation finishes, instead of every function paying the
+       same worst-case reservation regardless of how little it actually uses -
+       that flat cost is what capped recursion depth at ~2000 calls uniformly.
+       @parallel workers and fn-value thunks get their own separate frames via
+       flush_pending_parallel/flush_pending_fn_thunks below and are emitted
+       after this function's frame size is captured and flushed, so their own
+       COBRA_FRAME_BYTES reservations are unaffected by this. */
+    FILE *real_out = cg->out;
+    char *body_buf = NULL;
+    size_t body_len = 0;
+    FILE *mem = open_memstream(&body_buf, &body_len);
+    cg->out = mem;
+
     fprintf(cg->out, "    .intel_syntax noprefix\n");
     /* The native test runner calls test_* functions from a separate C
        translation unit. They remain externally visible only in test mode;
@@ -4825,6 +4853,34 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
     emit_scope_cleanup(cg, NULL);
     fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n", COBRA_SCR_TMP);
     emit_return_epilogue(cg);
+
+    /* Capture the true peak before flush_pending_parallel/flush_pending_fn_thunks
+       reset cg->stack_offset for their own separate function frames. */
+    int frame_size = (cg->stack_offset + 15) & ~15;
+    if (frame_size < COBRA_LOCAL_BASE) frame_size = COBRA_LOCAL_BASE;
+    if (frame_size > COBRA_FRAME_BYTES) frame_size = COBRA_FRAME_BYTES;
+
+    fclose(mem);
+    cg->out = real_out;
+
+    char placeholder[64];
+    char replacement[64];
+    snprintf(placeholder, sizeof(placeholder), "sub rsp, %d\n", COBRA_FRAME_BYTES);
+    snprintf(replacement, sizeof(replacement), "sub rsp, %d\n", frame_size);
+    char *match = memmem(body_buf, body_len, placeholder, strlen(placeholder));
+    if (match) {
+        size_t prefix_len = (size_t)(match - body_buf);
+        size_t suffix_off = prefix_len + strlen(placeholder);
+        fwrite(body_buf, 1, prefix_len, cg->out);
+        fputs(replacement, cg->out);
+        fwrite(body_buf + suffix_off, 1, body_len - suffix_off, cg->out);
+    } else {
+        /* Should be unreachable (the prologue always emits this exact text
+           first), but never silently drop the function body if it happens. */
+        fwrite(body_buf, 1, body_len, cg->out);
+    }
+    free(body_buf);
+
     /* @parallel workers are emitted after the caller's body, so the caller
        never falls through into a worker prologue. */
     flush_pending_parallel(cg);
