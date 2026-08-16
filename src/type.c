@@ -241,9 +241,8 @@ int cobra_type_abi_slots(const CobraType *type) {
         case COBRA_TYPE_V256: /* 256-bit vector: passed as a pointer+length view */
             return 2;
         case COBRA_TYPE_LIST:
-            return 3; /* pointer, length, capacity */
         case COBRA_TYPE_DICT:
-            return 2; /* table pointer, logical length */
+            return 1; /* pointer to caller-owned list/dict descriptor block */
         case COBRA_TYPE_OPTION:
         case COBRA_TYPE_RESULT:
             return 1; /* pointer to caller-owned sum storage */

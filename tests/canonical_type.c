@@ -340,8 +340,10 @@ int main(void) {
     assert(cobra_type_abi_slots(i64) == 1);
     assert(cobra_type_abi_slots(f32) == 0);
     assert(cobra_type_abi_slots(option_a) == 1);
-    assert(cobra_type_abi_slots(list) == 3);
-    assert(cobra_type_abi_slots(dict) == 2);
+    /* list/dict parameters pass one pointer to a caller-owned descriptor
+       block (reference semantics), not the block's fields by value. */
+    assert(cobra_type_abi_slots(list) == 1);
+    assert(cobra_type_abi_slots(dict) == 1);
     CobraType *slice = cobra_type_new(&arena, COBRA_TYPE_SLICE_F32);
     assert(slice && cobra_type_add_generic_arg(slice, f32));
     assert(cobra_type_validate(&arena, slice));

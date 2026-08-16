@@ -1,0 +1,84 @@
+# list[T]/dict parameters now have reference semantics: mutations performed
+# inside a callee (append, index-write, set) are visible to the caller after
+# the call returns.
+
+def append_val(xs: list[i64], v: i64): {
+    append(xs, v)
+}
+
+def write_at(xs: list[i64], idx: i64, v: i64): {
+    xs[idx] = v
+}
+
+def grow_a_lot(xs: list[i64]): {
+    let i: i64 = 0
+    while i < 500: {
+        append(xs, i)
+        i = i + 1
+    }
+}
+
+def set_val(d: dict[string]i64, k: string, v: i64): {
+    set(d, k, v)
+}
+
+def mutate_and_return(xs: list[i64]) -> list[i64]: {
+    append(xs, 777)
+    let ys: list[i64] = [1, 2, 3]
+    return ys
+}
+
+def test_append_propagates(): {
+    let xs: list[i64] = []
+    append_val(xs, 10)
+    append_val(xs, 20)
+    assert(len(xs) == 2)
+    assert(xs[0] == 10)
+    assert(xs[1] == 20)
+    return 0
+}
+
+def test_index_write_propagates(): {
+    let xs: list[i64] = [1, 2, 3]
+    write_at(xs, 1, 99)
+    assert(xs[1] == 99)
+    return 0
+}
+
+def test_growth_through_param(): {
+    let xs: list[i64] = []
+    grow_a_lot(xs)
+    assert(len(xs) == 500)
+    assert(xs[0] == 0)
+    assert(xs[499] == 499)
+    return 0
+}
+
+def test_dict_set_propagates(): {
+    let d: dict[string]i64 = {}
+    set_val(d, "a", 1)
+    set_val(d, "b", 2)
+    assert(get(d, "a", 0) == 1)
+    assert(get(d, "b", 0) == 2)
+    return 0
+}
+
+def test_mutate_param_and_return_different_list(): {
+    let xs: list[i64] = [1]
+    let ys: list[i64] = mutate_and_return(xs)
+    assert(len(xs) == 2)
+    assert(xs[1] == 777)
+    assert(len(ys) == 3)
+    assert(ys[2] == 3)
+    return 0
+}
+
+def test_iteration_readonly_unaffected(): {
+    let xs: list[i64] = [5, 6, 7]
+    let sum: i64 = 0
+    for v in xs: {
+        sum = sum + v
+    }
+    assert(sum == 18)
+    return 0
+}

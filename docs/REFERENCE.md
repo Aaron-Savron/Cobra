@@ -75,7 +75,7 @@ def run_checked(value: i64) -> Result[i64, i64]: {
 
 ## Collections
 
-Cobra keeps fixed arrays (`[1, 2, 3]`) and ML slices (`[]i64`, `[]f32`) unchanged. For application code, `list[T]` is an owned growable sequence with unboxed scalar elements and `dict[string]i64` is an owned open-addressed map with copied string keys:
+Cobra keeps fixed arrays (`[1, 2, 3]`) and ML slices (`[]i64`, `[]f32`) unchanged. For application code, `list[T]` is an owned growable sequence with unboxed scalar elements and `dict[string]i64` is an owned open-addressed map with copied string keys. `list[T]`/`dict[K]V` function parameters have reference semantics: append, index-write, and `set` calls performed inside a callee (including through further pass-through calls) are visible to the caller once the call returns, with a callee-side append that grows the backing buffer correctly writing the new pointer and capacity back through the reference. See `examples/150_list_dict_param_reference.cb`.
 
 ```cobra
 values: list[i64] = [1, 2]

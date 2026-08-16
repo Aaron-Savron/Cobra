@@ -99,6 +99,15 @@ typedef struct {
        vtable-block dispatch instead of the ordinary static-dispatch or
        direct-call paths. See emit_dyn_trait_call/emit_dyn_dispatch_call. */
     char dyn_trait_name[COBRA_MAX_IDENT_LEN];
+    /* Set only for a SYM_LIST/SYM_DICT parameter: list_dict_ref marks that
+       this symbol's local descriptor slots are a private working copy of a
+       caller-owned block, and ref_ptr_offset is the frame slot holding the
+       pointer back to that block. Every existing read/write of offset/
+       length_offset/capacity_offset stays untouched during the body; the
+       working copy is written back through ref_ptr_offset once, at the
+       function's single shared return point. */
+    bool list_dict_ref;
+    int ref_ptr_offset;
 } VarSymbol;
 
 typedef struct {
@@ -292,8 +301,7 @@ static int abi_slots(CobraTypeKind type) {
        slot; slices remain the historical pointer+length pair. */
     if (type == COBRA_TYPE_F32 || type == COBRA_TYPE_F64) return 0;
     if (type == COBRA_TYPE_SLICE || type == COBRA_TYPE_SLICE_F32 || type == COBRA_TYPE_SLICE_U8) return 2;
-    if (type == COBRA_TYPE_LIST) return 3; /* pointer, length, capacity */
-    if (type == COBRA_TYPE_DICT) return 2; /* table pointer, logical length */
+    if (type == COBRA_TYPE_LIST || type == COBRA_TYPE_DICT) return 1; /* pointer to caller-owned descriptor block */
     if (type == COBRA_TYPE_OPTION || type == COBRA_TYPE_RESULT) return 1; /* pointer to caller-owned sum storage */
     return 1;
 }
@@ -476,6 +484,30 @@ static void emit_struct_owned_field_frees(CodeGen *cg, const CobraType *canonica
     }
 }
 
+/* A list/dict reference parameter's local descriptor slots are a private
+   working copy seeded from the caller's block at function entry (see the
+   COBRA_TYPE_LIST/COBRA_TYPE_DICT parameter-binding branches in
+   emit_function). Every explicit `return` builds its own inline epilogue
+   rather than jumping through the shared .Lpropagate label, so this must be
+   called at every return path individually: once here for the implicit
+   fall-off/`.Lpropagate` path, and once from the AST_RETURN case for each
+   explicit return. */
+static void emit_list_dict_ref_writeback(CodeGen *cg) {
+    for (int i = 0; i < cg->symbol_count; i++) {
+        VarSymbol *s = &cg->symbols[i];
+        if (!s->list_dict_ref) continue;
+        fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n", s->ref_ptr_offset);
+        if (s->kind == SYM_LIST) {
+            fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rax], rcx\n", s->capacity_offset);
+            fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rax+8], rcx\n", s->length_offset);
+            fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rax+16], rcx\n", s->offset);
+        } else if (s->kind == SYM_DICT) {
+            fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rax], rcx\n", s->length_offset);
+            fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rax+8], rcx\n", s->offset);
+        }
+    }
+}
+
 /* Everyday owned values are reclaimed at function exit. Raw slices and tensor
    views deliberately stay outside this path: their lifetimes are explicit and
    their pointer/length ABI remains zero-overhead. */
@@ -510,6 +542,7 @@ static void emit_cleanup_preserving_result(CodeGen *cg, const char *skip_name,
         if (float_result) fprintf(cg->out, "    movss DWORD PTR [rbp-%d], xmm0\n", COBRA_SCR_TMP + 8);
         else fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", COBRA_SCR_TMP);
     }
+    emit_list_dict_ref_writeback(cg);
     emit_scope_cleanup(cg, skip_name);
     /* Early returns inside `with region` bodies must release every live region
        before leaving the frame, inside the save/restore window so the call
@@ -3089,12 +3122,16 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
             if (arg->type != AST_VAR_REF) { fprintf(stderr, "CodeGen Error: list arguments must be named lists\n"); exit(EXIT_FAILURE); }
             VarSymbol *list = find_symbol(cg, arg->name);
             if (!list || list->kind != SYM_LIST) { fprintf(stderr, "CodeGen Error: list argument is not a list\n"); exit(EXIT_FAILURE); }
-            fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", list->offset, slot, list->length_offset, slot + 8, list->capacity_offset, slot + 16);
+            /* offset/length_offset/capacity_offset are three consecutive
+               8-byte reserve() slots (see ensure_list_named), so the block's
+               low address is capacity_offset's slot; pass one pointer to it
+               so the callee's mutations write back through the same block. */
+            fprintf(cg->out, "    lea rax, [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", list->capacity_offset, slot);
         } else if (t == COBRA_TYPE_DICT) {
             if (arg->type != AST_VAR_REF) { fprintf(stderr, "CodeGen Error: dict arguments must be named dicts\n"); exit(EXIT_FAILURE); }
             VarSymbol *dict = find_symbol(cg, arg->name);
             if (!dict || dict->kind != SYM_DICT) { fprintf(stderr, "CodeGen Error: dict argument is not a dict\n"); exit(EXIT_FAILURE); }
-            fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", dict->offset, slot, dict->length_offset, slot + 8);
+            fprintf(cg->out, "    lea rax, [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", dict->length_offset, slot);
         } else if (t == COBRA_TYPE_OPTION || t == COBRA_TYPE_RESULT) {
             if (arg->type != AST_VAR_REF) {
                 fprintf(stderr, "CodeGen Error: Option and Result arguments must be named values\n");
@@ -4666,26 +4703,38 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
                 fprintf(cg->out, "    mov rax, QWORD PTR [rbp+%d]\n    mov QWORD PTR [rbp-%d], rax\n", 16 + stack_index++ * 8, s->length_offset);
             }
         } else if (parameter_type == COBRA_TYPE_LIST) {
+            /* One pointer to the caller's block (see the call-site marshalling
+               in emit_call). The body reads/writes the usual private local
+               slots unchanged; they're seeded from the caller's block here
+               and written back through ref_ptr_offset at the shared return
+               point, so append/index-write mutations become visible to the
+               caller without touching any of the existing list codegen. */
             VarSymbol *s = ensure_list_named(cg, p->name, ast_element_kind(p), ast_payload_name(p));
-            int slots = abi_slots_for(parameter_type, p);
-            if (gpr + slots <= 6) {
-                fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", COBRA_ARG_SAVE_BASE + gpr * 8, s->offset);
-                fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", COBRA_ARG_SAVE_BASE + (gpr + 1) * 8, s->length_offset);
-                fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", COBRA_ARG_SAVE_BASE + (gpr + 2) * 8, s->capacity_offset);
-                gpr += slots;
+            s->list_dict_ref = true;
+            s->ref_ptr_offset = reserve(cg, 8);
+            if (gpr < 6) {
+                fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", COBRA_ARG_SAVE_BASE + gpr * 8, s->ref_ptr_offset);
+                gpr++;
             } else {
-                for (int k = 0; k < 3; k++) fprintf(cg->out, "    mov rax, QWORD PTR [rbp+%d]\n    mov QWORD PTR [rbp-%d], rax\n", 16 + (stack_index++) * 8, k == 0 ? s->offset : (k == 1 ? s->length_offset : s->capacity_offset));
+                fprintf(cg->out, "    mov rax, QWORD PTR [rbp+%d]\n    mov QWORD PTR [rbp-%d], rax\n", 16 + stack_index++ * 8, s->ref_ptr_offset);
             }
+            fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n", s->ref_ptr_offset);
+            fprintf(cg->out, "    mov rcx, QWORD PTR [rax]\n    mov QWORD PTR [rbp-%d], rcx\n", s->capacity_offset);
+            fprintf(cg->out, "    mov rcx, QWORD PTR [rax+8]\n    mov QWORD PTR [rbp-%d], rcx\n", s->length_offset);
+            fprintf(cg->out, "    mov rcx, QWORD PTR [rax+16]\n    mov QWORD PTR [rbp-%d], rcx\n", s->offset);
         } else if (parameter_type == COBRA_TYPE_DICT) {
             VarSymbol *s = ensure_dict(cg, p->name);
-            int slots = abi_slots_for(parameter_type, p);
-            if (gpr + slots <= 6) {
-                fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", COBRA_ARG_SAVE_BASE + gpr * 8, s->offset);
-                fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", COBRA_ARG_SAVE_BASE + (gpr + 1) * 8, s->length_offset);
-                gpr += slots;
+            s->list_dict_ref = true;
+            s->ref_ptr_offset = reserve(cg, 8);
+            if (gpr < 6) {
+                fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", COBRA_ARG_SAVE_BASE + gpr * 8, s->ref_ptr_offset);
+                gpr++;
             } else {
-                for (int k = 0; k < 2; k++) fprintf(cg->out, "    mov rax, QWORD PTR [rbp+%d]\n    mov QWORD PTR [rbp-%d], rax\n", 16 + (stack_index++) * 8, k == 0 ? s->offset : s->length_offset);
+                fprintf(cg->out, "    mov rax, QWORD PTR [rbp+%d]\n    mov QWORD PTR [rbp-%d], rax\n", 16 + stack_index++ * 8, s->ref_ptr_offset);
             }
+            fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n", s->ref_ptr_offset);
+            fprintf(cg->out, "    mov rcx, QWORD PTR [rax]\n    mov QWORD PTR [rbp-%d], rcx\n", s->length_offset);
+            fprintf(cg->out, "    mov rcx, QWORD PTR [rax+8]\n    mov QWORD PTR [rbp-%d], rcx\n", s->offset);
         } else if (parameter_type == COBRA_TYPE_TENSOR_F32) {
             VarSymbol *s = ensure_tensor(cg, p->name);
             int incoming = reserve(cg, 8);
@@ -4769,6 +4818,10 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
     }
     fprintf(cg->out, ".Lpropagate_%d:\n", cg->propagation_label);
     fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", COBRA_SCR_TMP);
+    /* Covers the implicit fall-off and `?` propagation paths; explicit
+       `return` statements build their own inline epilogue (see AST_RETURN)
+       and call emit_list_dict_ref_writeback separately. */
+    emit_list_dict_ref_writeback(cg);
     emit_scope_cleanup(cg, NULL);
     fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n", COBRA_SCR_TMP);
     emit_return_epilogue(cg);
