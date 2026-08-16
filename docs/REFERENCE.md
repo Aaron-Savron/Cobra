@@ -385,6 +385,8 @@ value = abs(0 - 42)
 
 `import c "library" (name, ...)` registers imported symbols for direct native calls and adds the library to the linker without a shell. Bare library names use the linker's exact-name form (`-l:library`); paths are passed as path arguments. The current bridge intentionally supports up to six integer, pointer, or string-pointer arguments on Linux x86-64 SysV and treats the result as an integer/pointer value in `rax`; imported calls must therefore use an integer/pointer-returning C function. Floating-point foreign arguments or returns, and more than six arguments, are outside this bridge and should be wrapped with a typed Cobra function or C shim rather than guessed. For typed f32 model code, use a normal Cobra wrapper or the C host ABI example in `examples/34_c_abi_host.cb` and `examples/34_c_abi_host.c`.
 
+An imported C function has no declared signature (the `import c` list only names it), so its return value infers as bare `i64` even when the underlying C function returns a pointer. `let p: []u8 = some_c_func()` (or `[]i64`/`[]f32`) is accepted anyway for a call to an imported function specifically: the underlying bit pattern from `rax` is already a valid pointer, so reinterpreting it at the declaration site is sound. This coercion does not apply to ordinary Cobra function calls, which still require a real type match. See `examples/161_ffi_pointer_return_type.cb`.
+
 The emitted Cobra functions are global SysV symbols. A `[]f32` parameter is exposed as `(float *values, long length)`, so a C host can call a user-authored kernel without a runtime tensor object:
 
 ```bash

@@ -1,0 +1,13 @@
+# A C-imported function has no declared signature (import c only names it),
+# so a pointer-returning one infers as bare i64. Reinterpreting that i64 as
+# a declared pointer/slice type at the assignment site is sound - the
+# underlying bit pattern is already a valid pointer - so this works instead
+# of forcing the caller to leave the local untyped.
+
+import c "libc.so.6" (__errno_location)
+
+def test_ffi_pointer_return_typed() -> i64: {
+    let p: []i64 = __errno_location()
+    p?
+    return 0
+}
