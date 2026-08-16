@@ -1,0 +1,60 @@
+enum Op: { PUSH, ADD, SUB }
+struct InsA: { op: Op, operand: i64 }
+struct InsB: { operand: i64, op: Op }
+struct InsC: { op: Op, mid: i64, tail: Op }
+
+def mkA(op: Op, operand: i64) -> InsA: {
+    let ins: InsA
+    ins.op = op
+    ins.operand = operand
+    return ins
+}
+def mkB(operand: i64, op: Op) -> InsB: {
+    let ins: InsB
+    ins.operand = operand
+    ins.op = op
+    return ins
+}
+def mkC(op: Op, mid: i64, tail: Op) -> InsC: {
+    let ins: InsC
+    ins.op = op
+    ins.mid = mid
+    ins.tail = tail
+    return ins
+}
+
+def test_struct_return_enum_first_field(): {
+    let program: list[InsA] = []
+    append(program, mkA(Op.PUSH, 3))
+    append(program, mkA(Op.ADD, 7))
+    append(program, mkA(Op.SUB, 11))
+    let a0: InsA = program[0]
+    let a1: InsA = program[1]
+    let a2: InsA = program[2]
+    assert(a0.operand == 3)
+    assert(a1.operand == 7)
+    assert(a2.operand == 11)
+    return 0
+}
+
+def test_struct_return_enum_second_field(): {
+    let program: list[InsB] = []
+    append(program, mkB(5, Op.PUSH))
+    append(program, mkB(9, Op.ADD))
+    let b0: InsB = program[0]
+    let b1: InsB = program[1]
+    assert(b0.operand == 5)
+    assert(b1.operand == 9)
+    return 0
+}
+
+def test_struct_return_enum_first_and_last_field(): {
+    let program: list[InsC] = []
+    append(program, mkC(Op.PUSH, 100, Op.ADD))
+    append(program, mkC(Op.SUB, 200, Op.PUSH))
+    let c0: InsC = program[0]
+    let c1: InsC = program[1]
+    assert(c0.mid == 100)
+    assert(c1.mid == 200)
+    return 0
+}

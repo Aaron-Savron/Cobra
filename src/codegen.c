@@ -3067,11 +3067,11 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
                            (fn->declared_type == COBRA_TYPE_RESULT ?
                             sum_component_size(cg, ast_error_kind(fn), ast_error_name(fn)) : 0);
         if (tensor_return || struct_return || list_return || dict_return) {
+            cg->stack_offset += result_size;
             result_temp = cg->stack_offset;
-            cg->stack_offset += result_size;
         } else {
-            result_temp = cg->stack_offset + 8;
             cg->stack_offset += result_size;
+            result_temp = cg->stack_offset - result_size + 8;
         }
     }
     int temp = reserve(cg, (int)n->child_count * 24 + 16);
