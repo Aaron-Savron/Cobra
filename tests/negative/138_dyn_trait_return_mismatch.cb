@@ -1,0 +1,18 @@
+trait Shape: {
+    def area() -> i64
+}
+
+struct Circle: { radius: i64 }
+struct Box: { width: i64 }
+
+impl Shape for Circle: {
+    def area(c: Circle) -> i64: {
+        return c.radius * c.radius * 3
+    }
+}
+
+def make_shape() -> dyn Shape: {
+    let b: Box
+    b.width = 5
+    return b
+}

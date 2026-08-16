@@ -662,14 +662,24 @@ Finish the language contracts for:
   receiver, genuinely resolved at runtime rather than rewritten to a fixed
   symbol the way static dispatch is. ir.c validates every trait method is
   implemented at the coercion (call) site, reusing `find_impl_method`
-  (`tests/negative/134_dyn_trait_missing_method.cb`). Not yet supported:
-  `dyn Trait` as a `let`/return type or `list[dyn Trait]` element (only
-  function parameters coerce today), generic trait bounds
-  (`def f[T: Shape](x: T)`), default trait methods, supertraits, and
+  (`tests/negative/134_dyn_trait_missing_method.cb`). The dispatch block is
+  heap-allocated and never freed, matching this backend's existing
+  no-automatic-drop convention for closure environments.
+- [x] `dyn Trait` as a `let` declaration and function return type
+  (examples/137_dyn_trait_let_and_return.cb). `let shape: dyn Shape = c`
+  builds the dispatch block at the assignment site the same way a
+  parameter coercion does. `-> dyn Shape` builds it before returning, but
+  with one added twist the parameter case doesn't need: the struct's bytes
+  are heap-copied (not just pointed at in place) before the block is built,
+  since a returned local's stack frame is gone the instant the caller
+  resumes - pointing data_ptr at the frame directly would dangle
+  (`emit_build_dyn_dispatch_block_ex`'s `heap_copy_data` flag,
+  src/codegen.c). `let x: dyn Trait = some_func(...)` is a plain scalar
+  move, since a dyn-returning call already hands back a fully-built block
+  pointer. Not yet supported: `list[dyn Trait]` elements, generic trait
+  bounds (`def f[T: Shape](x: T)`), default trait methods, supertraits, and
   multiple impls of the same trait for the same type (last registration
-  wins silently - not yet diagnosed). The dispatch block is heap-allocated
-  and never freed, matching this backend's existing no-automatic-drop
-  convention for closure environments.
+  wins silently - not yet diagnosed).
 - Recursion
 - Casts and explicit conversions
 - Constant evaluation
@@ -1065,3 +1075,26 @@ struct (`Outer { tag: string, inner: Inner { label: string, value: i64 } }`,
 no corruption. A parallel 2M-iteration test of the disqualified "returned
 struct" pattern leaked as expected (126MB RSS) but did not crash, confirming
 the exclusion holds at scale, not just correctness at small scale.
+
+## Static automatic deallocation (phase 3: loop-body list/dict frees)
+
+A `list[T]`/dict local declared with a fresh literal inside a `while` or
+`for` loop body is now freed once per runtime iteration, right before the
+loop jumps back to its condition, instead of only at function-scope exit -
+see `emit_loop_owned_cleanup` in src/codegen.c. The soundness scope is
+narrower on purpose: candidates are collected from the loop body only (not
+the whole function), and the same `autofree_scan_disqualify` scan used by
+phases 1-2 runs over just that body - any use of the candidate as a call
+argument, a return value, or an rvalue copied elsewhere anywhere in the
+body disqualifies it and it is left to leak exactly as before. In practice
+this means direct-index use (`xs[0]`) benefits, while the common
+`get(dict, key, default)`/list-builtin-call access patterns still
+disqualify (the value is passed as a call argument) - a known,
+already-conservative limitation inherited unchanged from phases 1-2, not a
+new gap. Verified with per-iteration stress tests (flat RSS across 2-3M
+iterations for the freed case, correct expected growth with no crash for
+the explicitly-disqualified/leak-safe case) plus an explicit escaping-call
+test confirming no double free when combined with a user's own `free()`.
+Still deferred: closure-environment frees, and list/dict locals declared
+via a function-call initializer (`let zs = returns_a_list()`) rather than a
+literal, which are not yet tracked as owned at all on the caller side.

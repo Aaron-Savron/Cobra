@@ -69,6 +69,7 @@ typedef struct IRContext {
     CobraTypeKind return_error_type;
     char return_type_name[COBRA_MAX_IDENT_LEN];
     char return_error_type_name[COBRA_MAX_IDENT_LEN];
+    char return_dyn_trait_name[COBRA_MAX_IDENT_LEN];
     size_t errors;
     ASTNode *root;
     IRStruct structs[COBRA_MAX_STRUCTS];
@@ -3447,7 +3448,55 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                 !cobra_type_equal(node->canonical_type, node->children[0]->canonical_type)) {
                 ir_error(ctx, node, "function value's signature does not match its declared fn(...)->... type");
             }
-            if (node->declared_type != COBRA_TYPE_UNTYPED && inferred != COBRA_TYPE_UNKNOWN &&
+            bool is_dyn_trait_decl = node->dyn_trait_name[0] != '\0';
+            if (is_dyn_trait_decl) {
+                /* `let x: dyn Trait = concrete_value` - same conformance
+                   contract as a dyn-typed call argument (see the
+                   AST_FUNC_CALL dyn coercion check above), just applied at
+                   declaration time. A struct-typed initializer is expected;
+                   declared_compatible() below would otherwise reject
+                   FUNC-vs-STRUCT as a type mismatch, so this replaces that
+                   check entirely for dyn declarations. */
+                if (node->child_count > 0 && node->children[0]->type == AST_FUNC_CALL) {
+                    /* let x: dyn Trait = some_func(...) - the callee already
+                       verified its own return-time conformance (see the
+                       AST_RETURN dyn-trait check above); just confirm this
+                       declaration names the same trait the callee returns. */
+                    ASTNode *callee = find_function(ctx, node->children[0]->name);
+                    if (!callee || strcmp(callee->dyn_trait_name, node->dyn_trait_name) != 0) {
+                        ir_error(ctx, node, "function does not return this dyn trait type");
+                    }
+                } else if (node->child_count == 0 || node->children[0]->type != AST_VAR_REF) {
+                    ir_error(ctx, node, "dyn trait initializer must be a named struct value");
+                } else {
+                    IRLocal *init_local = find_local_entry(ctx, node->children[0]->name);
+                    if (init_local && init_local->type_name[0]) {
+                        ASTNode *trait_decl = NULL;
+                        for (size_t k = 0; k < ctx->root->child_count; k++) {
+                            ASTNode *d = ctx->root->children[k];
+                            if (d->type == AST_TRAIT_DECL && strcmp(d->name, node->dyn_trait_name) == 0) {
+                                trait_decl = d;
+                                break;
+                            }
+                        }
+                        if (trait_decl) {
+                            for (size_t m = 0; m < trait_decl->child_count; m++) {
+                                if (!find_impl_method(ctx, init_local->type_name, trait_decl->children[m]->name)) {
+                                    char message[220];
+                                    snprintf(message, sizeof(message),
+                                             "'%s' does not implement trait '%s' (missing method '%s')",
+                                             init_local->type_name, node->dyn_trait_name, trait_decl->children[m]->name);
+                                    ir_error(ctx, node, message);
+                                    break;
+                                }
+                            }
+                        } else {
+                            ir_error(ctx, node, "unknown trait in dyn declaration");
+                        }
+                    }
+                }
+            }
+            if (!is_dyn_trait_decl && node->declared_type != COBRA_TYPE_UNTYPED && inferred != COBRA_TYPE_UNKNOWN &&
                 inferred != COBRA_TYPE_UNTYPED && !declared_compatible(declared, inferred)) {
                 char message[180];
                 snprintf(message, sizeof(message), "'%s' declared as %s but initialized with %s",
@@ -3861,7 +3910,44 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                 strcmp(ctx->return_type_name, cobra_type_node_name(return_value)) != 0) {
                 ir_error(ctx, node, "cannot return a value from a different enum");
             }
-            if (ctx->return_type != COBRA_TYPE_UNTYPED && ctx->return_type != COBRA_TYPE_UNKNOWN &&
+            if (ctx->return_dyn_trait_name[0]) {
+                /* `-> dyn Trait`: same conformance contract as a dyn-typed
+                   call argument/let declaration, applied to the returned
+                   value. A struct-typed return expression is expected, which
+                   is why this replaces (rather than augments) the generic
+                   return-type mismatch check below - declared return type is
+                   COBRA_TYPE_FUNC (the dyn-trait ABI marker) while `actual`
+                   is COBRA_TYPE_STRUCT, which the generic check would reject. */
+                if (!return_value || return_value->type != AST_VAR_REF) {
+                    ir_error(ctx, node, "dyn trait return value must be a named struct value");
+                } else {
+                    IRLocal *returned = find_local_entry(ctx, return_value->name);
+                    if (returned && returned->type_name[0]) {
+                        ASTNode *trait_decl = NULL;
+                        for (size_t k = 0; k < ctx->root->child_count; k++) {
+                            ASTNode *d = ctx->root->children[k];
+                            if (d->type == AST_TRAIT_DECL && strcmp(d->name, ctx->return_dyn_trait_name) == 0) {
+                                trait_decl = d;
+                                break;
+                            }
+                        }
+                        if (trait_decl) {
+                            for (size_t m = 0; m < trait_decl->child_count; m++) {
+                                if (!find_impl_method(ctx, returned->type_name, trait_decl->children[m]->name)) {
+                                    char message[220];
+                                    snprintf(message, sizeof(message),
+                                             "'%s' does not implement trait '%s' (missing method '%s')",
+                                             returned->type_name, ctx->return_dyn_trait_name, trait_decl->children[m]->name);
+                                    ir_error(ctx, node, message);
+                                    break;
+                                }
+                            }
+                        } else {
+                            ir_error(ctx, node, "unknown trait in dyn return type");
+                        }
+                    }
+                }
+            } else if (ctx->return_type != COBRA_TYPE_UNTYPED && ctx->return_type != COBRA_TYPE_UNKNOWN &&
                 actual != COBRA_TYPE_UNKNOWN && ctx->return_type != actual &&
                 !(actual == COBRA_TYPE_NONE && ctx->return_type == COBRA_TYPE_OPTION) &&
                 !(is_integer(ctx->return_type) && is_integer(actual))) {
@@ -4329,6 +4415,7 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
         ctx.return_error_type = canonical_error_kind(function->canonical_type);
         snprintf(ctx.return_type_name, sizeof(ctx.return_type_name), "%.63s", cobra_type_node_name(function));
         snprintf(ctx.return_error_type_name, sizeof(ctx.return_error_type_name), "%.63s", cobra_type_node_error_name(function));
+        snprintf(ctx.return_dyn_trait_name, sizeof(ctx.return_dyn_trait_name), "%.63s", function->dyn_trait_name);
         /* Nested sums cross the boundary in the isolated backend only; the
            direct emitter still requires scalar value and error payloads on
            returns, mirroring the parameter rule below. */

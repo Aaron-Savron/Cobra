@@ -1,0 +1,33 @@
+# Loop-body auto-free: a fresh list[T] literal declared inside a loop body,
+# used only by indexing (not passed to a function or escaped), is freed at
+# the end of each iteration instead of leaking until the enclosing function
+# returns. See src/codegen.c's emit_loop_owned_cleanup.
+
+def test_loop_list_autofree_sums_correctly(): {
+    let i: i64 = 0
+    let total: i64 = 0
+    while i < 50: {
+        let zs: list[i64] = [10, 20, 30]
+        total = total + zs[0] + zs[1] + zs[2]
+        i = i + 1
+    }
+    assert(total == 3000)
+    return 0
+}
+
+def make_and_consume(count: i64) -> i64: {
+    let total: i64 = 0
+    let i: i64 = 0
+    while i < count: {
+        let row: list[i64] = [1, 2, 3, 4]
+        total = total + row[0] + row[1] + row[2] + row[3]
+        i = i + 1
+    }
+    return total
+}
+
+def test_loop_list_autofree_across_many_iterations(): {
+    let result = make_and_consume(2000)
+    assert(result == 20000)
+    return 0
+}

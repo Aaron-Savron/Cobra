@@ -132,6 +132,7 @@ typedef struct {
     CobraTypeKind current_return_error_type;
     char current_return_type_name[COBRA_MAX_IDENT_LEN];
     char current_return_error_type_name[COBRA_MAX_IDENT_LEN];
+    char current_return_dyn_trait_name[COBRA_MAX_IDENT_LEN];
     int propagation_label;
     PendingParallel pending_parallel[16];
     int pending_parallel_count;
@@ -2426,6 +2427,52 @@ static ASTNode *find_trait_decl(CodeGen *cg, const char *trait_name) {
    block is the coercion step (struct value -> dyn Trait); reading it back
    is emit_dyn_dispatch_call below. ir.c's cobra_ir_build already verified
    the concrete type implements every trait method before codegen runs. */
+/* Build a `dyn TraitName` dispatch block for the struct value held by `s`
+   and store the resulting pointer at dest_slot. Mirrors the block
+   construction inside emit_dyn_trait_call's per-argument loop, factored out
+   so `let x: dyn Trait = value` and `return` can build the same block.
+
+   heap_copy_data must be true whenever the dispatch block's data_ptr can
+   outlive the struct's current stack frame - concretely, a `-> dyn Trait`
+   return, where `s` is a local of the returning function: its stack slot is
+   gone the instant the caller resumes, so data_ptr would dangle if it
+   pointed at the frame directly. Call-argument and same-frame `let`
+   coercions never outlive the frame `s` lives in, so they pass false and
+   point straight at the stack value, matching the original (pre-return)
+   behavior exactly. */
+static void emit_build_dyn_dispatch_block_ex(CodeGen *cg, const char *trait_name,
+                                              VarSymbol *s, int dest_slot, bool heap_copy_data) {
+    ASTNode *trait_decl = find_trait_decl(cg, trait_name);
+    if (!trait_decl) {
+        fprintf(stderr, "CodeGen Error: unknown trait '%s'\n", trait_name);
+        exit(EXIT_FAILURE);
+    }
+    size_t method_count = trait_decl->child_count;
+    fprintf(cg->out, "    mov rdi, %d\n    call malloc@PLT\n    mov QWORD PTR [rbp-%d], rax\n",
+            (int)(method_count + 1) * 8, dest_slot);
+    if (heap_copy_data) {
+        int struct_size = struct_storage_size(cg, s->type_name);
+        fprintf(cg->out, "    mov rdi, %d\n    call malloc@PLT\n    mov rbx, rax\n", struct_size);
+        fprintf(cg->out, "    lea rsi, [rbp-%d]\n    mov rdi, rbx\n", s->array_base);
+        emit_copy_memory(cg, "rsi", "rdi", struct_size);
+    } else {
+        fprintf(cg->out, "    lea rbx, [rbp-%d]\n", s->array_base);
+    }
+    fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rcx], rbx\n", dest_slot);
+    for (size_t m = 0; m < method_count; m++) {
+        char mangled[COBRA_MAX_IDENT_LEN];
+        snprintf(mangled, sizeof(mangled), "__impl_%.31s_%.31s_%.31s",
+                 trait_name, s->type_name, trait_decl->children[m]->name);
+        fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    lea rax, [rip+%s]\n    mov QWORD PTR [rcx+%d], rax\n",
+                dest_slot, mangled, (int)(8 * (1 + m)));
+    }
+}
+
+static void emit_build_dyn_dispatch_block(CodeGen *cg, const char *trait_name,
+                                           VarSymbol *s, int dest_slot) {
+    emit_build_dyn_dispatch_block_ex(cg, trait_name, s, dest_slot, false);
+}
+
 static void emit_dyn_trait_call(CodeGen *cg, ASTNode *n, ASTNode *fn) {
     (void)fn;
     int arg_slot = reserve(cg, (int)n->child_count * 8 + 8);
@@ -3520,6 +3567,8 @@ static void flush_pending_parallel(CodeGen *cg) {
     cg->pending_parallel_count = 0;
 }
 
+static void emit_loop_owned_cleanup(CodeGen *cg, ASTNode *body);
+
 static void emit_for(CodeGen *cg, ASTNode *n) {
     int index = reserve(cg, 8), bound = reserve(cg, 8), label = cg->label_count++;
     ASTNode *target = n->child_count ? n->children[0] : NULL;
@@ -3600,7 +3649,7 @@ static void emit_for(CodeGen *cg, ASTNode *n) {
         (void)value_symbol;
     }
     cg->loop_depth++;
-    if (n->child_count > 1) emit_statement(cg, n->children[1]);
+    if (n->child_count > 1) { emit_statement(cg, n->children[1]); emit_loop_owned_cleanup(cg, n->children[1]); }
     cg->loop_depth--;
     if (is_range) fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    add rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", index, step, index);
     else fprintf(cg->out, "    inc QWORD PTR [rbp-%d]\n", index);
@@ -3727,6 +3776,65 @@ static bool is_safe_autofree_struct(CodeGen *cg, const char *name) {
     for (int i = 0; i < cg->safe_autofree_count; i++)
         if (!strcmp(cg->safe_autofree_structs[i], name)) return true;
     return false;
+}
+
+/* Collect list/dict locals declared with a fresh literal inside `n` (a loop
+   body), matching exactly the codegen sites that set VarSymbol.owned=true
+   for SYM_LIST/SYM_DICT (the AST_ARRAY_LITERAL/AST_DICT_LITERAL branches in
+   the AST_VAR_DECL/AST_ASSIGN case above). */
+static void loop_owned_collect_candidates(const ASTNode *n, AutofreeCandidate *cands, int *count) {
+    if (!n || *count >= 64) return;
+    if ((n->type == AST_ASSIGN || n->type == AST_VAR_DECL) && n->child_count > 0) {
+        const ASTNode *v = n->children[0];
+        bool is_owned_list = v->type == AST_ARRAY_LITERAL && n->declared_type == COBRA_TYPE_LIST;
+        bool is_owned_dict = v->type == AST_DICT_LITERAL;
+        if (is_owned_list || is_owned_dict) {
+            snprintf(cands[*count].name, COBRA_MAX_IDENT_LEN, "%.63s", n->name);
+            cands[*count].decl_node = n;
+            (*count)++;
+        }
+    }
+    for (size_t i = 0; i < n->child_count && *count < 64; i++)
+        loop_owned_collect_candidates(n->children[i], cands, count);
+}
+
+/* Free list/dict locals declared fresh inside one textual pass through a
+   loop body, once per runtime iteration, right before the body's assembly
+   jumps back to the loop condition. Reuses `autofree_scan_disqualify`
+   (generic over any candidate-name list) scoped to just this loop body, so
+   the exact same non-escaping soundness conditions phases 1-2 established
+   for struct locals apply here: any use as a call argument, a return value,
+   a whole-value reassignment target, or an rvalue copied elsewhere anywhere
+   in the body disqualifies the candidate and it is left to leak as before.
+   A survivor is set VarSymbol.owned=false after the emitted free so the
+   function-exit cleanup in emit_scope_cleanup does not free it a second
+   time; the next runtime iteration's declaration re-sets it, since the
+   declaration and this cleanup are emitted once and both execute every
+   iteration together. */
+static void emit_loop_owned_cleanup(CodeGen *cg, ASTNode *body) {
+    if (!body) return;
+    AutofreeCandidate cands[64];
+    int count = 0;
+    loop_owned_collect_candidates(body, cands, &count);
+    if (count == 0) return;
+    bool disq[64] = {0};
+    autofree_scan_disqualify(body, cands, disq, count);
+    for (int i = 0; i < count; i++) {
+        if (disq[i]) continue;
+        VarSymbol *s = find_symbol(cg, cands[i].name);
+        if (!s || !s->owned) continue;
+        if (s->kind == SYM_LIST) {
+            fprintf(cg->out,
+                    "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free@PLT\n",
+                    s->offset, s->length_offset, s->capacity_offset);
+            s->owned = false;
+        } else if (s->kind == SYM_DICT) {
+            fprintf(cg->out,
+                    "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    call cobra_dict_free@PLT\n",
+                    s->offset, s->length_offset);
+            s->owned = false;
+        }
+    }
 }
 
 static void emit_statement(CodeGen *cg, ASTNode *n) {
@@ -3916,6 +4024,35 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
                 int it = current_iter(cg, n->name);
                 if (cg->loops[it].source[0] != '\0') { emit_expr(cg, v); emit_load_buffer_ptr(cg, cg->loops[it].source, "rbx"); fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n", cg->loops[it].index_offset); if (cg->loops[it].element_type == COBRA_TYPE_F32) { if (!expression_is_float_codegen(cg, v)) fprintf(cg->out, "    cvtsi2ss xmm0, rax\n"); fprintf(cg->out, "    movss DWORD PTR [rbx + rdx*4], xmm0\n"); } else fprintf(cg->out, "    mov QWORD PTR [rbx + rdx*8], rax\n"); return; }
             }
+            if (n->declared_type == COBRA_TYPE_FUNC && n->dyn_trait_name[0]) {
+                /* `let x: dyn Trait = concrete_value` - ir.c's cobra_ir_build
+                   already verified conformance; build the dispatch block
+                   here the same way a dyn-typed call argument does. A
+                   function-call initializer already returns a fully-built
+                   dispatch block pointer (the callee's own `-> dyn Trait`
+                   return codegen built it), so that case is just an ordinary
+                   scalar move that tags the destination symbol as dyn. */
+                VarSymbol *s = find_symbol(cg, n->name);
+                if (!s) s = ensure_scalar(cg, n->name, COBRA_TYPE_FUNC);
+                if (s->dyn_trait_name[0] == '\0')
+                    snprintf(s->dyn_trait_name, sizeof(s->dyn_trait_name), "%.63s", n->dyn_trait_name);
+                if (v->type == AST_FUNC_CALL) {
+                    emit_expr(cg, v);
+                    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", s->offset);
+                    return;
+                }
+                if (v->type != AST_VAR_REF) {
+                    fprintf(stderr, "CodeGen Error: dyn %s initializer must be a named struct value or call\n", n->dyn_trait_name);
+                    exit(EXIT_FAILURE);
+                }
+                VarSymbol *src = find_symbol(cg, v->name);
+                if (!src || src->kind != SYM_STRUCT) {
+                    fprintf(stderr, "CodeGen Error: '%s' is not a struct value coercible to dyn %s\n", v->name, n->dyn_trait_name);
+                    exit(EXIT_FAILURE);
+                }
+                emit_build_dyn_dispatch_block(cg, n->dyn_trait_name, src, s->offset);
+                return;
+            }
             VarSymbol *s = find_symbol(cg, n->name);
             if (!s) {
                 CobraTypeKind inferred = n->declared_type;
@@ -3994,6 +4131,24 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             } else if (cg->current_return_type == COBRA_TYPE_OPTION ||
                        cg->current_return_type == COBRA_TYPE_RESULT) {
                 if (has_result) emit_sum_return(cg, n->children[0], cg->current_return_type);
+            } else if (cg->current_return_dyn_trait_name[0] && has_result) {
+                /* `-> dyn Trait`: ir.c already verified the returned value
+                   implements the trait. Build the dispatch block into a
+                   scratch slot and leave its pointer in rax, matching every
+                   other scalar-return path below. */
+                if (n->children[0]->type != AST_VAR_REF) {
+                    fprintf(stderr, "CodeGen Error: dyn %s return value must be a named struct value\n", cg->current_return_dyn_trait_name);
+                    exit(EXIT_FAILURE);
+                }
+                VarSymbol *src = find_symbol(cg, n->children[0]->name);
+                if (!src || src->kind != SYM_STRUCT) {
+                    fprintf(stderr, "CodeGen Error: '%s' is not a struct value coercible to dyn %s\n",
+                            n->children[0]->name, cg->current_return_dyn_trait_name);
+                    exit(EXIT_FAILURE);
+                }
+                int dest_slot = reserve(cg, 8);
+                emit_build_dyn_dispatch_block_ex(cg, cg->current_return_dyn_trait_name, src, dest_slot, true);
+                fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n", dest_slot);
             } else if (has_result) {
                 emit_expr(cg, n->children[0]);
             }
@@ -4059,7 +4214,7 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             return;
         }
         case AST_IF_STMT: { int l = cg->label_count++; emit_expr(cg, n->children[0]); fprintf(cg->out, "    cmp rax, 0\n    je .Lelse_%d\n", l); if (n->child_count > 1) emit_statement(cg, n->children[1]); fprintf(cg->out, "    jmp .Lif_done_%d\n.Lelse_%d:\n", l, l); if (n->child_count > 2) emit_statement(cg, n->children[2]); fprintf(cg->out, ".Lif_done_%d:\n", l); return; }
-        case AST_WHILE_STMT: { int l = cg->label_count++; fprintf(cg->out, ".Lwhile_%d:\n", l); emit_expr(cg, n->children[0]); fprintf(cg->out, "    cmp rax, 0\n    je .Lwhile_done_%d\n", l); if (n->child_count > 1) emit_statement(cg, n->children[1]); fprintf(cg->out, "    jmp .Lwhile_%d\n.Lwhile_done_%d:\n", l, l); return; }
+        case AST_WHILE_STMT: { int l = cg->label_count++; fprintf(cg->out, ".Lwhile_%d:\n", l); emit_expr(cg, n->children[0]); fprintf(cg->out, "    cmp rax, 0\n    je .Lwhile_done_%d\n", l); if (n->child_count > 1) { emit_statement(cg, n->children[1]); emit_loop_owned_cleanup(cg, n->children[1]); } fprintf(cg->out, "    jmp .Lwhile_%d\n.Lwhile_done_%d:\n", l, l); return; }
         case AST_WITH_REGION: {
             if (n->child_count < 1) return;
             if (cg->region_depth >= 16) {
@@ -4128,6 +4283,7 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
     cg->current_return_error_type = ast_error_kind(fn);
     snprintf(cg->current_return_type_name, sizeof(cg->current_return_type_name), "%.63s", ast_payload_name(fn));
     snprintf(cg->current_return_error_type_name, sizeof(cg->current_return_error_type_name), "%.63s", ast_error_name(fn));
+    snprintf(cg->current_return_dyn_trait_name, sizeof(cg->current_return_dyn_trait_name), "%.63s", fn->dyn_trait_name);
     cg->propagation_label = cg->label_count++;
     bool tensor_return = fn->declared_type == COBRA_TYPE_TENSOR_F32;
     bool sum_return = fn->declared_type == COBRA_TYPE_OPTION || fn->declared_type == COBRA_TYPE_RESULT;

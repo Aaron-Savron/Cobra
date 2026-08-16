@@ -1,0 +1,54 @@
+trait Shape: {
+    def area() -> i64
+}
+
+struct Circle: { radius: i64 }
+struct Square: { side: i64 }
+
+impl Shape for Circle: {
+    def area(c: Circle) -> i64: {
+        return c.radius * c.radius * 3
+    }
+}
+
+impl Shape for Square: {
+    def area(s: Square) -> i64: {
+        return s.side * s.side
+    }
+}
+
+def make_circle(radius: i64) -> dyn Shape: {
+    let c: Circle
+    c.radius = radius
+    return c
+}
+
+def make_square(side: i64) -> dyn Shape: {
+    let s: Square
+    s.side = side
+    return s
+}
+
+def test_dyn_let_declaration(): {
+    let c: Circle
+    c.radius = 4
+    let shape: dyn Shape = c
+    assert(shape.area() == 48)
+    return 0
+}
+
+def test_dyn_let_declaration_other_type(): {
+    let s: Square
+    s.side = 6
+    let shape: dyn Shape = s
+    assert(shape.area() == 36)
+    return 0
+}
+
+def test_dyn_return_type_dispatch(): {
+    let circle_shape: dyn Shape = make_circle(5)
+    let square_shape: dyn Shape = make_square(7)
+    assert(circle_shape.area() == 75)
+    assert(square_shape.area() == 49)
+    return 0
+}

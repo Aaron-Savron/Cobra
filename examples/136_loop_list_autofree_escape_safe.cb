@@ -1,0 +1,20 @@
+# A loop-body list that escapes (passed to a function call, or explicitly
+# freed by the user) must not be double-freed by the loop-body auto-free
+# sweep. Correctness here matters more than leak coverage.
+
+def consume(xs: list[i64]) -> i64: {
+    return xs[0] + xs[1]
+}
+
+def test_loop_list_escaping_call_not_double_freed(): {
+    let i: i64 = 0
+    let total: i64 = 0
+    while i < 50: {
+        let zs: list[i64] = [7, 8]
+        total = total + consume(zs)
+        free(zs)
+        i = i + 1
+    }
+    assert(total == 750)
+    return 0
+}
