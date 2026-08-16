@@ -2478,9 +2478,7 @@ static void emit_dyn_vtable_label(CodeGen *cg, const char *trait_name, ASTNode *
 
    The block is always exactly 2 words: word 0 is the data pointer, word 1
    is the address of the static per-(Trait,Type) vtable from
-   emit_dyn_vtable_label. This replaces the previous (method_count+1)-word
-   block whose method-pointer slots were filled in with per-call mov
-   instructions - the vtable portion is now zero-allocation and shared
+   emit_dyn_vtable_label. The vtable itself is zero-allocation and shared
    across every dispatch-block construction for the same pairing, so the
    remaining malloc is a fixed 16 bytes regardless of trait size.
 
@@ -3738,7 +3736,7 @@ static bool struct_type_has_owned_scalar_fields(CodeGen *cg, const char *type_na
     return struct_canonical_has_owned_payload(canonical, 0);
 }
 
-/* --- Whole-program struct-parameter borrow inference (memory design phase 1) ---
+/* --- Whole-program struct-parameter borrow inference ---
    A struct parameter is passed as a single pointer ABI slot (see
    cobra_type_abi_slots); today every non-`out` parameter unconditionally
    copies struct_storage_size bytes into private frame storage at function
@@ -3887,11 +3885,10 @@ static void autofree_scan_disqualify(const ASTNode *n, AutofreeCandidate *cands,
        to AST_MEMBER_ASSIGN, not AST_ASSIGN with secondary_name set - the base
        identifier name is preserved through the whole access chain (see
        parse_primary), so a name match here is exactly the "field write"
-       case the comment above already documents. Populating a field from an
-       existing variable gives that variable's storage a second owner (the
-       candidate's would-be freed field), so it must disqualify the same way
-       - this was previously unreachable dead code for this node shape, a
-       real double-free hole for e.g. `let h: Holder; h.tag = some_string`. */
+       case above. Populating a field from an existing variable gives that
+       variable's storage a second owner (the candidate's would-be freed
+       field), so it must disqualify the same way - e.g. `let h: Holder;
+       h.tag = some_string` needs h disqualified or some_string double-frees. */
     if (n->type == AST_MEMBER_ASSIGN) {
         for (int k = 0; k < count; k++) {
             if (disq[k] || n == cands[k].decl_node) continue;
