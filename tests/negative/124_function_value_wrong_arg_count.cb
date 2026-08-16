@@ -1,0 +1,11 @@
+# Calling a fn(...)->... value with the wrong number of arguments must be
+# rejected, exactly like calling a named function with too few/many args.
+
+def add(a: i64, b: i64) -> i64: {
+    return a + b
+}
+
+def bad_call(): {
+    let f: fn(i64, i64) -> i64 = add
+    return f(1)
+}

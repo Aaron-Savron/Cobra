@@ -1,0 +1,12 @@
+# A function value's declared fn(...)->... type must match the assigned
+# function's real signature. add takes two i64 params; assigning it to a
+# single-parameter fn(i64)->i64 slot must be rejected.
+
+def add(a: i64, b: i64) -> i64: {
+    return a + b
+}
+
+def bad_signature(): {
+    let f: fn(i64) -> i64 = add
+    return f(1)
+}

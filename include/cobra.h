@@ -184,7 +184,15 @@ typedef enum {
     AST_COMPREHENSION,  // [expr for target in source]  (optional if guard)
     AST_BOOL_LITERAL,   // true / false
     AST_NONE_LITERAL,   // none
-    AST_MEMBER_ASSIGN   // struct_var.field = value
+    AST_MEMBER_ASSIGN,  // struct_var.field = value
+    /* Compiler-internal only (no parser surface yet): read/write a scalar at
+       a fixed byte offset through a pointer value, for closure environment
+       field access once phase 2c wires up capture codegen. child[0] is the
+       pointer-valued expression; int_val is the byte offset; value_type
+       selects the scalar width/kind (COBRA_TYPE_I64 or COBRA_TYPE_F32).
+       AST_ENV_FIELD_STORE additionally uses child[1] as the value expression. */
+    AST_ENV_FIELD_LOAD,
+    AST_ENV_FIELD_STORE
 } ASTNodeType;
 
 typedef enum {
@@ -214,6 +222,8 @@ typedef enum {
     COBRA_TYPE_GENERIC_PARAM,/* canonical placeholder used during instantiation */
     COBRA_TYPE_ENUM,         /* integer-backed unit enum (type_name holds name) */
     COBRA_TYPE_STRUCT,       /* user-defined struct type (type_name holds name) */
+    COBRA_TYPE_FUNC,         /* non-capturing function value: scalar params + scalar/void return,
+                                a single 8-byte code pointer at runtime (see fn(...)->... syntax) */
     COBRA_TYPE_UNKNOWN
 } CobraTypeKind;
 
@@ -311,6 +321,15 @@ CobraType *cobra_type_make(CobraTypeArena *arena, CobraTypeKind kind, const char
                            CobraOwnershipKind ownership, CobraMutabilityKind mutability,
                            int region_id);
 bool cobra_type_add_generic_arg(CobraType *type, const CobraType *argument);
+/* Build a non-capturing function-value type: generic_args holds each scalar
+   parameter type in order, followed by the scalar/void return type, so
+   generic_arg_count is always param_count + 1. Rejects a NULL param/return
+   entry or a non-scalar (non-void) component. */
+const CobraType *cobra_type_make_func(CobraTypeArena *arena, const CobraType *const *params,
+                                      size_t param_count, const CobraType *return_type);
+size_t cobra_type_func_param_count(const CobraType *type);
+const CobraType *cobra_type_func_param(const CobraType *type, size_t index);
+const CobraType *cobra_type_func_return(const CobraType *type);
 /* Attach one variant payload to a payload-carrying enum descriptor (NULL marks
    a unit variant). Legal only before finalization. */
 bool cobra_type_add_variant_payload(CobraType *type, const CobraType *payload);
@@ -419,6 +438,27 @@ struct ASTNode {
     char module_alias[COBRA_MAX_IDENT_LEN];
     /* Optional qualifier on a function call; empty means an ordinary call. */
     char qualifier[COBRA_MAX_IDENT_LEN];
+    /* Set by IR validation when an AST_FUNC_CALL's callee name resolves to a
+       local fn(...)->... value rather than a top-level function (f(a, b)
+       where f is a variable, not a declaration) - see function_value_type
+       and the AST_FUNC_CALL fallback in ir.c. Codegen emits an indirect
+       `call` through the stored code pointer instead of `call name@PLT`. */
+    bool is_indirect_call;
+    /* Closure support (phase 2c). is_closure marks a synthesized AST_FUNCTION
+       produced by an anonymous `def(...)->...:{...}` literal; enclosing_function
+       names the function it was lexically written inside (empty if the literal
+       has no captures worth resolving). captured_names/types/count are filled
+       in by ir.c's closure-capture pass and consumed by codegen to size the
+       heap-allocated environment struct and marshal it through the fn value's
+       {code_ptr,env_ptr} thunk. is_closure_instance marks the AST_VAR_REF left
+       at the closure literal's use site so codegen builds a fresh thunk+env
+       there instead of treating the name as a plain top-level function value. */
+    bool is_closure;
+    char enclosing_function[COBRA_MAX_IDENT_LEN];
+    bool is_closure_instance;
+    char captured_names[8][COBRA_MAX_IDENT_LEN];
+    CobraTypeKind captured_types[8];
+    int captured_count;
     /* Canonical type attached during parsing or IR inference. Descriptors are
        immutable after construction; the AST only borrows the arena node. */
     const CobraType *canonical_type;
@@ -491,6 +531,18 @@ typedef struct {
        parsed while set is tagged TARGET_DEV_GPU_KERNEL instead of CPU. A
        file whose first directive is `@gpu` therefore targets GPU throughout. */
     bool gpu_directive_active;
+    /* Root program node, set once at parse start so anonymous closure
+       literals encountered mid-expression can be registered as ordinary
+       top-level functions before IR build ever runs (no re-entrancy risk:
+       parsing fully completes before cobra_ir_build iterates root's
+       children). */
+    ASTNode *root;
+    int closure_counter;
+    /* Innermost-first stack of the named functions currently being parsed,
+       so a closure literal can record which function it was lexically
+       written inside (see ASTNode.enclosing_function). */
+    char enclosing_stack[8][COBRA_MAX_IDENT_LEN];
+    int enclosing_depth;
 } Parser;
 
 void parser_init(Parser *parser, const char *source);

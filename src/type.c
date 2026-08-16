@@ -67,6 +67,52 @@ bool cobra_type_add_variant_payload(CobraType *type, const CobraType *payload) {
     return true;
 }
 
+static bool scalar_generic_argument(const CobraType *type);
+
+static bool func_component_ok(const CobraType *type) {
+    /* Phase 1 of function-value support: scalar parameters and a scalar or
+       void return only. No captures, no aggregate marshalling yet - see
+       ROADMAP.md's function-value entry for the follow-up capture phase. */
+    if (!type) return false;
+    return type->kind == COBRA_TYPE_VOID || scalar_generic_argument(type);
+}
+
+const CobraType *cobra_type_make_func(CobraTypeArena *arena, const CobraType *const *params,
+                                      size_t param_count, const CobraType *return_type) {
+    if (!arena || !func_component_ok(return_type)) return NULL;
+    if (param_count > 0 && !params) return NULL;
+    for (size_t i = 0; i < param_count; i++) {
+        if (!func_component_ok(params[i])) return NULL;
+    }
+    CobraType *type = cobra_type_new(arena, COBRA_TYPE_FUNC);
+    if (!type) return NULL;
+    for (size_t i = 0; i < param_count; i++) {
+        if (!cobra_type_add_generic_arg(type, params[i])) return NULL;
+    }
+    if (!cobra_type_add_generic_arg(type, return_type)) return NULL;
+    type->abi = COBRA_ABI_GPR;
+    type->size = 8;
+    type->alignment = 8;
+    type->finalized = true;
+    return type;
+}
+
+size_t cobra_type_func_param_count(const CobraType *type) {
+    if (!type || type->kind != COBRA_TYPE_FUNC || type->generic_arg_count == 0) return 0;
+    return type->generic_arg_count - 1;
+}
+
+const CobraType *cobra_type_func_param(const CobraType *type, size_t index) {
+    if (!type || type->kind != COBRA_TYPE_FUNC) return NULL;
+    if (index >= cobra_type_func_param_count(type)) return NULL;
+    return type->generic_args[index];
+}
+
+const CobraType *cobra_type_func_return(const CobraType *type) {
+    if (!type || type->kind != COBRA_TYPE_FUNC || type->generic_arg_count == 0) return NULL;
+    return type->generic_args[type->generic_arg_count - 1];
+}
+
 const CobraType *cobra_type_element(const CobraType *type) {
     if (!type || type->generic_arg_count == 0) return NULL;
     if (type->kind == COBRA_TYPE_OPTION || type->kind == COBRA_TYPE_RESULT ||
@@ -136,6 +182,7 @@ const char *cobra_type_kind_name(CobraTypeKind kind) {
         case COBRA_TYPE_GENERIC_PARAM: return "generic parameter";
         case COBRA_TYPE_ENUM: return "enum";
         case COBRA_TYPE_STRUCT: return "struct";
+        case COBRA_TYPE_FUNC: return "fn";
         case COBRA_TYPE_UNKNOWN: return "unknown";
         default: return "invalid";
     }
@@ -966,7 +1013,8 @@ static const CobraType *cobra_type_struct_layout_depth(CobraTypeArena *arena, AS
                 declared->region_id == -1;
             bool readonly_borrowed_slice =
                 declared->ownership == COBRA_OWNERSHIP_BORROWED &&
-                declared->mutability == COBRA_MUTABILITY_READONLY &&
+                (declared->mutability == COBRA_MUTABILITY_READONLY ||
+                 declared->mutability == COBRA_MUTABILITY_OUT) &&
                 declared->region_id == -1;
             if ((field_kind == COBRA_TYPE_SLICE || field_kind == COBRA_TYPE_SLICE_F32 ||
                  field_kind == COBRA_TYPE_SLICE_U8) &&

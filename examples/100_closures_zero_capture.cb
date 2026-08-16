@@ -1,0 +1,34 @@
+# Zero-capture anonymous closure literals: `def(params) -> ret: { body }` in
+# expression position (phase 2c-a - no captures yet, see ROADMAP.md; a body
+# referencing an enclosing-scope variable is rejected as an undefined
+# variable since the synthesized function has no access to the caller's
+# locals).
+
+def apply(f: fn(i64, i64) -> i64, x: i64, y: i64) -> i64: {
+    return f(x, y)
+}
+
+def test_assign_and_call(): {
+    let f: fn(i64, i64) -> i64 = def(a: i64, b: i64) -> i64: {
+        return a + b
+    }
+    assert(f(3, 4) == 7)
+    return 0
+}
+
+def test_pass_as_parameter(): {
+    assert(apply(def(a: i64, b: i64) -> i64: { return a * b }, 6, 7) == 42)
+    return 0
+}
+
+def make_negator() -> fn(i64) -> i64: {
+    return def(x: i64) -> i64: {
+        return 0 - x
+    }
+}
+
+def test_return_closure_literal(): {
+    let neg: fn(i64) -> i64 = make_negator()
+    assert(neg(9) == -9)
+    return 0
+}

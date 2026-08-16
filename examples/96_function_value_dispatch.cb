@@ -1,0 +1,39 @@
+# A function value passed to another function and called there, used for
+# runtime-dispatched per-element behavior selection (no captures - phase 1).
+
+def double_it(x: i64) -> i64: {
+    return x * 2
+}
+
+def square_it(x: i64) -> i64: {
+    return x * x
+}
+
+def apply_all(f: fn(i64) -> i64, values: []i64, out_values: []i64) -> i64: {
+    for idx in range(len(values)): {
+        out_values[idx] = f(values[idx])
+    }
+    return 0
+}
+
+def test_apply_all_double(): {
+    values = [1, 2, 3, 4]
+    results = [0, 0, 0, 0]
+    apply_all(double_it, values, results)
+    assert(results[0] == 2)
+    assert(results[1] == 4)
+    assert(results[2] == 6)
+    assert(results[3] == 8)
+    return 0
+}
+
+def test_apply_all_square(): {
+    values = [1, 2, 3, 4]
+    results = [0, 0, 0, 0]
+    apply_all(square_it, values, results)
+    assert(results[0] == 1)
+    assert(results[1] == 4)
+    assert(results[2] == 9)
+    assert(results[3] == 16)
+    return 0
+}

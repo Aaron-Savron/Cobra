@@ -291,6 +291,60 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
         }
         return COBRA_TYPE_ARRAY;
     }
+    if (match(parser, TOKEN_IDENTIFIER) && strcmp(parser->current_token.text, "fn") == 0) {
+        /* Non-capturing function-value type: fn(T1, T2, ...) -> R. Phase 1
+           (see ROADMAP.md) restricts every component to a scalar or void
+           return - no slices, structs, or other aggregates yet. */
+        advance_token(parser);
+        expect(parser, TOKEN_LPAREN, "Expected '(' after fn in function-value type");
+        const CobraType *params[COBRA_MAX_TYPE_ARGS];
+        size_t param_count = 0;
+        if (!match(parser, TOKEN_RPAREN)) {
+            for (;;) {
+                CobraTypeKind param_kind = token_to_type(parser->current_token.type);
+                if (param_kind == COBRA_TYPE_UNKNOWN || param_kind == COBRA_TYPE_VOID ||
+                    param_kind == COBRA_TYPE_STRING || param_kind == COBRA_TYPE_V256) {
+                    fprintf(stderr, "%s:%d:%d: error: fn(...) parameters must be scalar values\n",
+                            parser->source_file, parser->current_token.line,
+                            parser->current_token.col);
+                    exit(1);
+                }
+                if (param_count >= COBRA_MAX_TYPE_ARGS - 1) {
+                    fprintf(stderr, "%s:%d:%d: error: fn(...) has too many parameters\n",
+                            parser->source_file, parser->current_token.line,
+                            parser->current_token.col);
+                    exit(1);
+                }
+                params[param_count++] = parser_component_type(parser, param_kind, NULL);
+                advance_token(parser);
+                if (match(parser, TOKEN_COMMA)) { advance_token(parser); continue; }
+                break;
+            }
+        }
+        expect(parser, TOKEN_RPAREN, "Expected ')' after fn(...) parameters");
+        expect(parser, TOKEN_ARROW, "Expected '->' after fn(...) parameters");
+        CobraTypeKind return_kind = token_to_type(parser->current_token.type);
+        if (return_kind == COBRA_TYPE_UNKNOWN || return_kind == COBRA_TYPE_STRING ||
+            return_kind == COBRA_TYPE_V256) {
+            fprintf(stderr, "%s:%d:%d: error: fn(...) return type must be scalar or void\n",
+                    parser->source_file, parser->current_token.line,
+                    parser->current_token.col);
+            exit(1);
+        }
+        const CobraType *return_type = parser_component_type(parser, return_kind, NULL);
+        advance_token(parser);
+        if (owner) {
+            owner->canonical_type = cobra_type_make_func(parser->canonical_arena, params,
+                                                          param_count, return_type);
+            if (!owner->canonical_type) {
+                fprintf(stderr, "%s:%d:%d: error: could not construct function-value type metadata\n",
+                        parser->source_file, parser->current_token.line,
+                        parser->current_token.col);
+                exit(EXIT_FAILURE);
+            }
+        }
+        return COBRA_TYPE_FUNC;
+    }
     if (match(parser, TOKEN_IDENTIFIER) && strcmp(parser->current_token.text, "list") == 0) {
         advance_token(parser);
         expect(parser, TOKEN_LBRACKET, "Expected '[' after list in collection type");
@@ -590,7 +644,13 @@ static int parse_int_literal(Parser *parser) {
     return (int)magnitude;
 }
 
+static ASTNode *parse_closure_literal(Parser *parser);
+
 static ASTNode *parse_primary(Parser *parser) {
+    if (match(parser, TOKEN_DEF)) {
+        return parse_closure_literal(parser);
+    }
+
     if (match(parser, TOKEN_MINUS)) {
         advance_token(parser);
         if (match(parser, TOKEN_INT_LITERAL)) {
@@ -1023,6 +1083,7 @@ static ASTNode *parse_statement(Parser *parser) {
         } else {
             ASTNode *cap = parser_create_node(parser, AST_INT_LITERAL, NULL);
             cap->int_val = 1048576; /* 1 MiB default backing store */
+            cap->literal_i64 = 1048576; /* literal_i64 is authoritative for codegen; int_val alone is stale */
             ast_add_child(with_node, cap);
         }
         if (match(parser, TOKEN_COLON)) advance_token(parser);
@@ -1350,8 +1411,24 @@ static ASTNode *parse_statement(Parser *parser) {
     if (match(parser, TOKEN_RETURN)) {
         advance_token(parser);
         ASTNode *ret_node = parser_create_node(parser, AST_RETURN, NULL);
+        /* `return` directly followed by `def` is ambiguous: a brace-less
+           function body's implicit end (`return` with no value, next `def`
+           starts the following top-level function) vs. `return def(...)...`
+           returning a closure literal. Disambiguate with one token of
+           lookahead: `def(` is always a closure literal (named declarations
+           require `def <identifier>`), so only swallow TOKEN_DEF as "no
+           value" when it isn't immediately followed by '('. */
+        bool def_starts_closure = false;
+        if (match(parser, TOKEN_DEF)) {
+            Lexer saved_lexer = parser->lexer;
+            Token saved_token = parser->current_token;
+            advance_token(parser);
+            def_starts_closure = match(parser, TOKEN_LPAREN);
+            parser->lexer = saved_lexer;
+            parser->current_token = saved_token;
+        }
         if (!match(parser, TOKEN_RBRACE) && !match(parser, TOKEN_EOF) &&
-            !match(parser, TOKEN_DEF) && !match(parser, TOKEN_ELSE)) {
+            (!match(parser, TOKEN_DEF) || def_starts_closure) && !match(parser, TOKEN_ELSE)) {
             ASTNode *expr = parse_expression(parser);
             ast_add_child(ret_node, expr);
         }
@@ -1622,6 +1699,13 @@ static ASTNode *parse_struct_declaration(Parser *parser) {
             advance_token(parser);
         }
         field->declared_type = parse_type_into(parser, "struct field", field, field_qualifier);
+        /* Struct fields use ownership to distinguish a borrowed writable view
+           from an owned value (see direct_struct_field_supported in ir.c and
+           the struct slice field check in type.c); function/local `out`
+           parameters key off mutability alone and must not be touched here,
+           so this stays local to struct field parsing. */
+        if (field_qualifier == 2 && field->canonical_type)
+            ((CobraType *)field->canonical_type)->ownership = COBRA_OWNERSHIP_BORROWED;
 
         ast_add_child(struct_node, field);
         if (match(parser, TOKEN_COMMA)) advance_token(parser);
@@ -1631,17 +1715,10 @@ static ASTNode *parse_struct_declaration(Parser *parser) {
     return struct_node;
 }
 
-static ASTNode *parse_function(Parser *parser) {
-    expect(parser, TOKEN_DEF, "Expected 'def' to start function declaration");
-    
-    char fn_name[COBRA_MAX_IDENT_LEN];
-    Token function_token = parser->current_token;
-    copy_token_text(parser, fn_name, sizeof(fn_name), "function name");
-    expect(parser, TOKEN_IDENTIFIER, "Expected function name");
-
-    ASTNode *fn_node = parser_create_node_at(parser, AST_FUNCTION, fn_name, function_token);
-    if (parser->gpu_directive_active) fn_node->target_device = TARGET_DEV_GPU_KERNEL;
-
+/* Shared by named `def foo(...)` declarations and anonymous closure
+   literals: parses generics, parameters, return type, and body onto an
+   already-created (named or synthesized) AST_FUNCTION node. */
+static ASTNode *parse_function_signature_and_body(Parser *parser, ASTNode *fn_node) {
     size_t previous_generic_count = parser->generic_param_count;
     parser->generic_param_count = 0;
     if (match(parser, TOKEN_LBRACKET)) {
@@ -1768,6 +1845,67 @@ static ASTNode *parse_function(Parser *parser) {
     return fn_node;
 }
 
+static ASTNode *parse_function(Parser *parser) {
+    expect(parser, TOKEN_DEF, "Expected 'def' to start function declaration");
+
+    char fn_name[COBRA_MAX_IDENT_LEN];
+    Token function_token = parser->current_token;
+    copy_token_text(parser, fn_name, sizeof(fn_name), "function name");
+    expect(parser, TOKEN_IDENTIFIER, "Expected function name");
+
+    ASTNode *fn_node = parser_create_node_at(parser, AST_FUNCTION, fn_name, function_token);
+    if (parser->gpu_directive_active) fn_node->target_device = TARGET_DEV_GPU_KERNEL;
+
+    if (parser->enclosing_depth < 8)
+        snprintf(parser->enclosing_stack[parser->enclosing_depth++], COBRA_MAX_IDENT_LEN, "%.63s", fn_name);
+    ASTNode *result = parse_function_signature_and_body(parser, fn_node);
+    if (parser->enclosing_depth > 0) parser->enclosing_depth--;
+    return result;
+}
+
+/* Anonymous closure literal in expression position: `def(params) -> ret: { body }`.
+   Registered immediately as an ordinary synthesized top-level function (parsing
+   finishes fully before cobra_ir_build ever runs, so there is no re-entrancy
+   risk), and the literal evaluates to a var-reference naming it. Every
+   closure gets an implicit leading `__env` (i64) parameter, whether or not it
+   ends up capturing anything - it rides the same {code_ptr, env_ptr} thunk
+   convention as plain function values (see ensure_fn_thunk in codegen.c), so
+   there is one uniform indirect-call ABI instead of a bifurcated one. Capture
+   analysis and the read rewrite to AST_ENV_FIELD_LOAD happen later in ir.c,
+   once every function's parameter list is known; only scalar captures of the
+   immediately-enclosing named function are supported (see
+   collect_closure_captures in ir.c). enclosing_function records that
+   function's name so ir.c can look up its parameters. */
+static ASTNode *parse_closure_literal(Parser *parser) {
+    Token def_token = parser->current_token;
+    expect(parser, TOKEN_DEF, "Expected 'def' to start closure literal");
+
+    char closure_name[COBRA_MAX_IDENT_LEN];
+    snprintf(closure_name, sizeof(closure_name), "__closure_%d", parser->closure_counter++);
+
+    ASTNode *fn_node = parser_create_node_at(parser, AST_FUNCTION, closure_name, def_token);
+    if (parser->gpu_directive_active) fn_node->target_device = TARGET_DEV_GPU_KERNEL;
+    fn_node->is_closure = true;
+    if (parser->enclosing_depth > 0)
+        snprintf(fn_node->enclosing_function, COBRA_MAX_IDENT_LEN, "%.63s", parser->enclosing_stack[parser->enclosing_depth - 1]);
+
+    ASTNode *env_param = parser_create_node_at(parser, AST_PARAM, "__env", def_token);
+    env_param->declared_type = COBRA_TYPE_I64;
+    parser_set_canonical(parser, env_param, COBRA_TYPE_I64, 0, NULL, NULL, NULL, NULL);
+    ast_add_child(fn_node, env_param);
+
+    if (parser->enclosing_depth < 8)
+        snprintf(parser->enclosing_stack[parser->enclosing_depth++], COBRA_MAX_IDENT_LEN, "%.63s", closure_name);
+    parse_function_signature_and_body(parser, fn_node);
+    if (parser->enclosing_depth > 0) parser->enclosing_depth--;
+
+    if (parser->root) ast_add_child(parser->root, fn_node);
+
+    ASTNode *ref = parser_create_node_at(parser, AST_VAR_REF, closure_name, def_token);
+    ref->is_closure_instance = true;
+    return ref;
+}
+
 ASTNode *parser_parse_program(Parser *parser) {
     ASTNode *root = parser_create_node(parser, AST_PROGRAM, "RootProgram");
     root->canonical_arena = (CobraTypeArena *)calloc(1, sizeof(CobraTypeArena));
@@ -1777,6 +1915,7 @@ ASTNode *parser_parse_program(Parser *parser) {
     }
     cobra_type_arena_init(root->canonical_arena);
     parser->canonical_arena = root->canonical_arena;
+    parser->root = root;
     while (!match(parser, TOKEN_EOF)) {
         if (match(parser, TOKEN_GPU_DIRECTIVE)) {
             advance_token(parser);

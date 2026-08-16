@@ -1,0 +1,13 @@
+# Closures cannot capture a non-scalar (struct) variable from the enclosing
+# function - only scalar (i64/f32/bool) captures are supported (phase 2c, see
+# ROADMAP.md). This used to test that ALL captures were rejected (phase
+# 2c-a); scalar captures now work (see examples/119_closures_capture.cb), so
+# this narrows to the case that remains genuinely unsupported.
+
+struct Point: { x: i64, y: i64 }
+
+def make_bad(p: Point) -> fn(i64) -> i64: {
+    return def(x: i64) -> i64: {
+        return x + p.x
+    }
+}

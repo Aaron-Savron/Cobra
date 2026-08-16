@@ -1,0 +1,11 @@
+# A closure's captures are a read-only snapshot taken when the closure
+# literal is evaluated, not a live reference to the enclosing function's
+# local - assigning to a captured name inside the closure body is rejected
+# rather than silently writing to a local that reads never observe.
+
+def make_bad(n: i64) -> fn(i64) -> i64: {
+    return def(x: i64) -> i64: {
+        n = x
+        return n
+    }
+}

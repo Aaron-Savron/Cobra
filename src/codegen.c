@@ -130,6 +130,19 @@ typedef struct {
     int propagation_label;
     PendingParallel pending_parallel[16];
     int pending_parallel_count;
+    /* Plain top-level functions used as fn(...)->... values (closures aside)
+       get a lazily-emitted {adapter_stub, 0} thunk the first time their
+       address is taken, so every fn value - closure or plain - is a pointer
+       to a uniform 16-byte {code_ptr, env_ptr} pair; see ensure_fn_thunk. */
+    char fn_thunks_emitted[64][COBRA_MAX_IDENT_LEN];
+    int fn_thunk_count;
+    /* Names recorded by ensure_fn_thunk but not yet flushed to output. Actual
+       adapter/thunk bytes must never be printed mid-function (execution would
+       fall straight through the adapter's instructions as if they were part
+       of the caller's own body) - flush_pending_fn_thunks prints them only
+       after the current function's `ret`, mirroring flush_pending_parallel. */
+    char fn_thunk_pending[16][COBRA_MAX_IDENT_LEN];
+    int fn_thunk_pending_count;
 } CodeGen;
 
 static const char *SYSV_REGS[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
@@ -167,6 +180,43 @@ static ASTNode *find_function(CodeGen *cg, const char *name) {
         if (n->type == AST_FUNCTION && strcmp(n->name, name) == 0) return n;
     }
     return NULL;
+}
+
+/* Emits, once per function name, a static {adapter_stub, 0} thunk so a plain
+   top-level function used as an fn(...)->... value has the same 16-byte
+   {code_ptr, env_ptr} shape a closure's thunk has (see emit_call's
+   is_indirect_call path, which always dereferences a thunk pointer and
+   passes env_ptr as an implicit leading argument). The adapter drops that
+   unused env_ptr and shifts the real integer arguments left by one GPR
+   before jumping to the real function; float arguments arrive in xmm0.. and
+   are untouched by the shift, so this is safe for any declared signature
+   this backend supports (int/float scalars only). */
+static void ensure_fn_thunk(CodeGen *cg, const char *name) {
+    for (int i = 0; i < cg->fn_thunk_count; i++)
+        if (!strcmp(cg->fn_thunks_emitted[i], name)) return;
+    if (cg->fn_thunk_count < 64) snprintf(cg->fn_thunks_emitted[cg->fn_thunk_count++], COBRA_MAX_IDENT_LEN, "%.63s", name);
+    if (cg->fn_thunk_pending_count < 16) snprintf(cg->fn_thunk_pending[cg->fn_thunk_pending_count++], COBRA_MAX_IDENT_LEN, "%.63s", name);
+}
+
+/* Prints the adapter/thunk bytes ensure_fn_thunk queued during the function
+   just compiled. Must only be called right after that function's epilogue
+   (see flush_pending_parallel's call site) - the emitted adapter contains a
+   real `jmp`, so it must never sit reachable via fallthrough inside another
+   function's body. */
+static void flush_pending_fn_thunks(CodeGen *cg) {
+    for (int i = 0; i < cg->fn_thunk_pending_count; i++) {
+        const char *name = cg->fn_thunk_pending[i];
+        fprintf(cg->out,
+                "    .text\n"
+                "__fnval_adapter_%s:\n"
+                "    mov rdi, rsi\n    mov rsi, rdx\n    mov rdx, rcx\n    mov rcx, r8\n    mov r8, r9\n"
+                "    jmp %s\n"
+                "    .data\n"
+                "__fnthunk_%s:\n    .quad __fnval_adapter_%s\n    .quad 0\n"
+                "    .text\n",
+                name, name, name, name);
+    }
+    cg->fn_thunk_pending_count = 0;
 }
 
 static bool is_imported_function(CodeGen *cg, const char *name) {
@@ -1268,6 +1318,19 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
             }
             return;
         }
+        case AST_ENV_FIELD_LOAD: {
+            if (node->child_count != 1) {
+                fprintf(stderr, "CodeGen Error: env field load requires one pointer expression\n");
+                exit(EXIT_FAILURE);
+            }
+            emit_expr(cg, node->children[0]);
+            if (node->value_type == COBRA_TYPE_F32) {
+                fprintf(cg->out, "    movss xmm0, DWORD PTR [rax + %d]\n", (int)node->int_val);
+            } else {
+                fprintf(cg->out, "    mov rax, QWORD PTR [rax + %d]\n", (int)node->int_val);
+            }
+            return;
+        }
         case AST_COMPTIME_EXPR: fprintf(cg->out, "    mov rax, %d\n", interpreter_eval_expr(node)); return;
         case AST_VAR_REF: {
             int loop = current_iter(cg, node->name);
@@ -1292,14 +1355,46 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
                 }
                 return;
             }
+            if (node->is_closure_instance) {
+                /* Closure literal's use site: build a fresh {code_ptr,env_ptr}
+                   thunk. Captured values are this (the enclosing) function's
+                   own live locals, since the literal is compiled as part of
+                   the enclosing function's own body. */
+                ASTNode *closure_fn = find_function(cg, node->name);
+                if (!closure_fn) { fprintf(stderr, "CodeGen Error: undefined closure '%s'\n", node->name); exit(EXIT_FAILURE); }
+                int env_slot = reserve(cg, 8);
+                if (closure_fn->captured_count > 0) {
+                    fprintf(cg->out, "    mov rdi, %d\n    call malloc@PLT\n    mov QWORD PTR [rbp-%d], rax\n",
+                            closure_fn->captured_count * 8, env_slot);
+                    for (int i = 0; i < closure_fn->captured_count; i++) {
+                        VarSymbol *cap = find_symbol(cg, closure_fn->captured_names[i]);
+                        if (!cap) { fprintf(stderr, "CodeGen Error: closure capture '%s' not found\n", closure_fn->captured_names[i]); exit(EXIT_FAILURE); }
+                        if (closure_fn->captured_types[i] == COBRA_TYPE_F32)
+                            fprintf(cg->out, "    movss xmm0, DWORD PTR [rbp-%d]\n    mov rdx, QWORD PTR [rbp-%d]\n    movss DWORD PTR [rdx+%d], xmm0\n",
+                                    cap->offset, env_slot, i * 8);
+                        else
+                            fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov rdx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rdx+%d], rax\n",
+                                    cap->offset, env_slot, i * 8);
+                    }
+                } else {
+                    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], 0\n", env_slot);
+                }
+                fprintf(cg->out,
+                        "    mov rdi, 16\n    call malloc@PLT\n"
+                        "    lea rdx, [rip+%s]\n    mov QWORD PTR [rax], rdx\n"
+                        "    mov rdx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rax+8], rdx\n",
+                        node->name, env_slot);
+                return;
+            }
             VarSymbol *s = find_symbol(cg, node->name);
             if (!s) {
-                /* A bare identifier that isn't a local is a function
-                   reference (ir.c already confirmed it names a real
-                   top-level function): its value is the function's address,
-                   for use with call_i64_i64/call_f32_f32. */
+                /* A bare identifier that isn't a local is a plain top-level
+                   function used as an fn(...)->... value: its value is a
+                   pointer to a lazily-emitted {adapter_stub, 0} thunk (see
+                   ensure_fn_thunk), keeping every fn value - closure or
+                   plain - a uniform pointer to a {code_ptr, env_ptr} pair. */
                 ASTNode *fn_ref = find_function(cg, node->name);
-                if (fn_ref) { fprintf(cg->out, "    lea rax, [rip+%s]\n", node->name); return; }
+                if (fn_ref) { ensure_fn_thunk(cg, node->name); fprintf(cg->out, "    lea rax, [rip+__fnthunk_%s]\n", node->name); return; }
                 fprintf(stderr, "CodeGen Error: Undefined variable '%s'\n", node->name); exit(EXIT_FAILURE);
             }
             if (is_sum_symbol_type(s->type)) fprintf(cg->out, "    lea rax, [rbp-%d]\n", s->tag_offset);
@@ -2261,6 +2356,48 @@ static void emit_gpu_resident_call(CodeGen *cg, ASTNode *call, ASTNode *fn) {
 }
 
 static void emit_call(CodeGen *cg, ASTNode *n) {
+    if (n->is_indirect_call) {
+        /* f(a, b, ...) where f is a local fn(...)->... value (ir.c already
+           checked argument count/types against the stored signature). Each
+           argument is evaluated into a stack temp first - same reasoning as
+           call_i64_i64 below - because evaluating a later argument, or the
+           callee address itself, may clobber a register still needed for an
+           earlier one; only once every value is safely on the stack are they
+           loaded into the SysV argument registers in order. */
+        /* fn(...)->... values are always a pointer to a {code_ptr, env_ptr}
+           thunk (see ensure_fn_thunk for plain functions, and the
+           is_closure_instance codegen for closures), so env_ptr is always
+           passed as an implicit leading argument in rdi; the real arguments
+           start at rsi. Float arguments are unaffected since env only
+           consumes a GPR. */
+        VarSymbol *fs = find_symbol(cg, n->name);
+        if (!fs) { fprintf(stderr, "CodeGen Error: undefined function value '%s'\n", n->name); exit(EXIT_FAILURE); }
+        int thunk_slot = reserve(cg, 8);
+        fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", fs->offset, thunk_slot);
+        int arg_slot = reserve(cg, (int)n->child_count * 8);
+        bool arg_is_float[16];
+        for (size_t i = 0; i < n->child_count && i < 16; i++) {
+            ASTNode *arg = n->children[i];
+            arg_is_float[i] = expression_is_float_codegen(cg, arg);
+            emit_expr(cg, arg);
+            int slot = arg_slot - (int)i * 8;
+            if (arg_is_float[i]) fprintf(cg->out, "    movss DWORD PTR [rbp-%d], xmm0\n", slot);
+            else fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", slot);
+        }
+        int gpr = 1, xmm = 0;
+        for (size_t i = 0; i < n->child_count && i < 16; i++) {
+            int slot = arg_slot - (int)i * 8;
+            if (arg_is_float[i]) fprintf(cg->out, "    movss %s, DWORD PTR [rbp-%d]\n", SYSV_XMM_REGS[xmm++], slot);
+            else fprintf(cg->out, "    mov %s, QWORD PTR [rbp-%d]\n", param_reg(cg, gpr++), slot);
+        }
+        fprintf(cg->out,
+                "    mov r11, QWORD PTR [rbp-%d]\n"
+                "    mov rdi, QWORD PTR [r11+8]\n"
+                "    mov r10, QWORD PTR [r11]\n"
+                "    xor eax, eax\n    call r10\n",
+                thunk_slot);
+        return;
+    }
     if (is_region_alloc(cg, n)) { emit_region_alloc(cg, n); return; }
     {
         ASTNode *gpu_fn = find_function(cg, n->name);
@@ -3530,6 +3667,25 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             }
             return;
         }
+        case AST_ENV_FIELD_STORE: {
+            if (n->child_count != 2) {
+                fprintf(stderr, "CodeGen Error: env field store requires a pointer and a value expression\n");
+                exit(EXIT_FAILURE);
+            }
+            int ptr_temp = reserve(cg, 8);
+            emit_expr(cg, n->children[0]);
+            fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", ptr_temp);
+            emit_expr(cg, n->children[1]);
+            if (n->value_type == COBRA_TYPE_F32) {
+                if (!expression_is_float_codegen(cg, n->children[1])) fprintf(cg->out, "    cvtsi2ss xmm0, rax\n");
+                fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n    movss DWORD PTR [rdx + %d], xmm0\n",
+                        ptr_temp, n->int_val);
+            } else {
+                fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rdx + %d], rax\n",
+                        ptr_temp, n->int_val);
+            }
+            return;
+        }
         case AST_FUNC_CALL: emit_call(cg, n); return;
         case AST_RETURN: {
             const char *returned_name = NULL;
@@ -3820,6 +3976,7 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
     /* @parallel workers are emitted after the caller's body, so the caller
        never falls through into a worker prologue. */
     flush_pending_parallel(cg);
+    flush_pending_fn_thunks(cg);
 }
 
 static bool codegen_is_nn_function(const ASTNode *node) {

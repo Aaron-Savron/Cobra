@@ -1,0 +1,41 @@
+# Non-capturing function values: fn(...)->... assigns, passes, and returns
+# a checked function signature (phase 1 - no captures yet, see ROADMAP.md).
+
+def add(a: i64, b: i64) -> i64: {
+    return a + b
+}
+
+def sub(a: i64, b: i64) -> i64: {
+    return a - b
+}
+
+def apply(f: fn(i64, i64) -> i64, x: i64, y: i64) -> i64: {
+    return f(x, y)
+}
+
+def pick_op(use_add: i64) -> fn(i64, i64) -> i64: {
+    if use_add == 1: {
+        return add
+    }
+    return sub
+}
+
+def test_assign_and_call(): {
+    let f: fn(i64, i64) -> i64 = add
+    assert(f(3, 4) == 7)
+    return 0
+}
+
+def test_pass_as_parameter(): {
+    assert(apply(add, 10, 5) == 15)
+    assert(apply(sub, 10, 5) == 5)
+    return 0
+}
+
+def test_return_function_value(): {
+    let op: fn(i64, i64) -> i64 = pick_op(1)
+    assert(op(20, 8) == 28)
+    let op2: fn(i64, i64) -> i64 = pick_op(0)
+    assert(op2(20, 8) == 12)
+    return 0
+}

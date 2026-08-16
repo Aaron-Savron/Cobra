@@ -90,6 +90,34 @@ known = has(metrics, "loss")
 
 Use `len(values)` or `len(metrics)`, ordinary indexing, `append`, `set`, `get`, and `has`. Membership uses the Python-shaped operators `in` and `not in`: a dictionary membership compiles to a native hash probe, and list/array/slice membership compiles to a direct element scan with an early exit. `delete(metrics, "step")` removes a key and returns success; `pop(metrics, "key", fallback)` removes a key and returns its value, or the fallback when the key is absent. List comprehensions build a fresh native list in one pass: `[expr for value in values]` and `[expr for value in values if guard]` lower to a single loop with one `cobra_list_append_*` call per kept element, writing directly into the declared `list` symbol. Local lists and dictionaries are reclaimed automatically when their containing function exits, including early returns. `free` remains available as an explicit compatibility operation for owned values; borrowed collection parameters cannot be freed, use-after-free is rejected, and unsafe owned aliases are rejected. Dictionary keys are copied into the table. There is no tracing garbage collector, boxing, or hidden list object on fixed-array/tensor paths. `list[i64]` and `list[f32]` are the first native element types; dictionary values are currently `i64`, and missing `get` keys return the supplied fallback.
 
+## Function Values
+
+`fn(T1, T2, ...) -> R` is a non-capturing function-value type: a plain top-level function assigned to it, passed as it, or returned as it carries a real checked signature (parameter and return types), not just a bare address. Phase 1 only: every parameter and the return type must be scalar (or `void` for the return) - no captures, no slices/structs/collections in the signature yet.
+
+```cobra
+def add(a: i64, b: i64) -> i64: { return a + b }
+
+def apply(f: fn(i64, i64) -> i64, x: i64, y: i64) -> i64: {
+    return f(x, y)
+}
+
+let op: fn(i64, i64) -> i64 = add
+op(3, 4)          # 7
+apply(add, 3, 4)  # 7
+```
+
+`call_i64_i64(func_ptr, arg)` / `call_f32_f32(func_ptr, arg)` remain as a deprecated one-argument alias; prefer calling the `fn(...)->...` value directly.
+
+`def(params) -> ret: { body }` in expression position is an anonymous closure literal: it evaluates to a `fn(...)->...` value the same way a named function reference does. It may capture scalar (i64/f32/bool) variables from the immediately-enclosing function - its parameters, and its explicitly-typed `let` locals - by value: a snapshot taken when the literal is evaluated, not a live reference. Captures are read-only; assigning to a captured name inside the closure body is rejected. Capturing a non-scalar variable is rejected with a diagnostic naming it. See ROADMAP.md for the ABI and capture-analysis design, and examples/119_closures_capture.cb / examples/120_closures_map.cb for usage.
+
+```cobra
+def apply(f: fn(i64, i64) -> i64, x: i64, y: i64) -> i64: {
+    return f(x, y)
+}
+
+apply(def(a: i64, b: i64) -> i64: { return a * b }, 6, 7)  # 42
+```
+
 ## Type Foundation
 
 Cobra's core types stay direct native slots: `bool` is a 0/1 value, `none` is the empty value (lowers to zero and is assignable to any type), `const` bindings are immutable after initialization, and `struct` defines a contiguous user type with compiler-assigned field offsets.

@@ -550,7 +550,61 @@ Finish the language contracts for:
 - Tuples
 - Destructuring
 - Methods
-- Closures
+- [x] Non-capturing function values: `fn(...)->...` is a real checked
+  signature type (scalar params + scalar/void return only), covering
+  assignment, parameter passing, return, and indirect calls
+  (`f(a, b, ...)`). The direct backend's `call_i64_i64`/`call_f32_f32`
+  builtins remain as a deprecated one-argument alias.
+- [x] Closures. `def(params) -> ret: { body }` in expression position is a
+  real anonymous function literal that can capture scalar (i64/f32/bool)
+  variables from the immediately-enclosing named function by value - a
+  snapshot taken when the closure literal is evaluated, not a live
+  reference (examples/119_closures_capture.cb,
+  examples/120_closures_map.cb). Capturable sources: the enclosing
+  function's own parameters, and its explicitly-typed top-level `let`
+  bindings (`let n: i64 = ...`; type-inferred `let n = ...` locals are not
+  yet supported, since a closure can be IR-compiled before the function
+  that lexically contains it - see below). Capturing a non-scalar
+  (struct/slice/string) variable is rejected with a clear diagnostic
+  (tests/negative/125_closure_capture_not_supported.cb); assigning to a
+  captured name inside the closure body is rejected too, since captures are
+  read-only (tests/negative/126_closure_capture_assignment.cb).
+
+  Every `fn(...)->...` value - closure or plain top-level function
+  reference - is a pointer to a heap- or statically-allocated
+  `{code_ptr, env_ptr}` thunk (16 bytes), not a bare code pointer: a plain
+  function gets a lazily-emitted static thunk pointing at a small adapter
+  stub that drops the unused `env_ptr` and shifts real integer arguments
+  left by one register before jumping to the real function
+  (`ensure_fn_thunk`/`flush_pending_fn_thunks`, src/codegen.c - the adapter
+  bytes are queued and only flushed right after the *current* function's
+  own epilogue, never inline mid-function, since the adapter contains a
+  real `jmp` that must not be reachable by fallthrough); a closure's thunk
+  points directly at the synthesized closure function, which already takes
+  an implicit leading `__env` parameter. `emit_call`'s indirect-call path
+  always dereferences the thunk and passes `env_ptr` as an implicit leading
+  argument, so both cases share one calling convention. Captured values are
+  copied into a `malloc@PLT`-allocated environment struct at the closure
+  literal's evaluation point (same allocator `emit_string_concat` already
+  uses); captured environments leak like any other owned allocation in this
+  backend's no-GC/no-automatic-drop model - there is no scope-exit drop for
+  anything else either. Capture analysis (`collect_closure_captures`,
+  src/ir.c) seeds each capture as an ordinary read-only local in the
+  closure's own `IRContext` before `validate_statement` runs, so the rest
+  of type-checking (binary ops, calls, returns, ...) needs no new cases at
+  all; the reads are rewritten to `AST_ENV_FIELD_LOAD` only *after*
+  validate_statement finishes (`rewrite_closure_captures`), so `infer_expr`
+  never has to learn the new node kind. `IRContext.parent_scope` (added for
+  this feature) ended up unused - a closure's own locals table is
+  sufficient since captures are seeded directly rather than resolved via
+  live cross-context chaining, which was found to be structurally
+  incompatible with the existing one-`IRContext`-per-top-level-function
+  compile loop (a closure is IR-compiled as its own root-child iteration,
+  not nested inside its enclosing function's compile pass - which is also
+  why only *explicitly-typed* enclosing `let` locals are captureable: their
+  type is known at parse time, independent of compile order, whereas a
+  type-inferred local's type is only known once its own function's
+  validate_statement pass runs, which may not have happened yet).
 - Recursion
 - Casts and explicit conversions
 - Constant evaluation

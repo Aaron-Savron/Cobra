@@ -59,7 +59,7 @@ typedef struct {
     } variants[COBRA_MAX_ENUM_VARIANTS];
 } IREnum;
 
-typedef struct {
+typedef struct IRContext {
     IRLocal locals[128];
     size_t count;
     CobraTypeKind return_type;
@@ -81,6 +81,11 @@ typedef struct {
     int region_depth;
     CobraTypeArena *canonical_arena;
     ASTNode *current_function;
+    /* Set only when compiling a nested function-literal body (closures,
+       phase 2c). NULL for every ordinary top-level function, so identifier
+       lookup behaves exactly as before unless a caller opts into scope
+       chaining by threading a parent context through. */
+    struct IRContext *parent_scope;
 } IRContext;
 
 static const char *canonical_type_name(const CobraType *type) {
@@ -210,6 +215,11 @@ static bool find_local(IRContext *ctx, const char *name, CobraTypeKind *out_type
             return true;
         }
     }
+    /* Fall through to the enclosing scope only when compiling a nested
+       function-literal body (closures, phase 2c). Ordinary top-level
+       functions never set parent_scope, so this is a no-op for every
+       existing caller. */
+    if (ctx->parent_scope) return find_local(ctx->parent_scope, name, out_type);
     return false;
 }
 
@@ -217,6 +227,7 @@ static IRLocal *find_local_entry(IRContext *ctx, const char *name) {
     for (size_t i = 0; i < ctx->count; i++) {
         if (strcmp(ctx->locals[i].name, name) == 0) return &ctx->locals[i];
     }
+    if (ctx->parent_scope) return find_local_entry(ctx->parent_scope, name);
     return NULL;
 }
 
@@ -304,6 +315,22 @@ static bool is_integer(CobraTypeKind type) {
    collections, or ownership-bearing structs cross the boundary yet. */
 static bool is_scalar_sum_component(CobraTypeKind type) {
     return is_integer(type) || type == COBRA_TYPE_F32 || type == COBRA_TYPE_BOOL;
+}
+
+/* A struct made entirely of scalar fields already has a full direct-backend
+   ABI: emit_sum_constructor/emit_sum_accessor/emit_sum_return copy its bytes
+   like any other scalar-sized sum component (see codegen.c). Structs with
+   owned or borrowed slice fields are not accepted here; the direct backend
+   has no move/drop machinery for owned fields inside sum storage yet. */
+static bool is_scalar_sum_component_ex(IRContext *ctx, CobraTypeKind type, const char *type_name) {
+    if (is_scalar_sum_component(type)) return true;
+    if (type != COBRA_TYPE_STRUCT || !ctx || !ctx->canonical_arena || !type_name || !type_name[0]) return false;
+    const CobraType *canonical = cobra_type_struct_layout(ctx->canonical_arena, ctx->root, type_name);
+    if (!canonical) return false;
+    for (size_t i = 0; i < canonical->field_count; i++) {
+        if (!cobra_type_is_scalar(canonical->fields[i].type)) return false;
+    }
+    return true;
 }
 
 static bool is_slice_type(CobraTypeKind type) {
@@ -844,6 +871,131 @@ static ASTNode *find_function(IRContext *ctx, const char *name) {
     return NULL;
 }
 
+/* Build the fn(...)->... value type for a plain top-level function, so a
+   bare function name used as a value carries a real checked signature
+   instead of the historical "just an i64 address" fallback. Returns NULL
+   (with *reason set) when the function's own signature is not expressible
+   as a phase-1 function value (generics, or a non-scalar param/return). */
+static const CobraType *function_value_type(IRContext *ctx, ASTNode *fn, const char **reason) {
+    *reason = NULL;
+    if (fn->generic_param_count > 0) {
+        *reason = "generic functions cannot be used as function values yet";
+        return NULL;
+    }
+    const CobraType *params[COBRA_MAX_TYPE_ARGS];
+    size_t param_count = 0;
+    for (size_t i = 0; i < fn->child_count; i++) {
+        ASTNode *param = fn->children[i];
+        if (param->type != AST_PARAM) continue;
+        /* Every closure carries an implicit leading __env parameter (see
+           parse_closure_literal) that is not part of its user-visible
+           fn(...)->... signature - it only exists so codegen can pass the
+           environment pointer through the uniform indirect-call ABI. */
+        if (fn->is_closure && !strcmp(param->name, "__env")) continue;
+        if (param_count >= COBRA_MAX_TYPE_ARGS - 1 || !cobra_type_is_scalar(param->canonical_type)) {
+            *reason = "only functions with scalar parameters and a scalar or void return can be used as function values";
+            return NULL;
+        }
+        params[param_count++] = param->canonical_type;
+    }
+    CobraTypeKind ret_kind = fn->declared_type == COBRA_TYPE_UNTYPED ? COBRA_TYPE_I64 : fn->declared_type;
+    const CobraType *ret_type = fn->canonical_type && cobra_type_is_scalar(fn->canonical_type)
+        ? fn->canonical_type
+        : cobra_type_make(ctx->canonical_arena, ret_kind, NULL, NULL, NULL, NULL, NULL,
+                          COBRA_OWNERSHIP_VALUE, COBRA_MUTABILITY_DEFAULT, -1);
+    if (ret_kind != COBRA_TYPE_VOID && !cobra_type_is_scalar(ret_type)) {
+        *reason = "only functions with scalar parameters and a scalar or void return can be used as function values";
+        return NULL;
+    }
+    const CobraType *func_type = cobra_type_make_func(ctx->canonical_arena, params, param_count, ret_type);
+    if (!func_type) {
+        *reason = "only functions with scalar parameters and a scalar or void return can be used as function values";
+        return NULL;
+    }
+    return func_type;
+}
+
+/* Phase 2c capture analysis. Walks a closure body looking for identifiers
+   that are not already bound within the closure itself (find_local fails);
+   any such name that matches a scalar parameter of the immediately-enclosing
+   named function is a capture - it is registered on closure_fn and also
+   add_local'd into ctx as an ordinary read-only local, so the rest of
+   validate_statement's type checking (binary ops, calls, returns, ...) needs
+   no changes at all to accept it. Non-scalar matches are rejected outright.
+   Anything else is left as a plain AST_VAR_REF for the normal
+   undefined-variable check elsewhere to catch. The actual rewrite to
+   AST_ENV_FIELD_LOAD happens afterward, once validate_statement has fully
+   type-checked the body using the ordinary local (see
+   rewrite_closure_captures) - keeping the two passes separate means
+   infer_expr and friends never need to learn a new node kind. */
+static void collect_closure_captures(IRContext *ctx, ASTNode *closure_fn,
+                                     ASTNode *enclosing_fn, ASTNode *node) {
+    if (!node) return;
+    if (node->type == AST_VAR_REF) {
+        if (find_local(ctx, node->name, NULL)) return;
+        for (size_t i = 0; i < enclosing_fn->child_count; i++) {
+            ASTNode *p = enclosing_fn->children[i];
+            bool is_param = p->type == AST_PARAM && strcmp(p->name, "__env") != 0;
+            /* Explicitly-typed top-level `let` bindings of the enclosing
+               function are also captureable; their declared_type is set at
+               parse time, so this does not depend on the enclosing function's
+               own validate_statement pass having run yet (closures can be
+               compiled before the function that lexically contains them,
+               since parse_closure_literal appends the synthesized function to
+               root's children as soon as the literal is parsed - earlier than
+               the enclosing named function itself is appended). Type-inferred
+               `let n = ...` locals are not supported yet for that reason. */
+            bool is_typed_let = p->type == AST_VAR_DECL && p->declared_type != COBRA_TYPE_UNTYPED;
+            if ((!is_param && !is_typed_let) || strcmp(p->name, node->name)) continue;
+            CobraTypeKind ptype = (is_param && p->declared_type == COBRA_TYPE_UNTYPED) ? COBRA_TYPE_I64 : p->declared_type;
+            if (!is_scalar_sum_component(ptype)) {
+                char message[220];
+                snprintf(message, sizeof(message),
+                         "closure cannot capture non-scalar variable '%s'; only scalar captures are supported",
+                         node->name);
+                ir_error(ctx, node, message);
+                return;
+            }
+            for (int c = 0; c < closure_fn->captured_count; c++)
+                if (!strcmp(closure_fn->captured_names[c], node->name)) return;
+            if (closure_fn->captured_count < 8) {
+                snprintf(closure_fn->captured_names[closure_fn->captured_count], COBRA_MAX_IDENT_LEN, "%.63s", node->name);
+                closure_fn->captured_types[closure_fn->captured_count] = ptype;
+                closure_fn->captured_count++;
+                add_local(ctx, node->name, ptype, node);
+            }
+            return;
+        }
+        return;
+    }
+    for (size_t i = 0; i < node->child_count; i++)
+        collect_closure_captures(ctx, closure_fn, enclosing_fn, node->children[i]);
+}
+
+/* Second pass, run only after validate_statement has fully type-checked the
+   closure body: converts each AST_VAR_REF that collect_closure_captures
+   identified as a capture into an AST_ENV_FIELD_LOAD reading the matching
+   8-byte-stride slot of the environment struct through the closure's own
+   __env parameter. */
+static void rewrite_closure_captures(ASTNode *closure_fn, ASTNode *node) {
+    if (!node) return;
+    if (node->type == AST_VAR_REF) {
+        for (int c = 0; c < closure_fn->captured_count; c++) {
+            if (strcmp(closure_fn->captured_names[c], node->name)) continue;
+            ASTNode *env_ref = ast_create_node(AST_VAR_REF, "__env");
+            node->type = AST_ENV_FIELD_LOAD;
+            node->value_type = closure_fn->captured_types[c];
+            node->int_val = c * 8;
+            node->child_count = 0;
+            ast_add_child(node, env_ref);
+            return;
+        }
+        return;
+    }
+    for (size_t i = 0; i < node->child_count; i++)
+        rewrite_closure_captures(closure_fn, node->children[i]);
+}
+
 static bool generic_scalar_argument(const CobraType *type) {
     return cobra_type_is_scalar(type);
 }
@@ -1278,18 +1430,30 @@ static bool is_imported_function(IRContext *ctx, const char *name) {
 /* Register the shared layout contract once from the canonical descriptor.
    Codegen reads the same canonical sizes and offsets, so the IR table is a
    convenience mirror of cobra_type_struct_layout, not a second layout. */
-static bool direct_struct_field_supported(const CobraType *type, bool nested) {
+static bool direct_struct_field_supported_kind(const CobraType *type, CobraOwnershipKind ownership,
+                                               CobraMutabilityKind mutability, int region_id, bool nested) {
     if (!type) return false;
     if (cobra_type_is_scalar(type)) return true;
-    if (cobra_type_is_slice_kind(type->kind)) {
-        return !nested && type->ownership == COBRA_OWNERSHIP_BORROWED &&
-               (type->mutability == COBRA_MUTABILITY_READONLY ||
-                type->mutability == COBRA_MUTABILITY_OUT) &&
-               type->region_id == -1;
+    if (cobra_type_is_slice_kind(type->kind) || type->kind == COBRA_TYPE_STRING) {
+        if (nested) return false;
+        bool borrowed_view = ownership == COBRA_OWNERSHIP_BORROWED &&
+               (mutability == COBRA_MUTABILITY_READONLY || mutability == COBRA_MUTABILITY_OUT) &&
+               region_id == -1;
+        /* Owned string/slice fields (e.g. `name: string`) are stored as a
+           plain pointer+length pair, byte-copied on struct assignment just
+           like every other field - the direct backend never auto-frees
+           owned locals on scope exit (only an explicit free() call or
+           region teardown releases memory), so an owned field here carries
+           no more lifetime risk than an owned local of the same type. */
+        bool owned_value = ownership == COBRA_OWNERSHIP_OWNED &&
+               mutability == COBRA_MUTABILITY_DEFAULT && region_id == -1;
+        return borrowed_view || owned_value;
     }
     if (type->kind != COBRA_TYPE_STRUCT) return false;
     for (size_t i = 0; i < type->field_count; i++) {
-        if (!direct_struct_field_supported(type->fields[i].type, true)) return false;
+        const CobraTypeField *field = &type->fields[i];
+        if (!direct_struct_field_supported_kind(field->type, field->ownership, field->mutability,
+                                                field->region_id, true)) return false;
     }
     return true;
 }
@@ -1330,7 +1494,9 @@ static void register_struct_decl(IRContext *ctx, ASTNode *decl, bool report_erro
     }
 
     for (size_t i = 0; i < canonical->field_count; i++) {
-        if (!direct_struct_field_supported(canonical->fields[i].type, false)) {
+        const CobraTypeField *field = &canonical->fields[i];
+        if (!direct_struct_field_supported_kind(field->type, field->ownership, field->mutability,
+                                                field->region_id, false)) {
             IRStruct *invalid = &ctx->structs[ctx->struct_count++];
             memset(invalid, 0, sizeof(*invalid));
             snprintf(invalid->name, sizeof(invalid->name), "%.63s", decl->name);
@@ -1667,16 +1833,23 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
             IRLocal *local = find_local_entry(ctx, node->name);
             if (!local) {
                 /* A bare identifier that isn't a variable but does name a
-                   top-level function is a function reference: its value is
-                   the function's address (i64), for use with
-                   call_i64_i64/call_f32_f32 (see codegen.c's AST_VAR_REF
-                   fallback and the two indirect-call builtins). This is
-                   deliberately narrow - a raw address plus a fixed calling
-                   convention the caller must get right, not a real closure
-                   or a typed function-pointer system. */
+                   top-level function is a function value: its runtime
+                   representation is still just the function's address (one
+                   GPR slot, see codegen.c's AST_VAR_REF fallback), but its
+                   static type is now a real checked fn(...)->... signature
+                   (see function_value_type) instead of a bare i64. Phase 1:
+                   no captures, no closures - see ROADMAP.md. */
                 ASTNode *fn_ref = find_function(ctx, node->name);
                 if (fn_ref) {
-                    node->value_type = COBRA_TYPE_I64;
+                    const char *reason = NULL;
+                    const CobraType *func_type = function_value_type(ctx, fn_ref, &reason);
+                    if (!func_type) {
+                        ir_error(ctx, node, reason);
+                        node->value_type = COBRA_TYPE_I64;
+                        return node->value_type;
+                    }
+                    node->value_type = COBRA_TYPE_FUNC;
+                    node->canonical_type = func_type;
                     return node->value_type;
                 }
                 char message[160];
@@ -2423,12 +2596,16 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                genuine runtime-dispatched Sequential-style layer list
                instead of hand-written branch-per-layer-kind code. */
             if (!strcmp(node->name, "call_i64_i64") || !strcmp(node->name, "call_f32_f32")) {
+                /* Deprecated one-argument alias, kept working for existing
+                   callers. Prefer calling a fn(...)->... value directly
+                   (f(a, b, ...) below) which checks the whole signature. */
                 bool is_f32 = !strcmp(node->name, "call_f32_f32");
                 if (node->child_count != 2) {
                     ir_error(ctx, node, "call_i64_i64/call_f32_f32 require (func_ptr, arg)");
                 } else {
-                    if (infer_expr(node->children[0], ctx) != COBRA_TYPE_I64)
-                        ir_error(ctx, node, "the func_ptr argument must be i64 (a function reference)");
+                    CobraTypeKind ptr_type = infer_expr(node->children[0], ctx);
+                    if (ptr_type != COBRA_TYPE_FUNC)
+                        ir_error(ctx, node, "the func_ptr argument must be a fn(...)->... function value");
                     CobraTypeKind arg_type = infer_expr(node->children[1], ctx);
                     CobraTypeKind want = is_f32 ? COBRA_TYPE_F32 : COBRA_TYPE_I64;
                     if (arg_type != want)
@@ -2702,6 +2879,35 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                 if (argument_index < node->child_count) ir_error(ctx, node, "function call has too many arguments");
                 validate_shape_contracts(node, function, ctx);
             } else {
+                IRLocal *indirect = find_local_entry(ctx, node->name);
+                if (indirect && indirect->type == COBRA_TYPE_FUNC && indirect->canonical_type) {
+                    node->is_indirect_call = true;
+                    size_t expected_params = cobra_type_func_param_count(indirect->canonical_type);
+                    if (node->child_count != expected_params) {
+                        char message[160];
+                        snprintf(message, sizeof(message),
+                                 "'%s' takes %zu argument(s), got %zu",
+                                 node->name, expected_params, node->child_count);
+                        ir_error(ctx, node, message);
+                    }
+                    for (size_t i = 0; i < node->child_count; i++) {
+                        CobraTypeKind argument_type = infer_expr(node->children[i], ctx);
+                        const CobraType *expected_type = cobra_type_func_param(indirect->canonical_type, i);
+                        CobraTypeKind expected = expected_type ? expected_type->kind : COBRA_TYPE_UNKNOWN;
+                        bool compatible = argument_type == COBRA_TYPE_UNKNOWN || expected == COBRA_TYPE_UNKNOWN ||
+                            expected == argument_type || (is_integer(expected) && is_integer(argument_type));
+                        if (!compatible) {
+                            char message[200];
+                            snprintf(message, sizeof(message), "argument %zu to '%s' has type %s, expected %s",
+                                     i + 1, node->name, type_name(argument_type), type_name(expected));
+                            ir_error(ctx, node, message);
+                        }
+                    }
+                    const CobraType *ret = cobra_type_func_return(indirect->canonical_type);
+                    node->value_type = ret ? ret->kind : COBRA_TYPE_I64;
+                    node->canonical_type = ret;
+                    return node->value_type;
+                }
                 for (size_t i = 0; i < node->child_count; i++) (void)infer_expr(node->children[i], ctx);
             }
             /* Untyped function declarations retain the historical integer ABI;
@@ -3033,6 +3239,11 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                 strcmp(cobra_type_node_name(node), cobra_type_node_name(node->children[0])) != 0) {
                 ir_error(ctx, node, "struct initializer belongs to a different type");
             }
+            if (node->child_count > 0 && declared == COBRA_TYPE_FUNC && inferred == COBRA_TYPE_FUNC &&
+                node->canonical_type && node->children[0]->canonical_type &&
+                !cobra_type_equal(node->canonical_type, node->children[0]->canonical_type)) {
+                ir_error(ctx, node, "function value's signature does not match its declared fn(...)->... type");
+            }
             if (node->declared_type != COBRA_TYPE_UNTYPED && inferred != COBRA_TYPE_UNKNOWN &&
                 inferred != COBRA_TYPE_UNTYPED && !declared_compatible(declared, inferred)) {
                 char message[180];
@@ -3233,6 +3444,18 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
         case AST_ASSIGN: {
             reject_illegal_float_context(node->child_count > 0 ? node->children[0] : NULL, ctx,
                                          "scalar f32 values are not yet supported; use a float literal directly with fill_f32");
+            if (ctx->current_function && ctx->current_function->is_closure) {
+                for (int c = 0; c < ctx->current_function->captured_count; c++) {
+                    if (!strcmp(ctx->current_function->captured_names[c], node->name)) {
+                        char message[200];
+                        snprintf(message, sizeof(message),
+                                 "closures cannot assign to captured variable '%s'; captures are a read-only snapshot",
+                                 node->name);
+                        ir_error(ctx, node, message);
+                        break;
+                    }
+                }
+            }
             IRLocal *assigned_local = find_local_entry(ctx, node->name);
             if (assigned_local && assigned_local->is_const) {
                 char message[160];
@@ -3853,12 +4076,12 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
            returns, mirroring the parameter rule below. */
         if (function->declared_type == COBRA_TYPE_OPTION ||
             function->declared_type == COBRA_TYPE_RESULT) {
-            if (!is_scalar_sum_component(ctx.return_payload_type)) {
+            if (!is_scalar_sum_component_ex(&ctx, ctx.return_payload_type, ctx.return_type_name)) {
                 ir_error(&ctx, function,
                          "Option and Result returns currently require scalar value payloads");
             }
             if (function->declared_type == COBRA_TYPE_RESULT &&
-                !is_scalar_sum_component(ctx.return_error_type)) {
+                !is_scalar_sum_component_ex(&ctx, ctx.return_error_type, ctx.return_error_type_name)) {
                 ir_error(&ctx, function,
                          "Result returns currently require a scalar error payload");
             }
@@ -3937,10 +4160,23 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
                 }
             }
         }
+        ASTNode *closure_enclosing = NULL;
+        if (function->is_closure && function->enclosing_function[0])
+            closure_enclosing = find_function(&ctx, function->enclosing_function);
+        if (closure_enclosing) {
+            for (size_t j = 0; j < function->child_count; j++)
+                if (function->children[j]->type != AST_PARAM)
+                    collect_closure_captures(&ctx, function, closure_enclosing, function->children[j]);
+        }
         for (size_t j = 0; j < function->child_count; j++) {
             if (function->children[j]->type != AST_PARAM) {
                 validate_statement(function->children[j], &ctx);
             }
+        }
+        if (closure_enclosing && function->captured_count > 0) {
+            for (size_t j = 0; j < function->child_count; j++)
+                if (function->children[j]->type != AST_PARAM)
+                    rewrite_closure_captures(function, function->children[j]);
         }
         check_canonical_tree(&ctx, function);
         ir->error_count += ctx.errors;

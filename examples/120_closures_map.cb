@@ -1,0 +1,23 @@
+# A closure capturing a scalar used as the per-element transform in a
+# map-style loop, building on examples/96_function_value_dispatch.cb's
+# non-capturing dispatch pattern.
+
+def apply_all(f: fn(i64) -> i64, values: []i64, out_values: []i64) -> i64: {
+    for idx in range(len(values)): {
+        out_values[idx] = f(values[idx])
+    }
+    return 0
+}
+
+def test_apply_all_scaled_by_capture(): {
+    let factor: i64 = 3
+    let scale: fn(i64) -> i64 = def(x: i64) -> i64: { return x * factor }
+    values = [1, 2, 3, 4]
+    results = [0, 0, 0, 0]
+    apply_all(scale, values, results)
+    assert(results[0] == 3)
+    assert(results[1] == 6)
+    assert(results[2] == 9)
+    assert(results[3] == 12)
+    return 0
+}
