@@ -1192,7 +1192,7 @@ static ASTNode *find_specialization(IRContext *ctx, ASTNode *generic,
 }
 
 static ASTNode *specialize_generic_function(IRContext *ctx, ASTNode *generic,
-                                             const CobraType *argument) {
+                                             const CobraType *argument, const ASTNode *call_site) {
     if (!ctx || !generic || generic->generic_param_count != 1 ||
         !generic->generic_param_types[0] || !generic_scalar_argument(argument)) return NULL;
     if (ctx->current_function &&
@@ -1226,6 +1226,12 @@ static ASTNode *specialize_generic_function(IRContext *ctx, ASTNode *generic,
     specialized->specialized_from = generic;
     specialized->specialization_arg_count = 1;
     specialized->specialization_args[0] = argument;
+    if (call_site) {
+        specialized->specialization_call_line = call_site->source_line;
+        specialized->specialization_call_col = call_site->source_col;
+        snprintf(specialized->specialization_call_file, sizeof(specialized->specialization_call_file),
+                 "%.255s", call_site->source_file);
+    }
     specialize_ast_tree(ctx, specialized, generic->generic_param_types[0], argument);
     for (size_t i = 0; i < specialized->child_count; i++) {
         ASTNode *param = specialized->children[i];
@@ -2340,7 +2346,7 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                         ir_error(ctx, node, "generic call has an ambiguous, mismatched, or unsupported type argument");
                         called_function = NULL;
                     } else {
-                        ASTNode *specialized = specialize_generic_function(ctx, called_function, binding);
+                        ASTNode *specialized = specialize_generic_function(ctx, called_function, binding, node);
                         if (!specialized) {
                             called_function = NULL;
                         } else {
@@ -4587,7 +4593,43 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
                     rewrite_closure_captures(function, function->children[j]);
         }
         check_canonical_tree(&ctx, function);
+        if (ctx.errors > 0 && function->specialized_from && function->specialization_call_file[0]) {
+            const char *template_name = function->specialized_from->name;
+            fprintf(stderr, "%s:%d:%d: note: in specialization of %s() with (%s): "
+                             "errors above are from the template at %s:%d:%d\n",
+                    function->specialization_call_file, function->specialization_call_line,
+                    function->specialization_call_col, template_name,
+                    function->specialization_args[0] ? cobra_type_kind_name(function->specialization_args[0]->kind) : "?",
+                    function->specialized_from->source_file, function->specialized_from->source_line,
+                    function->specialized_from->source_col);
+        }
         ir->error_count += ctx.errors;
+    }
+
+    /* def export name[](...): a generic template's body is only checked on
+       its specialized clones (see specialize_generic_function), so a
+       template with no call site anywhere in the program would otherwise
+       ship with a body that was never type-checked. export requires at
+       least one specialization to exist by now. */
+    for (size_t i = 0; i < root->child_count; i++) {
+        ASTNode *function = root->children[i];
+        if (function->type != AST_FUNCTION || !function->is_exported ||
+            function->generic_param_count == 0) continue;
+        bool has_specialization = false;
+        for (size_t j = 0; j < root->child_count; j++) {
+            if (root->children[j]->specialized_from == function) {
+                has_specialization = true;
+                break;
+            }
+        }
+        if (!has_specialization) {
+            char message[220];
+            snprintf(message, sizeof(message),
+                     "exported function '%.63s' has no call site; its body was never type-checked",
+                     function->name);
+            ir_error(&root_context, function, message);
+            ir->error_count++;
+        }
     }
 
     ir->valid = ir->error_count == 0;

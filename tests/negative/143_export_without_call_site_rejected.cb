@@ -1,0 +1,11 @@
+# export def name[](...) requires at least one call site by end of
+# compilation. With no caller anywhere in the program, the template's body
+# was never type-checked and must be rejected rather than silently shipped.
+
+export def orphan[](x) -> i64: {
+    return x * x
+}
+
+def test_unrelated(): {
+    return 1
+}

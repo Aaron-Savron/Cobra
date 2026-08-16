@@ -1738,13 +1738,43 @@ static ASTNode *parse_struct_declaration(Parser *parser) {
     return struct_node;
 }
 
+/* def foo[](...) (empty brackets, no named type parameter) marks a parameter
+   left without a `: type` annotation as implicitly generic instead of the
+   ordinary bare-parameter error: it gets the same COBRA_TYPE_GENERIC_PARAM
+   placeholder an explicit `x: T` would, so it flows through the existing
+   specialize_generic_function/specialize_ast_tree monomorphization pipeline
+   unchanged. Phase 1 allows exactly one such parameter per function; a
+   second omitted parameter is a hard error rather than silently unifying
+   with the first or being left untyped. */
+static void assign_implicit_generic_param(Parser *parser, ASTNode *fn_node, ASTNode *param,
+                                          bool is_implicit_generic_fn,
+                                          const CobraType **implicit_generic_type) {
+    if (!is_implicit_generic_fn) return;
+    if (*implicit_generic_type) {
+        fprintf(stderr, "%s:%d:%d: error: phase 1 only supports one inferred parameter per function; "
+                         "multiple inferred parameters are not yet supported\n",
+                parser->source_file, parser->current_token.line, parser->current_token.col);
+        exit(1);
+    }
+    *implicit_generic_type = cobra_type_make(parser->canonical_arena, COBRA_TYPE_GENERIC_PARAM,
+                                             "__auto", NULL, NULL, NULL, NULL,
+                                             COBRA_OWNERSHIP_VALUE, COBRA_MUTABILITY_DEFAULT, -1);
+    param->declared_type = COBRA_TYPE_GENERIC_PARAM;
+    param->canonical_type = *implicit_generic_type;
+    snprintf(fn_node->generic_param_names[0], COBRA_MAX_IDENT_LEN, "__auto");
+    fn_node->generic_param_types[0] = *implicit_generic_type;
+    fn_node->generic_param_count = 1;
+}
+
 /* Shared by named `def foo(...)` declarations and anonymous closure
    literals: parses generics, parameters, return type, and body onto an
    already-created (named or synthesized) AST_FUNCTION node. */
 static ASTNode *parse_function_signature_and_body(Parser *parser, ASTNode *fn_node) {
     size_t previous_generic_count = parser->generic_param_count;
     parser->generic_param_count = 0;
+    bool saw_generic_brackets = false;
     if (match(parser, TOKEN_LBRACKET)) {
+        saw_generic_brackets = true;
         advance_token(parser);
         while (!match(parser, TOKEN_RBRACKET)) {
             if (parser->generic_param_count >= 1 ||
@@ -1788,6 +1818,8 @@ static ASTNode *parse_function_signature_and_body(Parser *parser, ASTNode *fn_no
     // Parse parameters: def foo(a: i64, b: i64) -> i64:
     // Alias contracts use contextual qualifiers (out/readonly) after the
     // colon, so existing code that names a variable `out` keeps working.
+    bool is_implicit_generic_fn = saw_generic_brackets && parser->generic_param_count == 0;
+    const CobraType *implicit_generic_type = NULL;
     if (!match(parser, TOKEN_RPAREN)) {
         if (match(parser, TOKEN_IDENTIFIER)) {
             ASTNode *param = parser_create_node(parser, AST_PARAM, parser->current_token.text);
@@ -1806,6 +1838,9 @@ static ASTNode *parse_function_signature_and_body(Parser *parser, ASTNode *fn_no
                 }
                 param->declared_type = parse_type_into(parser, "parameter", param, alias_qualifier);
 
+            } else {
+                assign_implicit_generic_param(parser, fn_node, param, is_implicit_generic_fn,
+                                              &implicit_generic_type);
             }
 
             while (match(parser, TOKEN_COMMA)) {
@@ -1826,6 +1861,9 @@ static ASTNode *parse_function_signature_and_body(Parser *parser, ASTNode *fn_no
                         }
                         p->declared_type = parse_type_into(parser, "parameter", p, alias_qualifier);
 
+                    } else {
+                        assign_implicit_generic_param(parser, fn_node, p, is_implicit_generic_fn,
+                                                      &implicit_generic_type);
                     }
                 }
             }
@@ -2079,6 +2117,17 @@ ASTNode *parser_parse_program(Parser *parser) {
             ASTNode *function = parse_function(parser);
             function->is_public = is_public;
             function->has_visibility = true;
+            ast_add_child(root, function);
+        } else if (match(parser, TOKEN_IDENTIFIER) &&
+                   !strcmp(parser->current_token.text, "export")) {
+            advance_token(parser);
+            if (!match(parser, TOKEN_DEF)) {
+                fprintf(stderr, "%s:%d:%d: error: export applies to a function declaration\n",
+                        parser->source_file, parser->current_token.line, parser->current_token.col);
+                exit(1);
+            }
+            ASTNode *function = parse_function(parser);
+            function->is_exported = true;
             ast_add_child(root, function);
         } else if (match(parser, TOKEN_ENUM)) {
             ast_add_child(root, parse_enum_declaration(parser));

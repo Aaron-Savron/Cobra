@@ -118,6 +118,39 @@ def apply(f: fn(i64, i64) -> i64, x: i64, y: i64) -> i64: {
 apply(def(a: i64, b: i64) -> i64: { return a * b }, 6, 7)  # 42
 ```
 
+## Implicit Generic Parameters (phase 1)
+
+`def name[](params)` (empty brackets, no named type parameter) marks exactly
+one parameter left without a `: type` annotation as implicitly generic: it is
+monomorphized per call site through the same specialization pipeline as an
+explicit `def name[T](x: T)`, instead of being rejected the way a bare
+parameter is under `def name(params)` (a bare parameter with no brackets at
+all is always a compile-time error - see Type Foundation above). The return
+type and every other parameter must still be an explicit, fixed, non-generic
+type; only one inferred parameter per function is supported in this phase.
+
+```cobra
+def double_it[](x) -> i64: { return x * 2 }
+def times_ten[](x) -> f32: { return x * 10.0 }
+
+double_it(21)   # 42, specialized for i64
+times_ten(7.0)  # 70.0, an independent specialization for f32
+```
+
+`export def name[](params)` requires at least one call site to exist by end
+of compilation, so a template with no caller anywhere in the program does
+not silently ship with a body that was never type-checked (a generic
+template's body is only checked on its specialized clones, matching how
+explicit `[T]` generics already work). When a specialization fails to
+type-check, the diagnostic names both the triggering call site and the
+template declaration.
+
+Not yet supported: more than one inferred parameter per function, an
+inferred return type, and using an implicitly-generic function as a
+`fn(...)->...` value, a closure, or a `dyn Trait` receiver (same restriction
+explicit `[T]` generics already have). See ROADMAP.md for the phase 2/3 plan
+(multi-parameter inference, further diagnostics).
+
 ## Traits
 
 `trait Name: { def method(params) -> ret ... }` declares required method signatures; `impl Name for Type: { def method(params) -> ret: { body } ... }` implements them for a struct type. Calling `x.method(args)` on a struct-typed value resolves at compile time to the matching impl (static dispatch only - no vtable, no runtime cost). Every trait method must have a matching impl method by name or the impl is rejected. See ROADMAP.md for what's deferred (generic trait bounds, default methods).

@@ -450,6 +450,14 @@ struct ASTNode {
        compatibility; explicit private declarations are checked at boundaries. */
     bool is_public;
     bool has_visibility;
+    /* `def export name[](...)`: for an implicitly- or explicitly-generic
+       function, requires at least one specialization (a real call site, in
+       this phase) to exist by end of compilation, so a template with no
+       caller anywhere in the program does not silently ship with a body
+       that was never type-checked. Checked once at the end of
+       cobra_ir_build. No effect on a non-generic function, which is always
+       checked directly regardless of callers. */
+    bool is_exported;
     /* Match cases use this flag for the single `else` arm. */
     bool is_default_case;
     /* Source imports are compile-time composition; C imports retain linker
@@ -492,6 +500,13 @@ struct ASTNode {
     /* Specialized clones point back to their generic declaration so recursion
        and duplicate specialization checks remain explicit in IR. */
     const ASTNode *specialized_from;
+    /* The call site that triggered this specialization, so a type error
+       inside the specialized body can be reported with both the template's
+       own location (already preserved on every cloned node) and the call
+       site that instantiated it. Zero when this is not a specialization. */
+    int specialization_call_line;
+    int specialization_call_col;
+    char specialization_call_file[COBRA_MAX_SOURCE_PATH];
     /* Canonical arguments identify a specialization; the generated function
        name is only an assembly symbol and must not decide reuse. */
     size_t specialization_arg_count;

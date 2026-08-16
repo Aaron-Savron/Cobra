@@ -1,0 +1,27 @@
+# def name[](...) (empty brackets) marks exactly one omitted parameter as
+# implicitly generic, monomorphized per call site through the same pipeline
+# as an explicit def name[T](x: T) declaration -- see specialize_generic_function
+# in src/ir.c. Phase 1 supports exactly one inferred parameter per function;
+# the return type stays a fixed, explicit, non-generic type.
+
+def double_it[](x) -> i64: {
+    return x * 2
+}
+
+def times_ten[](x) -> f32: {
+    return x * 10.0
+}
+
+def test_implicit_generic_i64(): {
+    let r: i64 = double_it(21)
+    assert(r == 42)
+    return 0
+}
+
+def test_implicit_generic_independent_specializations(): {
+    let a: f32 = times_ten(7.0)
+    assert(a == 70.0)
+    let b: i64 = double_it(5)
+    assert(b == 10)
+    return 0
+}

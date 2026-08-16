@@ -1,0 +1,13 @@
+# export def name[](...) requires at least one call site by end of
+# compilation, so a template with no caller anywhere in the program does not
+# silently ship with a body that was never type-checked.
+
+export def square[](x) -> i64: {
+    return x * x
+}
+
+def test_export_with_call_site(): {
+    let r: i64 = square(6)
+    assert(r == 36)
+    return 0
+}

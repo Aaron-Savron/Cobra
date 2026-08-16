@@ -1,0 +1,11 @@
+# Phase 1 supports exactly one inferred parameter per def name[](...)
+# function. A second omitted parameter must be rejected, not silently
+# unified with the first or left untyped.
+
+def add[](a, b) -> i64: {
+    return a + b
+}
+
+def test_add(): {
+    return add(1, 2)
+}
