@@ -4614,6 +4614,7 @@ bool bir_build_program(BackendIrModule *module, ASTNode *root) {
             continue;
         }
         if (decl->type == AST_STRUCT_DECL || decl->type == AST_ENUM_DECL) continue;
+        if (decl->type == AST_IMPORT_DECL) continue;
         snprintf(module->error, sizeof(module->error),
                  "%.60s:%d:%d: top-level declaration is outside the backend-IR subset",
                  module->source_file, decl->source_line, decl->source_col);
