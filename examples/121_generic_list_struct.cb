@@ -1,0 +1,46 @@
+# list[T] for an all-scalar-field struct T: append, index-read, index-write.
+
+struct Point: { x: i64, y: i64 }
+
+def test_list_point_append_and_index(): {
+    let pts: list[Point] = []
+    let a: Point
+    a.x = 1
+    a.y = 2
+    append(pts, a)
+    let b: Point
+    b.x = 5
+    b.y = 6
+    append(pts, b)
+    assert(len(pts) == 2)
+    let r0: Point = pts[0]
+    let r1: Point = pts[1]
+    assert(r0.x == 1)
+    assert(r0.y == 2)
+    assert(r1.x == 5)
+    assert(r1.y == 6)
+    return 0
+}
+
+def test_list_point_index_write(): {
+    let pts: list[Point] = []
+    let a: Point
+    a.x = 1
+    a.y = 2
+    append(pts, a)
+    let b: Point
+    b.x = 5
+    b.y = 6
+    append(pts, b)
+    let w: Point
+    w.x = 99
+    w.y = 100
+    pts[0] = w
+    let r0: Point = pts[0]
+    let r1: Point = pts[1]
+    assert(r0.x == 99)
+    assert(r0.y == 100)
+    assert(r1.x == 5)
+    assert(r1.y == 6)
+    return 0
+}

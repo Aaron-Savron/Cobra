@@ -72,6 +72,8 @@ typedef enum {
     TOKEN_LEN,
     TOKEN_WITH,
     TOKEN_REGION,
+    TOKEN_TRAIT,
+    TOKEN_IMPL,
     TOKEN_TYPE_I32,     // i32
     TOKEN_TYPE_I64,     // i64
     TOKEN_TYPE_U8,      // u8
@@ -192,7 +194,19 @@ typedef enum {
        selects the scalar width/kind (COBRA_TYPE_I64 or COBRA_TYPE_F32).
        AST_ENV_FIELD_STORE additionally uses child[1] as the value expression. */
     AST_ENV_FIELD_LOAD,
-    AST_ENV_FIELD_STORE
+    AST_ENV_FIELD_STORE,
+    /* trait Name: { def method(params) -> R } -- children are AST_FUNCTION
+       signature-only nodes (no body) declaring required methods. name holds
+       the trait name. */
+    AST_TRAIT_DECL,
+    /* impl Name for Type: { def method(params) -> R: { body } } -- a
+       bookkeeping node only; name holds the trait name, secondary_name holds
+       the implementing struct type name. Each method body is registered as
+       an ordinary top-level AST_FUNCTION (mangled name
+       __impl_<Trait>_<Type>_<method>) directly into the program root by the
+       parser, exactly like closure literals; this node exists purely so IR
+       build can verify every trait method got a matching impl. */
+    AST_IMPL_DECL
 } ASTNodeType;
 
 typedef enum {

@@ -1,0 +1,29 @@
+# list[T] for an all-scalar-field struct T: for-loop iteration.
+
+struct Point: { x: i64, y: i64 }
+
+def test_iterate_list_of_struct(): {
+    let pts: list[Point] = []
+    let a: Point
+    a.x = 1
+    a.y = 10
+    append(pts, a)
+    let b: Point
+    b.x = 2
+    b.y = 20
+    append(pts, b)
+    let c: Point
+    c.x = 3
+    c.y = 30
+    append(pts, c)
+
+    let sum_x: i64 = 0
+    let sum_y: i64 = 0
+    for p in pts: {
+        sum_x = sum_x + p.x
+        sum_y = sum_y + p.y
+    }
+    assert(sum_x == 6)
+    assert(sum_y == 60)
+    return 0
+}

@@ -102,6 +102,8 @@ Token lexer_next_token(Lexer *lexer) {
         else if (strcmp(token.text, "len") == 0) token.type = TOKEN_LEN;
         else if (strcmp(token.text, "with") == 0) token.type = TOKEN_WITH;
         else if (strcmp(token.text, "region") == 0) token.type = TOKEN_REGION;
+        else if (strcmp(token.text, "trait") == 0) token.type = TOKEN_TRAIT;
+        else if (strcmp(token.text, "impl") == 0) token.type = TOKEN_IMPL;
         else if (strcmp(token.text, "i32") == 0) token.type = TOKEN_TYPE_I32;
         else if (strcmp(token.text, "i64") == 0) token.type = TOKEN_TYPE_I64;
         else if (strcmp(token.text, "u8") == 0) token.type = TOKEN_TYPE_U8;

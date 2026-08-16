@@ -1,0 +1,6 @@
+# list[T] does not support a nested list as the element type.
+
+def bad(): {
+    let ls: list[list[i64]] = []
+    return 0
+}

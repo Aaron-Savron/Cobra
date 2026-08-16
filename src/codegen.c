@@ -361,6 +361,8 @@ static int reserve(CodeGen *cg, int bytes);
 static void emit_expr(CodeGen *cg, ASTNode *node);
 static void emit_call(CodeGen *cg, ASTNode *node);
 static void emit_failure(CodeGen *cg, const char *message);
+static int current_iter(CodeGen *cg, const char *name);
+static void emit_load_buffer_ptr(CodeGen *cg, const char *name, const char *reg);
 
 static void emit_import_call(CodeGen *cg, ASTNode *n) {
     if (n->child_count > 6) {
@@ -811,6 +813,16 @@ static void emit_struct_address(CodeGen *cg, ASTNode *node) {
         exit(EXIT_FAILURE);
     }
     if (node->type == AST_VAR_REF) {
+        int loop = current_iter(cg, node->name);
+        if (loop >= 0 && cg->loops[loop].source[0] != '\0') {
+            /* Struct-element `for p in list_of_struct:` loop variable: the
+               list stores each element as a pointer (see emit_list_append),
+               so loading the slot value already yields the struct's address. */
+            fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n", cg->loops[loop].index_offset);
+            emit_load_buffer_ptr(cg, cg->loops[loop].source, "rbx");
+            fprintf(cg->out, "    mov rax, QWORD PTR [rbx + rdx*8]\n");
+            return;
+        }
         VarSymbol *symbol = find_symbol(cg, node->name);
         if (!symbol || symbol->kind != SYM_STRUCT) {
             fprintf(stderr, "CodeGen Error: '%s' is not a struct value\n", node->name);

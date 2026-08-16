@@ -1906,6 +1906,115 @@ static ASTNode *parse_closure_literal(Parser *parser) {
     return ref;
 }
 
+/* trait Name: { def method(params) -> ret  def method2(...) -> ret2 } --
+   signature-only method list, no bodies. Each method becomes an AST_FUNCTION
+   node with AST_PARAM children and declared_type set to the return type;
+   child_count beyond the params is zero (no body statements), which is how
+   ir.c's conformance pass tells a signature apart from a real function. */
+static ASTNode *parse_trait_method_signature(Parser *parser) {
+    Token def_token = parser->current_token;
+    expect(parser, TOKEN_DEF, "Expected 'def' to start trait method signature");
+    char method_name[COBRA_MAX_IDENT_LEN];
+    copy_token_text(parser, method_name, sizeof(method_name), "trait method name");
+    expect(parser, TOKEN_IDENTIFIER, "Expected trait method name");
+    ASTNode *sig = parser_create_node_at(parser, AST_FUNCTION, method_name, def_token);
+    expect(parser, TOKEN_LPAREN, "Expected '(' after trait method name");
+    if (!match(parser, TOKEN_RPAREN)) {
+        for (;;) {
+            if (!match(parser, TOKEN_IDENTIFIER)) {
+                fprintf(stderr, "%s:%d:%d: error: expected parameter name in trait method signature\n",
+                        parser->source_file, parser->current_token.line, parser->current_token.col);
+                exit(1);
+            }
+            ASTNode *param = parser_create_node(parser, AST_PARAM, parser->current_token.text);
+            ast_add_child(sig, param);
+            advance_token(parser);
+            if (match(parser, TOKEN_COLON)) {
+                advance_token(parser);
+                int alias_qualifier = 0;
+                if (match(parser, TOKEN_IDENTIFIER) &&
+                    (!strcmp(parser->current_token.text, "out") ||
+                     !strcmp(parser->current_token.text, "readonly"))) {
+                    alias_qualifier = !strcmp(parser->current_token.text, "readonly") ? 1 : 2;
+                    advance_token(parser);
+                }
+                param->declared_type = parse_type_into(parser, "parameter", param, alias_qualifier);
+            }
+            if (match(parser, TOKEN_COMMA)) { advance_token(parser); continue; }
+            break;
+        }
+    }
+    expect(parser, TOKEN_RPAREN, "Expected ')' after trait method parameters");
+    if (match(parser, TOKEN_ARROW)) {
+        advance_token(parser);
+        sig->declared_type = parse_type_into(parser, "return", sig, 0);
+    }
+    return sig;
+}
+
+static ASTNode *parse_trait_declaration(Parser *parser) {
+    Token trait_token = parser->current_token;
+    expect(parser, TOKEN_TRAIT, "Expected 'trait'");
+    char trait_name[COBRA_MAX_IDENT_LEN];
+    copy_token_text(parser, trait_name, sizeof(trait_name), "trait name");
+    expect(parser, TOKEN_IDENTIFIER, "Expected trait name");
+    ASTNode *trait_node = parser_create_node_at(parser, AST_TRAIT_DECL, trait_name, trait_token);
+    expect(parser, TOKEN_COLON, "Expected ':' after trait name");
+    expect(parser, TOKEN_LBRACE, "Expected '{' to start trait body");
+    while (!match(parser, TOKEN_RBRACE) && !match(parser, TOKEN_EOF)) {
+        ast_add_child(trait_node, parse_trait_method_signature(parser));
+    }
+    expect(parser, TOKEN_RBRACE, "Expected '}' to close trait body");
+    return trait_node;
+}
+
+/* impl Name for Type: { def method(params) -> ret: { body } ... } -- each
+   method is registered directly into parser->root as a real top-level
+   function named __impl_<Trait>_<Type>_<method>, exactly like closure
+   literals are (parsing finishes fully before cobra_ir_build runs, so
+   there's no re-entrancy risk). The returned AST_IMPL_DECL is bookkeeping
+   only: its children name the implemented methods (name) and their mangled
+   target (secondary_name), so ir.c can check every trait method got an impl
+   without re-deriving the mangling scheme. */
+static ASTNode *parse_impl_declaration(Parser *parser) {
+    Token impl_token = parser->current_token;
+    expect(parser, TOKEN_IMPL, "Expected 'impl'");
+    char trait_name[COBRA_MAX_IDENT_LEN];
+    copy_token_text(parser, trait_name, sizeof(trait_name), "trait name");
+    expect(parser, TOKEN_IDENTIFIER, "Expected trait name after 'impl'");
+    expect(parser, TOKEN_FOR, "Expected 'for' after trait name in impl block");
+    char type_name[COBRA_MAX_IDENT_LEN];
+    copy_token_text(parser, type_name, sizeof(type_name), "implementing type name");
+    expect(parser, TOKEN_IDENTIFIER, "Expected implementing type name after 'for'");
+
+    ASTNode *impl_node = parser_create_node_at(parser, AST_IMPL_DECL, trait_name, impl_token);
+    snprintf(impl_node->secondary_name, sizeof(impl_node->secondary_name), "%.63s", type_name);
+
+    expect(parser, TOKEN_COLON, "Expected ':' after impl header");
+    expect(parser, TOKEN_LBRACE, "Expected '{' to start impl body");
+    while (!match(parser, TOKEN_RBRACE) && !match(parser, TOKEN_EOF)) {
+        Token def_token = parser->current_token;
+        expect(parser, TOKEN_DEF, "Expected 'def' to start impl method");
+        char method_name[COBRA_MAX_IDENT_LEN];
+        copy_token_text(parser, method_name, sizeof(method_name), "impl method name");
+        expect(parser, TOKEN_IDENTIFIER, "Expected impl method name");
+
+        char mangled_name[COBRA_MAX_IDENT_LEN];
+        snprintf(mangled_name, sizeof(mangled_name), "__impl_%.31s_%.31s_%.31s",
+                 trait_name, type_name, method_name);
+
+        ASTNode *fn_node = parser_create_node_at(parser, AST_FUNCTION, mangled_name, def_token);
+        parse_function_signature_and_body(parser, fn_node);
+        if (parser->root) ast_add_child(parser->root, fn_node);
+
+        ASTNode *marker = parser_create_node_at(parser, AST_PARAM, method_name, def_token);
+        snprintf(marker->secondary_name, sizeof(marker->secondary_name), "%.63s", mangled_name);
+        ast_add_child(impl_node, marker);
+    }
+    expect(parser, TOKEN_RBRACE, "Expected '}' to close impl body");
+    return impl_node;
+}
+
 ASTNode *parser_parse_program(Parser *parser) {
     ASTNode *root = parser_create_node(parser, AST_PROGRAM, "RootProgram");
     root->canonical_arena = (CobraTypeArena *)calloc(1, sizeof(CobraTypeArena));
@@ -2007,6 +2116,10 @@ ASTNode *parser_parse_program(Parser *parser) {
                 expect(parser, TOKEN_RPAREN, "Expected ')' after imported C function list");
             }
             ast_add_child(root, import_node);
+        } else if (match(parser, TOKEN_TRAIT)) {
+            ast_add_child(root, parse_trait_declaration(parser));
+        } else if (match(parser, TOKEN_IMPL)) {
+            ast_add_child(root, parse_impl_declaration(parser));
         } else {
             advance_token(parser);
         }

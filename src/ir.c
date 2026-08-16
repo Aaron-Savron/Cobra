@@ -1546,6 +1546,27 @@ static bool is_source_module_alias(IRContext *ctx, const char *alias) {
     return false;
 }
 
+/* Static trait-method dispatch: x.method(args) parses to an AST_FUNC_CALL
+   with qualifier="x" (see the qualified-call parse path shared with
+   alias.function(...) module calls). If "x" is not a module alias, check
+   whether it names a struct-typed local with a registered impl method of
+   that name; if so, return the mangled top-level function name so the
+   caller can rewrite the call in place. Every impl's methods are recorded
+   as AST_PARAM marker children (name=method, secondary_name=mangled) on the
+   AST_IMPL_DECL nodes sitting in ctx->root (see parse_impl_declaration). */
+static const char *find_impl_method(IRContext *ctx, const char *type_name, const char *method_name) {
+    if (!ctx->root || !type_name || !*type_name) return NULL;
+    for (size_t i = 0; i < ctx->root->child_count; i++) {
+        ASTNode *decl = ctx->root->children[i];
+        if (decl->type != AST_IMPL_DECL || strcmp(decl->secondary_name, type_name) != 0) continue;
+        for (size_t j = 0; j < decl->child_count; j++) {
+            ASTNode *marker = decl->children[j];
+            if (strcmp(marker->name, method_name) == 0) return marker->secondary_name;
+        }
+    }
+    return NULL;
+}
+
 static bool function_visible_from(ASTNode *caller, ASTNode *callee) {
     if (!callee || !callee->has_visibility || callee->is_public) return true;
     if (!caller || !caller->source_file[0] || !callee->source_file[0]) return true;
@@ -2149,6 +2170,32 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
             return node->value_type;
         }
         case AST_FUNC_CALL: {
+            /* x.method(args) parses with qualifier="x". If "x" isn't a
+               module/region alias, check whether it's a struct-typed local
+               with a registered impl method of this name (static trait
+               dispatch); if so, rewrite the call in place to the mangled
+               impl function with the receiver prepended as the first
+               argument, before any of the ordinary call-resolution logic
+               below runs. */
+            if (node->qualifier[0] != '\0' && !is_active_region(ctx, node->qualifier) &&
+                !is_source_module_alias(ctx, node->qualifier)) {
+                IRLocal *receiver_local = find_local_entry(ctx, node->qualifier);
+                if (receiver_local && receiver_local->type_name[0]) {
+                    const char *mangled = find_impl_method(ctx, receiver_local->type_name, node->name);
+                    if (mangled) {
+                        ASTNode *receiver_ref = ast_create_node(AST_VAR_REF, node->qualifier);
+                        receiver_ref->source_line = node->source_line;
+                        receiver_ref->source_col = node->source_col;
+                        snprintf(receiver_ref->source_file, sizeof(receiver_ref->source_file), "%.127s", node->source_file);
+                        ast_add_child(node, receiver_ref);
+                        for (size_t shift = node->child_count - 1; shift > 0; shift--)
+                            node->children[shift] = node->children[shift - 1];
+                        node->children[0] = receiver_ref;
+                        snprintf(node->name, sizeof(node->name), "%.63s", mangled);
+                        node->qualifier[0] = '\0';
+                    }
+                }
+            }
             ASTNode *called_function = find_function(ctx, node->name);
             if (called_function && called_function->generic_param_count > 0) {
                 if (called_function->generic_param_count != 1) {
@@ -3721,6 +3768,7 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
             size_t saved_count = ctx->count;
             memcpy(saved_locals, ctx->locals, sizeof(saved_locals));
             CobraTypeKind iterator_type = COBRA_TYPE_I64;
+            const CobraType *struct_element_type = NULL;
             ASTNode *target = node->child_count > 0 ? node->children[0] : NULL;
             if (target) {
                 CobraTypeKind target_type = infer_expr(target, ctx);
@@ -3744,6 +3792,11 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                         iterator_type = COBRA_TYPE_F32;
                     else if (source && source->type == COBRA_TYPE_SLICE_F32)
                         iterator_type = COBRA_TYPE_F32;
+                    else if (source && (source->type == COBRA_TYPE_LIST || source->type == COBRA_TYPE_ARRAY) &&
+                             canonical_element_kind(source->canonical_type) == COBRA_TYPE_STRUCT) {
+                        iterator_type = COBRA_TYPE_STRUCT;
+                        struct_element_type = cobra_type_element(source->canonical_type);
+                    }
                 }
             }            if (node->secondary_name[0] != '\0' &&
                 !(target && target->type == AST_FUNC_CALL && strcmp(target->name, "enumerate") == 0)) {
@@ -3757,6 +3810,16 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
           char message[160];
           snprintf(message, sizeof(message), "duplicate iterator '%s'", node->name);
           ir_error(ctx, node, message);
+      } else if (struct_element_type && primary_iterator_type == COBRA_TYPE_STRUCT) {
+          /* Give the loop variable the element's own canonical struct type
+             (not the list's), so member access resolves exactly like any
+             other struct local via cobra_type_node_name/find_struct. */
+          IRLocal *loop_local = find_local_entry(ctx, node->name);
+          if (loop_local) {
+              loop_local->canonical_type = struct_element_type;
+              snprintf(loop_local->type_name, sizeof(loop_local->type_name), "%.63s",
+                       canonical_type_name(struct_element_type));
+          }
       }
       if (node->secondary_name[0] != '\0' &&
           !add_local(ctx, node->secondary_name, iterator_type, NULL)) {
@@ -4001,6 +4064,45 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
             register_struct_decl(&root_context, root->children[i], true);
     }
     ir->error_count += root_context.errors;
+
+    /* Trait conformance: every impl must implement every method its trait
+       declares. Signature depth beyond name matching is unnecessary here -
+       each impl method is registered as an ordinary top-level function (see
+       parse_impl_declaration), so its own parameter/return types are already
+       fully type-checked by the normal per-function pass below; this only
+       catches a missing method the trait requires. */
+    for (size_t i = 0; i < root->child_count; i++) {
+        ASTNode *impl = root->children[i];
+        if (impl->type != AST_IMPL_DECL) continue;
+        ASTNode *trait = NULL;
+        for (size_t j = 0; j < root->child_count; j++) {
+            if (root->children[j]->type == AST_TRAIT_DECL && strcmp(root->children[j]->name, impl->name) == 0) {
+                trait = root->children[j];
+                break;
+            }
+        }
+        if (!trait) {
+            char message[180];
+            snprintf(message, sizeof(message), "impl references unknown trait '%s'", impl->name);
+            ir_error(&root_context, impl, message);
+            ir->error_count++;
+            continue;
+        }
+        for (size_t m = 0; m < trait->child_count; m++) {
+            const char *required = trait->children[m]->name;
+            bool satisfied = false;
+            for (size_t k = 0; k < impl->child_count; k++) {
+                if (strcmp(impl->children[k]->name, required) == 0) { satisfied = true; break; }
+            }
+            if (!satisfied) {
+                char message[280];
+                snprintf(message, sizeof(message), "impl '%.63s for %.63s' is missing required method '%.63s'",
+                         impl->name, impl->secondary_name, required);
+                ir_error(&root_context, impl, message);
+                ir->error_count++;
+            }
+        }
+    }
 
     for (size_t i = 0; i < root->child_count; i++) {
         ASTNode *function = root->children[i];

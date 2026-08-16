@@ -67,8 +67,12 @@ contract after specialization. A returned view may be forwarded from a
 specialized readonly or writable view parameter, and an owned actual may satisfy
 that borrowed parameter at the call boundary without losing allocation or
 region provenance. Frame-local and region-local return sources remain rejected.
-Non-scalar generic collections and ownership-bearing generic values remain
-deferred.
+`list[T]` for T an all-scalar-field struct (e.g. `list[Point]`) now works for
+append, index-read, index-write, and `for x in list` iteration, via the same
+aggregate-copy codegen path used elsewhere for value-owned structs. The loop
+variable takes the element's own canonical struct type, so normal member
+access works inside the loop body. Ownership-bearing generic values (e.g.
+`list[string]`) remain deferred.
 The existing native backend still emits assembly directly. The isolated lane
 now materializes a target-neutral `BirCallAbi` for every function, including
 lowered parameter locations, hidden aggregate-return storage, abstract GPR and
@@ -532,7 +536,7 @@ Finish the language contracts for:
 - [x] Scalar generic collections over `list[T]` with canonical substitution,
   owned-buffer calls, returns, append, pop, destruction, and ownership checks
 - [ ] Owned generic values
-- Non-scalar generic collections
+- Non-scalar generic collections (list[T] for all-scalar-field struct T now works for append/index/iteration; owned-field T remains deferred)
 - Generic dictionaries
 - [x] Scalar mutable generic slices through `out []T` writable views, including
   indexed stores, calls, borrowed returns, provenance, and borrow-contract checks
@@ -605,6 +609,31 @@ Finish the language contracts for:
   type is known at parse time, independent of compile order, whereas a
   type-inferred local's type is only known once its own function's
   validate_statement pass runs, which may not have happened yet).
+- [x] Traits (static dispatch only). `trait Name: { def method(params) -> ret ... }`
+  declares required method signatures (no bodies); `impl Name for Type: { def
+  method(params) -> ret: { body } ... }` implements them
+  (examples/130_traits_basic.cb). Each impl method is registered as an
+  ordinary top-level function with a mangled name
+  (`__impl_<Trait>_<Type>_<method>`, `parse_impl_declaration`, src/parser.c),
+  exactly like closure literals - no vtable, no runtime dispatch, no new
+  value representation. `x.method(args)` reuses the existing
+  `alias.function(...)` qualified-call parse path (`qualifier` holds "x");
+  when the qualifier isn't a module/region alias, `find_impl_method`
+  (src/ir.c) checks whether it names a struct-typed local with a matching
+  impl method and, if so, rewrites the call node in place - mangled name,
+  receiver prepended as the first argument, qualifier cleared - entirely at
+  IR-build time, so codegen needs zero new cases (the rewritten node is an
+  ordinary `AST_FUNC_CALL` by the time codegen ever sees it). Trait
+  conformance is checked once per impl (every trait method must have a
+  matching impl method by name; deeper signature comparison isn't needed
+  since each impl method is independently type-checked as a normal function
+  anyway) - see `tests/negative/128_impl_missing_method.cb` and
+  `tests/negative/129_impl_unknown_trait.cb`. Not yet supported: dynamic
+  dispatch / trait objects (calling a trait method through a value whose
+  concrete type isn't statically known - would need a real vtable, closer to
+  the closure thunk work), generic trait bounds (`def f[T: Shape](x: T)`),
+  default trait methods, and multiple impls of the same trait for the same
+  type (last registration wins silently - not yet diagnosed).
 - Recursion
 - Casts and explicit conversions
 - Constant evaluation

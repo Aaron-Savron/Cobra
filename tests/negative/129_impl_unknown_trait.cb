@@ -1,0 +1,14 @@
+struct Circle: { radius: i64 }
+
+impl Ghost for Circle: {
+    def area(c: Circle) -> i64: {
+        return c.radius * c.radius * 3
+    }
+}
+
+def test_unknown_trait(): {
+    let c: Circle
+    c.radius = 4
+    assert(c.area() == 48)
+    return 0
+}

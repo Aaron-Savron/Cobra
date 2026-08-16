@@ -118,6 +118,26 @@ def apply(f: fn(i64, i64) -> i64, x: i64, y: i64) -> i64: {
 apply(def(a: i64, b: i64) -> i64: { return a * b }, 6, 7)  # 42
 ```
 
+## Traits
+
+`trait Name: { def method(params) -> ret ... }` declares required method signatures; `impl Name for Type: { def method(params) -> ret: { body } ... }` implements them for a struct type. Calling `x.method(args)` on a struct-typed value resolves at compile time to the matching impl (static dispatch only - no vtable, no runtime cost). Every trait method must have a matching impl method by name or the impl is rejected. See ROADMAP.md for what's deferred (dynamic dispatch, generic trait bounds, default methods).
+
+```cobra
+struct Circle: { radius: i64 }
+
+trait Shape: {
+    def area() -> i64
+}
+
+impl Shape for Circle: {
+    def area(c: Circle) -> i64: { return c.radius * c.radius * 3 }
+}
+
+let c: Circle
+c.radius = 4
+c.area()  # 48
+```
+
 ## Type Foundation
 
 Cobra's core types stay direct native slots: `bool` is a 0/1 value, `none` is the empty value (lowers to zero and is assignable to any type), `const` bindings are immutable after initialization, and `struct` defines a contiguous user type with compiler-assigned field offsets.
