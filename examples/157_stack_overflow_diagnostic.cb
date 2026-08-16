@@ -1,0 +1,29 @@
+# Demonstrates the stack-overflow diagnostic added alongside the per-function
+# frame-sizing fix (examples/154_deep_recursion.cb, examples/155). Unbounded
+# recursion now prints a clean message and exits with code 3, instead of a
+# silent SIGSEGV (exit 139) with no indication of what happened.
+#
+# This program is NOT a `cobra test` case: it is meant to overflow the stack
+# on purpose, so it cannot pass/fail through the normal test harness. Run it
+# manually to see the diagnostic:
+#
+#   cobra build examples/157_stack_overflow_diagnostic.cb -o /tmp/overflow
+#   /tmp/overflow; echo "exit code: $?"
+#
+# Expected output:
+#   [cobra] stack overflow (possible unbounded recursion)
+#   exit code: 3
+#
+# An unrelated segfault (e.g. dereferencing a null pointer through FFI) is
+# NOT reported as a stack overflow: it falls through to the OS's normal
+# segfault behavior (exit 139), so this diagnostic never masks a real,
+# unrelated crash.
+
+def descend(n: i64) -> i64: {
+    return 1 + descend(n + 1)
+}
+
+def main(): {
+    print(descend(0))
+    return 0
+}

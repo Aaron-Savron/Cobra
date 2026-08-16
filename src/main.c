@@ -47,6 +47,7 @@ static bool ast_contains_parallel(ASTNode *node);
 static bool ast_contains_collections(ASTNode *node);
 static const char *parallel_runtime_path(void);
 static const char *collections_runtime_path(void);
+static const char *stackguard_runtime_path(void);
 
 #define COBRA_MAX_IMPORTED_LIBRARIES 256
 static char import_link_args[COBRA_MAX_IMPORTED_LIBRARIES][COBRA_MAX_TOKEN_TEXT + 8];
@@ -832,6 +833,8 @@ static void run_repl(void) {
                 continue;
             }
             if (collections_runtime) build_argv[build_argc++] = collections_runtime;
+            const char *stackguard_runtime = stackguard_runtime_path();
+            if (stackguard_runtime) build_argv[build_argc++] = stackguard_runtime;
             build_argc = append_import_libraries(program, build_argv, build_argc, 300);
             if (build_argc < 0) {
                 remove(".repl_tmp.s");
@@ -894,6 +897,24 @@ static const char *collections_runtime_path(void) {
     const char *lib_path = getenv("COBRA_LIB_PATH");
     if (lib_path && *lib_path) {
         snprintf(installed_path, sizeof(installed_path), "%s/cobra_collections.c", lib_path);
+        if (access(installed_path, R_OK) == 0) return installed_path;
+    }
+    return NULL;
+}
+
+/* Unlike the other optional runtime helpers above, the stack guard is linked
+   into every build/test/bench binary unconditionally: any program can
+   recurse, and installing the handler costs one ELF constructor call at
+   startup, not a per-function or per-call cost. Returns NULL (silently
+   skipped by callers) rather than erroring when the source tree/install
+   layout doesn't have it, so an unusual environment degrades to the old
+   raw-segfault behavior instead of failing the build. */
+static const char *stackguard_runtime_path(void) {
+    static char installed_path[512];
+    if (access("runtime/cobra_stackguard.c", R_OK) == 0) return "runtime/cobra_stackguard.c";
+    const char *lib_path = getenv("COBRA_LIB_PATH");
+    if (lib_path && *lib_path) {
+        snprintf(installed_path, sizeof(installed_path), "%s/cobra_stackguard.c", lib_path);
         if (access(installed_path, R_OK) == 0) return installed_path;
     }
     return NULL;
@@ -1436,6 +1457,8 @@ static bool run_benchmark(ASTNode *program, const char *source_path,
         build_argv[build_argc++] = "-pthread";
     }
     if (collections_runtime) build_argv[build_argc++] = collections_runtime;
+    const char *stackguard_runtime = stackguard_runtime_path();
+    if (stackguard_runtime) build_argv[build_argc++] = stackguard_runtime;
     build_argc = append_import_libraries(program, build_argv, build_argc, 300);
     if (build_argc < 0) {
         cleanup_benchmark_artifacts();
@@ -1670,6 +1693,8 @@ static bool run_native_tests(ASTNode *program, const char *source_path) {
         build_argv[build_argc++] = gpu_runtime;
         build_argv[build_argc++] = "-ldl";
     }
+    const char *stackguard_runtime = stackguard_runtime_path();
+    if (stackguard_runtime) build_argv[build_argc++] = stackguard_runtime;
     build_argc = append_import_libraries(program, build_argv, build_argc, 300);
     if (build_argc < 0) {
         remove(asm_path);
@@ -2105,13 +2130,21 @@ int main(int argc, char **argv) {
     }
 
     if (use_isolated_backend) {
-        /* The isolated backend covers a narrow language subset and cannot
-           parse the standard library that combined_source always carries.
-           Reparse just the user's own module (imports included, library
-           prelude excluded) so a program that only uses subset features has
-           a real chance to compile; anything still out of scope is rejected
-           below with a diagnostic instead of silently falling back. */
+        /* Give the isolated backend the same prelude the direct backend gets,
+           so stdlib-using programs have a chance; unsupported constructs are
+           still rejected below with a diagnostic instead of silently
+           falling back. */
         CobraSourceBuffer isolated_buffer = {0};
+        char *isolated_std_source = read_library_file("std.cb");
+        char *isolated_mem_source = read_library_file("mem.cb");
+        if (isolated_std_source) {
+            source_buffer_append(&isolated_buffer, isolated_std_source, "lib/std.cb");
+            free(isolated_std_source);
+        }
+        if (isolated_mem_source) {
+            source_buffer_append(&isolated_buffer, isolated_mem_source, "lib/mem.cb");
+            free(isolated_mem_source);
+        }
         CobraModulePaths isolated_module_paths = {0};
         if (!load_cobra_module(source_path, &project_config, &isolated_module_paths,
                                &isolated_buffer)) {
@@ -2233,6 +2266,8 @@ int main(int argc, char **argv) {
     }
     if (precision_runtime) build_argv[build_argc++] = precision_runtime;
     if (gpu_kernels_file) build_argv[build_argc++] = gpu_kernels_file;
+    const char *stackguard_runtime = target == TARGET_LINUX_X86_64 ? stackguard_runtime_path() : NULL;
+    if (stackguard_runtime) build_argv[build_argc++] = stackguard_runtime;
     build_argc = append_import_libraries(program, build_argv, build_argc, 300);
     if (build_argc < 0) {
         free(combined_source);
