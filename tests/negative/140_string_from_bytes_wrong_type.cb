@@ -1,0 +1,4 @@
+def bad(): {
+    let s: string = string_from_bytes("not a byte slice", 3)
+    return 0
+}

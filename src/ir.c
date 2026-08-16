@@ -770,6 +770,10 @@ static bool is_string_free_builtin(const char *name) {
     return strcmp(name, "string_free") == 0;
 }
 
+static bool is_string_from_bytes_builtin(const char *name) {
+    return strcmp(name, "string_from_bytes") == 0;
+}
+
 static bool is_sum_builtin(const char *name) {
     return !strcmp(name, "some") || !strcmp(name, "none") ||
            !strcmp(name, "ok") || !strcmp(name, "err") ||
@@ -2622,6 +2626,26 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                     if (value != COBRA_TYPE_I64 && value != COBRA_TYPE_UNKNOWN) ir_error(ctx, node, "dict value must be i64");
                 }
                 node->value_type = (!strcmp(node->name, "set") || !strcmp(node->name, "delete")) ? COBRA_TYPE_VOID : COBRA_TYPE_I64;
+                return node->value_type;
+            }
+            if (is_string_from_bytes_builtin(node->name)) {
+                if (node->child_count != 2) {
+                    ir_error(ctx, node, "string_from_bytes requires exactly two arguments");
+                }
+                if (node->child_count > 0) {
+                    CobraTypeKind buf = infer_expr(node->children[0], ctx);
+                    if (buf != COBRA_TYPE_SLICE_U8 && buf != COBRA_TYPE_UNKNOWN) {
+                        ir_error(ctx, node, "string_from_bytes first argument must be []u8");
+                    }
+                }
+                if (node->child_count > 1) {
+                    CobraTypeKind len = infer_expr(node->children[1], ctx);
+                    if (!is_integer(len) && len != COBRA_TYPE_UNKNOWN) {
+                        ir_error(ctx, node, "string_from_bytes second argument must be an integer length");
+                    }
+                }
+                node->value_type = COBRA_TYPE_STRING;
+                node->fresh_string_result = true;
                 return node->value_type;
             }
             if (is_string_builtin(node->name)) {

@@ -1153,6 +1153,17 @@ static void emit_string_concat(CodeGen *cg, ASTNode *n) {
     fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov rdx, QWORD PTR [rbp-%d]\n    mov BYTE PTR [rax + rdx], 0\n", result, total);
 }
 
+static void emit_string_from_bytes(CodeGen *cg, ASTNode *n) {
+    int src = reserve(cg, 8), len = reserve(cg, 8), result = reserve(cg, 8);
+    emit_expr(cg, n->children[0]);
+    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", src);
+    emit_expr(cg, n->children[1]);
+    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", len);
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    inc rax\n    mov rdi, rax\n    call malloc@PLT\n    mov QWORD PTR [rbp-%d], rax\n", len, result);
+    fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    mov rdx, QWORD PTR [rbp-%d]\n    call memcpy@PLT\n", result, src, len);
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov rdx, QWORD PTR [rbp-%d]\n    mov BYTE PTR [rax + rdx], 0\n", result, len);
+}
+
 static void emit_string_compare(CodeGen *cg, ASTNode *n) {
     int left = reserve(cg, 8), right = reserve(cg, 8);
     emit_expr(cg, n->children[0]); fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", left);
@@ -2850,6 +2861,7 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
         return;
     }
     if (!strcmp(n->name, "concat")) { emit_string_concat(cg, n); return; }
+    if (!strcmp(n->name, "string_from_bytes")) { emit_string_from_bytes(cg, n); return; }
     if (!strcmp(n->name, "some") || !strcmp(n->name, "none") ||
         !strcmp(n->name, "ok") || !strcmp(n->name, "err")) {
         bool result = !strcmp(n->name, "ok") || !strcmp(n->name, "err");

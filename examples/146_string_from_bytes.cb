@@ -1,0 +1,38 @@
+def test_string_from_bytes_basic(): {
+    let buf: []u8 = alloc_u8(5)
+    buf[0] = 104
+    buf[1] = 101
+    buf[2] = 108
+    buf[3] = 108
+    buf[4] = 111
+    let s: string = string_from_bytes(buf, 5)
+    assert(s == "hello")
+    assert(concat(s, " world") == "hello world")
+    return 0
+}
+
+def test_string_from_bytes_as_dict_key(): {
+    let buf: []u8 = alloc_u8(3)
+    buf[0] = 99
+    buf[1] = 97
+    buf[2] = 116
+    let s: string = string_from_bytes(buf, 3)
+    let counts: dict[string]i64 = {}
+    set(counts, s, 1)
+    set(counts, s, get(counts, s, 0) + 1)
+    assert(get(counts, "cat", 0) == 2)
+    assert(has(counts, s))
+    return 0
+}
+
+def test_string_from_bytes_computed_content(): {
+    let buf: []u8 = alloc_u8(4)
+    let i: i64 = 0
+    while i < 4: {
+        buf[i] = 97 + i
+        i = i + 1
+    }
+    let s: string = string_from_bytes(buf, 4)
+    assert(s == "abcd")
+    return 0
+}
