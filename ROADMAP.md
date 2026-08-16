@@ -1324,3 +1324,19 @@ would have reintroduced stack corruption for real programs:
    reserving that extra depth too. See the same example's
    `test_struct_return_round_trip` (a struct value round-tripped through
    two chained calls, the exact shape that segfaulted before this fix).
+
+`list[dyn Trait]` (a heterogeneous collection of trait-object values) was
+investigated and NOT implemented. A `dyn Trait` value is already just one
+pointer (to its heap-allocated dispatch block), so it should in principle
+slot into `list[T]`'s existing 8-byte scalar-element machinery -- but
+`list[T]` parsing has no `dyn` case (`list[dyn Shape]` fails to parse,
+"Expected ']' after list element type"), and more fundamentally, nothing
+threads a trait name through list-element metadata today: `IRLocal` tracks
+`element_type`/`type_name` for scalar and struct elements, but recovering
+which trait a `list[dyn Trait]` element belongs to at index-read time (so
+`shapes[0].area()` dispatches correctly) needs an equivalent
+`element_dyn_trait_name`-shaped field threaded through list declaration,
+append, and index-read -- comparable in scope to the original list[Struct]
+support work, not a small addition. Left undone rather than forced blind;
+a real attempt needs that field added to `IRLocal` and index-read taught to
+label its resulting temporary/local as dyn-typed from it.
