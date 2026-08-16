@@ -2707,7 +2707,10 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
             emit_import_call(cg, n);
             return;
         }
-        fprintf(stderr, "CodeGen Error: undefined function '%s' (not defined or imported with 'import c')\n", n->name);
+        const char *file = n->source_file[0] ? n->source_file : "<source>";
+        int line = n->source_line > 0 ? n->source_line : 1;
+        int col = n->source_col > 0 ? n->source_col : 1;
+        fprintf(stderr, "%s:%d:%d: error: undefined function '%s' (not defined or imported with 'import c')\n", file, line, col, n->name);
         exit(EXIT_FAILURE);
     }
     bool tensor_return = fn->declared_type == COBRA_TYPE_TENSOR_F32;

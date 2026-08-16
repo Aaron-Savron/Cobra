@@ -2,6 +2,22 @@
 
 This roadmap covers the work required to turn Cobra's current compiler into a complete systems programming language with a native backend.
 
+## Tooling
+
+Diagnostics now echo the offending source line with a caret under the
+column, and undefined-variable errors suggest the closest-spelled name in
+scope (locals, closure-enclosing scopes, and top-level functions) when one is
+within edit-distance 1-2. `undefined function` codegen errors now carry
+file:line:col like every IR-level diagnostic instead of a bare message.
+Remaining gap found in the same pass: `cobra check` does not currently
+validate that a called function exists (only codegen does, at build time) -
+a typo'd call name is accepted by `check` and only caught by `build`. No
+formatter, LSP, package manager, or debugger exist yet; a minimal
+diagnostics-only LSP (wrapping `cobra check`'s output as LSP diagnostics
+over stdio) is likely the next-highest-value tooling piece since the compiler
+already does the hard part, followed by a mechanical `cobra fmt`. A package
+manager is premature before there's a multi-project ecosystem to serve.
+
 ## Current position
 
 Cobra currently has:

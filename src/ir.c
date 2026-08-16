@@ -139,12 +139,91 @@ static const char *type_name(CobraTypeKind type) {
     }
 }
 
+/* Best-effort source-line echo for a diagnostic: re-reads the offending
+   file directly since the parser doesn't retain a line index and the
+   compiled program may be a multi-file prelude concatenation where byte
+   offsets alone wouldn't map cleanly back to a single file's lines. */
+static void print_source_snippet(const char *file, int line, int col) {
+    if (!file || !file[0] || strcmp(file, "<source>") == 0 || line <= 0) return;
+    FILE *f = fopen(file, "r");
+    if (!f) return;
+    char buf[512];
+    int current = 0;
+    bool found = false;
+    while (fgets(buf, sizeof(buf), f)) {
+        current++;
+        if (current == line) { found = true; break; }
+    }
+    fclose(f);
+    if (!found) return;
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) buf[--len] = '\0';
+    fprintf(stderr, "    %s\n", buf);
+    if (col > 0 && (size_t)col <= len + 1) {
+        fprintf(stderr, "    ");
+        for (int i = 1; i < col; i++) fputc(buf[i - 1] == '\t' ? '\t' : ' ', stderr);
+        fprintf(stderr, "^\n");
+    }
+}
+
+/* Small edit-distance match used to power "did you mean" suggestions for
+   undefined-identifier errors; names are short (COBRA_MAX_IDENT_LEN) so an
+   O(n*m) DP table per candidate is negligible next to actual compilation. */
+static int identifier_edit_distance(const char *a, const char *b) {
+    int la = (int)strlen(a), lb = (int)strlen(b);
+    if (la == 0 || lb == 0 || la > 63 || lb > 63) return la + lb;
+    int dp[64][64];
+    for (int i = 0; i <= la; i++) dp[i][0] = i;
+    for (int j = 0; j <= lb; j++) dp[0][j] = j;
+    for (int i = 1; i <= la; i++) {
+        for (int j = 1; j <= lb; j++) {
+            int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            int del = dp[i - 1][j] + 1;
+            int ins = dp[i][j - 1] + 1;
+            int sub = dp[i - 1][j - 1] + cost;
+            int best = del < ins ? del : ins;
+            dp[i][j] = best < sub ? best : sub;
+        }
+    }
+    return dp[la][lb];
+}
+
 static void ir_error(IRContext *ctx, ASTNode *node, const char *message) {
     const char *file = (node && node->source_file[0]) ? node->source_file : "<source>";
     int line = node && node->source_line > 0 ? node->source_line : 1;
     int col = node && node->source_col > 0 ? node->source_col : 1;
     fprintf(stderr, "%s:%d:%d: error: %s\n", file, line, col, message);
+    print_source_snippet(file, line, col);
     ctx->errors++;
+}
+
+/* Finds the closest-spelled candidate name (locals in scope, walking
+   parent_scope for closures, plus top-level functions) for an
+   undefined-identifier diagnostic. Returns NULL if nothing is close enough
+   to be worth suggesting (distance threshold keeps unrelated names quiet). */
+static const char *suggest_similar_name(IRContext *ctx, const char *name) {
+    if (!ctx || !name || !name[0]) return NULL;
+    const char *best = NULL;
+    int best_dist = INT_MAX;
+    int threshold = (int)strlen(name) <= 3 ? 1 : 2;
+    for (IRContext *scope = ctx; scope; scope = scope->parent_scope) {
+        for (size_t i = 0; i < scope->count; i++) {
+            const char *cand = scope->locals[i].name;
+            if (!cand[0] || strcmp(cand, name) == 0) continue;
+            int d = identifier_edit_distance(name, cand);
+            if (d < best_dist) { best_dist = d; best = cand; }
+        }
+    }
+    if (ctx->root) {
+        for (size_t i = 0; i < ctx->root->child_count; i++) {
+            ASTNode *decl = ctx->root->children[i];
+            if (decl->type != AST_FUNCTION || !decl->name[0]) continue;
+            if (strcmp(decl->name, name) == 0) continue;
+            int d = identifier_edit_distance(name, decl->name);
+            if (d < best_dist) { best_dist = d; best = decl->name; }
+        }
+    }
+    return (best && best_dist <= threshold) ? best : NULL;
 }
 
 static IREnum *find_enum(IRContext *ctx, const char *name) {
@@ -1873,8 +1952,12 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                     node->canonical_type = func_type;
                     return node->value_type;
                 }
-                char message[160];
-                snprintf(message, sizeof(message), "undefined variable '%s'", node->name);
+                char message[220];
+                const char *suggestion = suggest_similar_name(ctx, node->name);
+                if (suggestion)
+                    snprintf(message, sizeof(message), "undefined variable '%s'; did you mean '%s'?", node->name, suggestion);
+                else
+                    snprintf(message, sizeof(message), "undefined variable '%s'", node->name);
                 ir_error(ctx, node, message);
             } else {
                 type = local->type;
