@@ -173,6 +173,12 @@ let empty: i64 = none
 
 See `examples/50_type_foundation.cb`.
 
+Function parameters require an explicit type annotation (`def f(x: i64): { ... }`); an
+omitted parameter type is a compile-time error rather than a silent default. `let`
+locals remain inferrable from their initializer (`let x = 5`). Function return types
+may still be omitted, defaulting to `i64` if a value is returned or `void` otherwise;
+this is an established, widely-used convention, not the same class of bug.
+
 ### Option and Result
 
 `Option[T]` and `Result[T, E]` are native tagged values for application APIs. Scalar payloads and named structs made from scalar fields are supported. Struct-bearing sums use caller-provided native return storage and copy payload bytes by value; they do not allocate a hidden heap object:

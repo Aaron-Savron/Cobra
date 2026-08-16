@@ -1222,3 +1222,19 @@ through that box -- a second list representation alongside the flat one
 used everywhere else, not a small addition. Left undone rather than forced;
 `direct_struct_field_supported_kind` in `src/ir.c` still has no
 `COBRA_TYPE_LIST` case.
+
+An untyped function parameter used to silently default to `i64`
+(`src/ir.c`, `is_param && p->declared_type == COBRA_TYPE_UNTYPED`) instead
+of being rejected or inferred -- `def add(a, b): { return a + b }` compiled
+today with both parameters hardcoded to `i64`, so calling it with an `f32`
+argument silently coerced/truncated rather than erroring. Fixed: an
+untyped parameter is now a compile-time error naming the parameter and
+suggesting an annotation. `lib/std.cb`'s prelude had four such parameters
+(`abs_val`, `max_val`, `min_val`, `vector_scale_avx2`, `file_write_log`)
+that were silently relying on this default; all now carry explicit types.
+Function return types are unaffected -- an omitted `->` type is an
+established, separate convention (defaults to `i64` if a value is
+returned, `void` otherwise), not the same silent-wrong-default bug.
+Real single-parameter type inference (as opposed to rejecting the omission)
+remains future work, tracked alongside the larger implicit-generics design
+question.

@@ -4490,6 +4490,13 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
         for (size_t j = 0; j < function->child_count; j++) {
             ASTNode *child = function->children[j];
             if (child->type == AST_PARAM) {
+                if (child->declared_type == COBRA_TYPE_UNTYPED) {
+                    char message[180];
+                    snprintf(message, sizeof(message),
+                             "parameter '%s' has no type annotation; add a type, e.g. '%s: i64'",
+                             child->name, child->name);
+                    ir_error(&ctx, child, message);
+                }
                 CobraTypeKind type = child->declared_type == COBRA_TYPE_UNTYPED ? COBRA_TYPE_I64 : child->declared_type;
                 if (type == COBRA_TYPE_F64) {
                     ir_error(&ctx, child, "f64 is reserved until native double-precision lowering is implemented");

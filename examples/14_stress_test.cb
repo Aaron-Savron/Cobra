@@ -2,7 +2,7 @@
 
 import c "libc.so.6" (abs)
 
-def calculate_stress(a, b): {
+def calculate_stress(a: i64, b: i64): {
     val = a + b
     return val
 }

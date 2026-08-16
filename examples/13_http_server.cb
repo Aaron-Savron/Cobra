@@ -3,7 +3,7 @@
 
 import c "libc.so.6" (socket, write, close)
 
-def handle_request(client_fd): {
+def handle_request(client_fd: i64): {
     # 1. Scope-Arena memory allocation for HTTP Response
     header_len = len("HTTP/1.1 200 OK Content-Type: application/json Connection: close")
     header_len?

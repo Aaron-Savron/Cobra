@@ -1,6 +1,6 @@
 # Example 4: Cobra v0.3 Control Flow, Loops, and Functions! 
 
-def multiply(x, y): {
+def multiply(x: i64, y: i64): {
     return x * y
 }
 

@@ -7,28 +7,28 @@ def print_banner(): {
     print("=== Cobra Standard Library ===")
 }
 
-def abs_val(x): {
+def abs_val(x: i64): {
     if x < 0: {
         return 0 - x
     }
     return x
 }
 
-def max_val(a, b): {
+def max_val(a: i64, b: i64): {
     if a > b: {
         return a
     }
     return b
 }
 
-def min_val(a, b): {
+def min_val(a: i64, b: i64): {
     if a < b: {
         return a
     }
     return b
 }
 
-def vector_scale_avx2(numbers): {
+def vector_scale_avx2(numbers: []i64): {
     @compute: {
         for i in numbers: {
             i = i * 2
@@ -42,7 +42,7 @@ def sys_io_uring_socket(): {
     return 0
 }
 
-def file_write_log(msg): {
+def file_write_log(msg: string): {
     print(msg)
     return 0
 }

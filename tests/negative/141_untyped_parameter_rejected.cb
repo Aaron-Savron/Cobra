@@ -1,0 +1,10 @@
+# An untyped parameter used to silently default to i64 instead of being
+# rejected or inferred. It must now be a clear compile-time error.
+
+def add(a, b: i64) -> i64: {
+    return a + b
+}
+
+def main(): {
+    return add(1, 2)
+}
