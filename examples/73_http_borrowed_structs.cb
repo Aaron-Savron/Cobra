@@ -63,10 +63,6 @@ def test_http_malformed_request_view(): {
         parsed = http_request_parse(request, duplicate_length, meta, names, values)
         assert(is_ok(parsed) == 0)
         assert(unwrap_err(parsed) == 13)
-
-        free(values)
-        free(names)
-        free(meta)
     }
     return 0
 }

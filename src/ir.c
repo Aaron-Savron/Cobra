@@ -2261,6 +2261,19 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
             return node->value_type;
         }
         case AST_FUNC_CALL: {
+            /* An unqualified alloc_i64/alloc_f32/alloc_u8 inside an active
+               with region block implicitly binds to the innermost enclosing
+               region, exactly as if the developer had written
+               "region_name.alloc_*(...)". This is a pure AST rewrite done
+               before any other qualifier-dependent logic below runs, so the
+               existing region-alloc IR/codegen paths handle it unchanged. */
+            if (node->qualifier[0] == '\0' && ctx->region_depth > 0 &&
+                (strcmp(node->name, "alloc_i64") == 0 ||
+                 strcmp(node->name, "alloc_f32") == 0 ||
+                 strcmp(node->name, "alloc_u8") == 0)) {
+                snprintf(node->qualifier, sizeof(node->qualifier), "%.63s",
+                         ctx->regions[ctx->region_depth - 1]);
+            }
             /* x.method(args) parses with qualifier="x". If "x" isn't a
                module/region alias, check whether it's a struct-typed local
                with a registered impl method of this name (static trait

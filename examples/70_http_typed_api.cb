@@ -39,7 +39,6 @@ def test_http_typed_request(): {
         assert(len(body) == 5)
         assert(body[0] == 104)
         free(body)
-        free(body_meta)
     }
 
     with region response_region: {
@@ -58,16 +57,11 @@ def test_http_typed_request(): {
         assert(is_ok(wire))
         assert(unwrap_ok(wire) == sent_size)
         assert(received[0] == 72)
-        free(received)
-        free(progress)
         free(header_view)
     }
 
     net_close_checked(handles[0])
     net_close_checked(handles[1])
-    free(value_meta)
-    free(name_meta)
-    free(request_meta)
     free(handles)
     return 0
 }
@@ -124,12 +118,6 @@ def test_http_typed_failures(): {
         assert(is_ok(invalid_write) == 0)
         assert(unwrap_err(invalid_write) == 2)
         assert(invalid_progress[0] == 0)
-        free(invalid_progress)
-        free(invalid_response)
-        free(partial_body)
-        free(value)
-        free(name)
-        free(meta)
     }
     return 0
 }
@@ -154,9 +142,6 @@ def serve_typed_once(server: i64) -> i64 {
         parsed = parse_request_checked(request, request_size, request_meta, name_meta, value_meta)
         if is_ok(parsed) == 0: {
             net_close_checked(client)
-            free(value_meta)
-            free(name_meta)
-            free(request_meta)
             return -1
         }
         route_ok = http_request_method_is(request, request_meta, "GET")
@@ -178,11 +163,7 @@ def serve_typed_once(server: i64) -> i64 {
         progress = alloc_i64(1)
         written = http_response_send(client, status, header_view, response_body, response, progress)
         net_close_checked(client)
-        free(progress)
         free(header_view)
-        free(value_meta)
-        free(name_meta)
-        free(request_meta)
         if is_ok(written) == 0: {
             return -1
         }

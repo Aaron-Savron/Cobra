@@ -1175,3 +1175,16 @@ assignment/merging (phase 2/3 of the wider design) and extending
 caller-allocated returns beyond the struct/sum `sret` that already exists.
 This phase only changes the borrow-vs-move decision at direct call sites;
 nothing here changes what gets freed or when.
+
+Implicit region inheritance (direct backend): an unqualified `alloc_i64`/
+`alloc_f32`/`alloc_u8` call now binds to the innermost active `with region`
+block automatically, exactly as if written `region_name.alloc_*(...)`. This
+is a pure AST qualifier rewrite in `cobra_ir_build`'s `AST_FUNC_CALL` case,
+done before any other qualifier-dependent logic runs, so it flows through
+the existing region-alloc IR and codegen paths unchanged (confirmed via
+`emit-asm`: region-bound allocations compile to `arena_alloc@PLT`, not
+`calloc@PLT`). Outside any `with region` block, behavior is unchanged. A
+region-bound allocation can no longer be explicitly `free()`'d (the region's
+own exit now owns cleanup) -- existing example code that allocated inside a
+region and freed explicitly was updated to drop those now-redundant/invalid
+free() calls.

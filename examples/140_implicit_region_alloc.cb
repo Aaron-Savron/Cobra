@@ -1,0 +1,37 @@
+# Unqualified alloc_i64/alloc_f32/alloc_u8 calls implicitly bind to the
+# innermost active `with region` block, exactly as if the developer had
+# written `region_name.alloc_*(...)`. Outside any region, they still use
+# the global heap and require an explicit free(), unchanged.
+
+def test_implicit_region_alloc_basic(): {
+    with region scratch: {
+        buf = alloc_u8(16)
+        buf[0] = 42
+        assert(buf[0] == 42)
+        assert(len(buf) == 16)
+    }
+    return 0
+}
+
+def test_implicit_region_alloc_many(): {
+    with region scratch: {
+        total = 0
+        i = 0
+        while i < 500: {
+            nums = alloc_i64(4)
+            nums[0] = i
+            total = total + nums[0]
+            i = i + 1
+        }
+        assert(total == 124750)
+    }
+    return 0
+}
+
+def test_plain_alloc_outside_region_unchanged(): {
+    buf = alloc_u8(8)
+    buf[0] = 7
+    assert(buf[0] == 7)
+    free(buf)
+    return 0
+}

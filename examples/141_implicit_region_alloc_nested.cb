@@ -1,0 +1,16 @@
+# Nested `with region` blocks: an unqualified alloc_* call always binds to
+# the innermost active region, not an outer one.
+
+def test_nested_region_alloc_resolves_innermost(): {
+    with region outer: {
+        outer_buf = alloc_i64(2)
+        outer_buf[0] = 100
+        with region inner: {
+            inner_buf = alloc_i64(2)
+            inner_buf[0] = 200
+            assert(inner_buf[0] == 200)
+        }
+        assert(outer_buf[0] == 100)
+    }
+    return 0
+}
