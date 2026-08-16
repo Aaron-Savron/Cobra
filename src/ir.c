@@ -3609,7 +3609,20 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                     }
                 }
             }
-            if (!is_dyn_trait_decl && node->declared_type != COBRA_TYPE_UNTYPED && inferred != COBRA_TYPE_UNKNOWN &&
+            /* Imported C functions have no declared signature (`import c` only
+               names them, see is_imported_function), so a pointer-returning
+               one infers as bare i64. Reinterpreting that i64 as a pointer
+               type at the assignment site is sound - the underlying bit
+               pattern is already a valid pointer - so this narrow coercion
+               lets `let p: []u8 = some_c_func()` work instead of forcing the
+               caller to leave the local untyped. */
+            bool c_pointer_reinterpret = inferred == COBRA_TYPE_I64 &&
+                (declared == COBRA_TYPE_SLICE || declared == COBRA_TYPE_SLICE_U8 ||
+                 declared == COBRA_TYPE_SLICE_F32) &&
+                node->child_count > 0 && node->children[0]->type == AST_FUNC_CALL &&
+                is_imported_function(ctx, node->children[0]->name);
+            if (!is_dyn_trait_decl && !c_pointer_reinterpret &&
+                node->declared_type != COBRA_TYPE_UNTYPED && inferred != COBRA_TYPE_UNKNOWN &&
                 inferred != COBRA_TYPE_UNTYPED && !declared_compatible(declared, inferred)) {
                 char message[180];
                 snprintf(message, sizeof(message), "'%s' declared as %s but initialized with %s",
