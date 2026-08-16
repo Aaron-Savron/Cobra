@@ -588,6 +588,46 @@ static void emit_struct_return(CodeGen *cg, ASTNode *value) {
     fprintf(cg->out, "    mov rax, QWORD PTR [rbp-240]\n");
 }
 
+/* A list/dict value's fields live in separate stack slots, not a contiguous
+   memory block, so returning one copies each field individually into the
+   caller's sret buffer instead of a single memcpy like emit_struct_return. */
+static void emit_list_return(CodeGen *cg, ASTNode *value) {
+    if (!value || value->type != AST_VAR_REF) {
+        fprintf(stderr, "CodeGen Error: list return value must be a named list\n");
+        exit(EXIT_FAILURE);
+    }
+    VarSymbol *s = find_symbol(cg, value->name);
+    if (!s || s->kind != SYM_LIST) {
+        fprintf(stderr, "CodeGen Error: '%s' is not a list value\n", value->name);
+        exit(EXIT_FAILURE);
+    }
+    fprintf(cg->out,
+            "    mov rdi, QWORD PTR [rbp-240]\n"
+            "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rdi], rax\n"
+            "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rdi+8], rax\n"
+            "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rdi+16], rax\n",
+            s->offset, s->length_offset, s->capacity_offset);
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-240]\n");
+}
+
+static void emit_dict_return(CodeGen *cg, ASTNode *value) {
+    if (!value || value->type != AST_VAR_REF) {
+        fprintf(stderr, "CodeGen Error: dict return value must be a named dict\n");
+        exit(EXIT_FAILURE);
+    }
+    VarSymbol *s = find_symbol(cg, value->name);
+    if (!s || s->kind != SYM_DICT) {
+        fprintf(stderr, "CodeGen Error: '%s' is not a dict value\n", value->name);
+        exit(EXIT_FAILURE);
+    }
+    fprintf(cg->out,
+            "    mov rdi, QWORD PTR [rbp-240]\n"
+            "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rdi], rax\n"
+            "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rdi+8], rax\n",
+            s->offset, s->length_offset);
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-240]\n");
+}
+
 static void emit_sum_return(CodeGen *cg, ASTNode *value, CobraTypeKind type) {
     if (!value) {
         fprintf(stderr, "CodeGen Error: Option or Result return requires a value\n");
@@ -843,17 +883,24 @@ static VarSymbol *ensure_slice(CodeGen *cg, const char *name, CobraTypeKind type
     s->offset = reserve(cg, 8); s->length_offset = reserve(cg, 8); return s;
 }
 
-static VarSymbol *ensure_list(CodeGen *cg, const char *name, CobraTypeKind element_type) {
+static VarSymbol *ensure_list_named(CodeGen *cg, const char *name, CobraTypeKind element_type,
+                                     const char *element_type_name) {
     VarSymbol *s = find_symbol(cg, name);
     if (s) return s;
     s = new_symbol(cg, name);
     s->kind = SYM_LIST;
     s->type = COBRA_TYPE_LIST;
     s->element_type = element_type;
+    if (element_type == COBRA_TYPE_STRUCT && element_type_name)
+        snprintf(s->type_name, sizeof(s->type_name), "%.63s", element_type_name);
     s->offset = reserve(cg, 8);
     s->length_offset = reserve(cg, 8);
     s->capacity_offset = reserve(cg, 8);
     return s;
+}
+
+static VarSymbol *ensure_list(CodeGen *cg, const char *name, CobraTypeKind element_type) {
+    return ensure_list_named(cg, name, element_type, NULL);
 }
 
 static VarSymbol *ensure_dict(CodeGen *cg, const char *name) {
@@ -1220,6 +1267,20 @@ static void emit_list_append(CodeGen *cg, VarSymbol *s, ASTNode *value) {
     if (s->element_type == COBRA_TYPE_F32) {
         if (!expression_is_float_codegen(cg, value)) fprintf(cg->out, "    cvtsi2ss xmm0, rax\n");
         fprintf(cg->out, "    movss DWORD PTR [rbp-%d], xmm0\n    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    movss xmm0, DWORD PTR [rbp-%d]\n    call cobra_list_append_f32@PLT\n", temp, s->offset, s->length_offset, s->capacity_offset, temp);
+    } else if (s->element_type == COBRA_TYPE_STRUCT) {
+        /* emit_expr left the source struct's own address in rax - which, for a
+           plain local, is a stack slot the caller will reuse on its next call.
+           Storing that address directly would alias every appended element
+           against whichever call happened to run last, so each append gets its
+           own heap-owned copy of the struct's bytes instead. */
+        int struct_size = struct_storage_size(cg, s->type_name);
+        int src_slot = reserve(cg, 8);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", src_slot);
+        fprintf(cg->out, "    mov rdi, %d\n    call malloc@PLT\n", struct_size);
+        fprintf(cg->out, "    mov rdi, rax\n    mov rsi, QWORD PTR [rbp-%d]\n", src_slot);
+        emit_copy_memory(cg, "rsi", "rdi", struct_size);
+        fprintf(cg->out, "    mov rax, rdi\n");
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    mov rcx, QWORD PTR [rbp-%d]\n    call cobra_list_append_i64@PLT\n", temp, s->offset, s->length_offset, s->capacity_offset, temp);
     } else {
         fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    mov rcx, QWORD PTR [rbp-%d]\n    call cobra_list_append_i64@PLT\n", temp, s->offset, s->length_offset, s->capacity_offset, temp);
     }
@@ -2970,7 +3031,9 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
     bool tensor_return = fn->declared_type == COBRA_TYPE_TENSOR_F32;
     bool sum_return = fn->declared_type == COBRA_TYPE_OPTION || fn->declared_type == COBRA_TYPE_RESULT;
     bool struct_return = fn->declared_type == COBRA_TYPE_STRUCT;
-    bool compound_return = tensor_return || sum_return || struct_return;
+    bool list_return = fn->declared_type == COBRA_TYPE_LIST;
+    bool dict_return = fn->declared_type == COBRA_TYPE_DICT;
+    bool compound_return = tensor_return || sum_return || struct_return || list_return || dict_return;
     int stack_slots = function_stack_slot_count(cg, n->name, compound_return);
     /* The first outgoing stack argument is written at [rsp+0] before call;
        the call's pushed return address becomes [rbp+8], so the callee reads
@@ -2980,16 +3043,18 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
 
     int result_temp = 0;
     if (compound_return) {
-        /* Allocate the caller-owned result region first. Struct and tensor
-           returns use its low-address base; sums use the historical high
-           address tag pointer. */
+        /* Allocate the caller-owned result region first. Struct, list, dict,
+           and tensor returns use its low-address base; sums use the
+           historical high address tag pointer. */
         if (cg->stack_offset < COBRA_LOCAL_BASE) cg->stack_offset = COBRA_LOCAL_BASE;
         int result_size = tensor_return ? COBRA_TENSOR_FIELDS * 8 :
                            struct_return ? struct_storage_size(cg, ast_payload_name(fn)) :
+                           list_return ? 24 :
+                           dict_return ? 16 :
                            8 + sum_component_size(cg, ast_element_kind(fn), ast_payload_name(fn)) +
                            (fn->declared_type == COBRA_TYPE_RESULT ?
                             sum_component_size(cg, ast_error_kind(fn), ast_error_name(fn)) : 0);
-        if (tensor_return || struct_return) {
+        if (tensor_return || struct_return || list_return || dict_return) {
             result_temp = cg->stack_offset;
             cg->stack_offset += result_size;
         } else {
@@ -4194,10 +4259,37 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             }
             if (v->type == AST_ARRAY_LITERAL && n->declared_type == COBRA_TYPE_LIST) {
                 CobraTypeKind element = ast_element_kind(n) == COBRA_TYPE_UNTYPED ? COBRA_TYPE_I64 : ast_element_kind(n);
-                VarSymbol *s = ensure_list(cg, n->name, element);
+                VarSymbol *s = ensure_list_named(cg, n->name, element, ast_payload_name(n));
                 s->owned = true;
                 fprintf(cg->out, "    mov QWORD PTR [rbp-%d], 0\n    mov QWORD PTR [rbp-%d], 0\n    mov QWORD PTR [rbp-%d], 0\n", s->offset, s->length_offset, s->capacity_offset);
                 for (size_t i = 0; i < v->child_count; i++) emit_list_append(cg, s, v->children[i]);
+                return;
+            }
+            if (n->declared_type == COBRA_TYPE_LIST && v->type == AST_FUNC_CALL) {
+                /* A list-returning call leaves rax pointing at the callee's
+                   sret buffer (see emit_list_return): {data, length, capacity}
+                   as three contiguous words, not the raw data pointer alone. */
+                CobraTypeKind element = ast_element_kind(n) == COBRA_TYPE_UNTYPED ? COBRA_TYPE_I64 : ast_element_kind(n);
+                VarSymbol *s = ensure_list(cg, n->name, element);
+                s->owned = true;
+                emit_call(cg, v);
+                fprintf(cg->out,
+                        "    mov rdx, rax\n"
+                        "    mov rax, QWORD PTR [rdx]\n    mov QWORD PTR [rbp-%d], rax\n"
+                        "    mov rax, QWORD PTR [rdx+8]\n    mov QWORD PTR [rbp-%d], rax\n"
+                        "    mov rax, QWORD PTR [rdx+16]\n    mov QWORD PTR [rbp-%d], rax\n",
+                        s->offset, s->length_offset, s->capacity_offset);
+                return;
+            }
+            if (n->declared_type == COBRA_TYPE_DICT && v->type == AST_FUNC_CALL) {
+                VarSymbol *s = ensure_dict(cg, n->name);
+                s->owned = true;
+                emit_call(cg, v);
+                fprintf(cg->out,
+                        "    mov rdx, rax\n"
+                        "    mov rax, QWORD PTR [rdx]\n    mov QWORD PTR [rbp-%d], rax\n"
+                        "    mov rax, QWORD PTR [rdx+8]\n    mov QWORD PTR [rbp-%d], rax\n",
+                        s->offset, s->length_offset);
                 return;
             }
             if (v->type == AST_ARRAY_LITERAL) {
@@ -4324,6 +4416,10 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
                 if (has_result) emit_tensor_return(cg, n->children[0]);
             } else if (cg->current_return_type == COBRA_TYPE_STRUCT) {
                 if (has_result) emit_struct_return(cg, n->children[0]);
+            } else if (cg->current_return_type == COBRA_TYPE_LIST) {
+                if (has_result) emit_list_return(cg, n->children[0]);
+            } else if (cg->current_return_type == COBRA_TYPE_DICT) {
+                if (has_result) emit_dict_return(cg, n->children[0]);
             } else if (cg->current_return_type == COBRA_TYPE_OPTION ||
                        cg->current_return_type == COBRA_TYPE_RESULT) {
                 if (has_result) emit_sum_return(cg, n->children[0], cg->current_return_type);
@@ -4484,7 +4580,9 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
     bool tensor_return = fn->declared_type == COBRA_TYPE_TENSOR_F32;
     bool sum_return = fn->declared_type == COBRA_TYPE_OPTION || fn->declared_type == COBRA_TYPE_RESULT;
     bool struct_return = fn->declared_type == COBRA_TYPE_STRUCT;
-    bool compound_return = tensor_return || sum_return || struct_return;
+    bool list_return = fn->declared_type == COBRA_TYPE_LIST;
+    bool dict_return = fn->declared_type == COBRA_TYPE_DICT;
+    bool compound_return = tensor_return || sum_return || struct_return || list_return || dict_return;
     fprintf(cg->out, "    .intel_syntax noprefix\n");
     /* The native test runner calls test_* functions from a separate C
        translation unit. They remain externally visible only in test mode;
@@ -4521,7 +4619,7 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
                 fprintf(cg->out, "    mov rax, QWORD PTR [rbp+%d]\n    mov QWORD PTR [rbp-%d], rax\n", 16 + stack_index++ * 8, s->length_offset);
             }
         } else if (parameter_type == COBRA_TYPE_LIST) {
-            VarSymbol *s = ensure_list(cg, p->name, ast_element_kind(p));
+            VarSymbol *s = ensure_list_named(cg, p->name, ast_element_kind(p), ast_payload_name(p));
             int slots = abi_slots_for(parameter_type, p);
             if (gpr + slots <= 6) {
                 fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", COBRA_ARG_SAVE_BASE + gpr * 8, s->offset);

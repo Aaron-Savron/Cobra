@@ -1,0 +1,36 @@
+def build() -> list[i64]: {
+    let xs: list[i64] = []
+    append(xs, 10)
+    append(xs, 20)
+    append(xs, 30)
+    assert(len(xs) == 3)
+    return xs
+}
+
+def test_list_return_preserves_length_and_contents(): {
+    let ys: list[i64] = build()
+    assert(len(ys) == 3)
+    assert(ys[0] == 10)
+    assert(ys[1] == 20)
+    assert(ys[2] == 30)
+    return 0
+}
+
+def make_bigger() -> list[i64]: {
+    let xs: list[i64] = []
+    let i: i64 = 0
+    while i < 50: {
+        append(xs, i * 2)
+        i = i + 1
+    }
+    return xs
+}
+
+def test_list_return_survives_growth(): {
+    let zs: list[i64] = make_bigger()
+    assert(len(zs) == 50)
+    assert(zs[0] == 0)
+    assert(zs[25] == 50)
+    assert(zs[49] == 98)
+    return 0
+}

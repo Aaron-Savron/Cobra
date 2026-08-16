@@ -1188,3 +1188,25 @@ region-bound allocation can no longer be explicitly `free()`'d (the region's
 own exit now owns cleanup) -- existing example code that allocated inside a
 region and freed explicitly was updated to drop those now-redundant/invalid
 free() calls.
+
+## list[T]/dict return values (bug fix)
+
+Returning a `list[T]` or `dict[...]` from a function previously fell through
+to scalar return codegen, which only moved the data pointer into `rax` and
+silently dropped length and capacity -- the caller got a corrupted value with
+the right pointer but wrong (usually zero) length. `list[T]`/`dict` returns
+now go through the same caller-allocated sret convention already used for
+struct returns (`emit_list_return`/`emit_dict_return` in src/codegen.c write
+each field into the caller's result buffer individually, since a list/dict
+value's fields live in separate stack slots rather than one contiguous
+block like a struct). The underlying heap buffer itself was never the
+problem -- `cobra_list_append_*`'s backing storage is `realloc`-based, not
+region/stack-backed, so no dangling-pointer risk was introduced. See
+`examples/142_list_return_value.cb`.
+
+This does not fix the separate issue of mutating a `list[T]` through a
+function *parameter*: a list argument is copied field-by-field into the
+callee's own stack slots at entry, so an `append`/index-write inside the
+callee never touches the caller's copy. That is by-value parameter passing,
+not a return-path bug, and needs pass-by-reference semantics for list
+parameters to fix -- left for a dedicated pass.
