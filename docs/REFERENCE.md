@@ -587,3 +587,7 @@ An unqualified `alloc_i64(count)`/`alloc_f32(count)`/`alloc_u8(count)` call insi
 ### Pool and aligned memory contracts
 
 `pool_create(state, free_list, block_size, count)` returns the pool base or `0`. It rejects nonpositive dimensions, a free list shorter than `count`, and multiplication overflow before calling `mmap`. `pool_alloc` returns a block pointer or `0`; it validates the stored free index before using it. `pool_free` returns `0` for success and `-1` for a null, foreign, out-of-range, misaligned, or already-free pointer. Double-free detection scans the caller-owned free-index stack and adds no hidden runtime metadata. `pool_destroy` unmaps the pool, clears `base`, `block_size`, `count`, and `free_top`, and is a successful no-op when called again after destruction. If its stored state is invalid, it returns `-1` and leaves the state unchanged. `mem_aligned_alloc` accepts positive power-of-two alignments up to 4096, rejects other sizes or alignments, and returns `0` on failure; `mem_aligned_free` returns `-1` for invalid arguments. See `examples/97_memory_contracts.cb`.
+
+## Runtime fatal errors
+
+Runtime fatal errors (byte slice and buffer bounds checks, division by zero, failed `assert`, region capacity and creation failures, string index and predicate bounds) print the source `file:line` of the failing operation ahead of the message, e.g. `[cobra] path/to/file.cb:12: byte slice bounds error`, matching compile-time diagnostics. See `examples/142_runtime_error_location.cb`.

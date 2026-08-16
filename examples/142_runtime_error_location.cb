@@ -1,0 +1,12 @@
+# Runtime fatal errors (bounds checks, division by zero, assertions, region
+# failures) now report the source file:line of the failing operation, the
+# same way compile-time diagnostics already do.
+
+def test_bounds_error_ok_path(): {
+    owner = alloc_u8(4)
+    let view: []u8 = slice_u8(owner, 0, 4)
+    assert(view[0] == 0)
+    free(view)
+    free(owner)
+    return 0
+}

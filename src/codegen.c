@@ -392,6 +392,7 @@ static int reserve(CodeGen *cg, int bytes);
 static void emit_expr(CodeGen *cg, ASTNode *node);
 static void emit_call(CodeGen *cg, ASTNode *node);
 static void emit_failure(CodeGen *cg, const char *message);
+static void emit_failure_at(CodeGen *cg, ASTNode *node, const char *message);
 static int current_iter(CodeGen *cg, const char *name);
 static void emit_load_buffer_ptr(CodeGen *cg, const char *name, const char *reg);
 
@@ -1026,6 +1027,7 @@ static bool is_region_alloc(CodeGen *cg, ASTNode *n) {
 }
 
 static void emit_failure(CodeGen *cg, const char *message);
+static void emit_failure_at(CodeGen *cg, ASTNode *node, const char *message);
 
 /* scratch.alloc_i64(n), scratch.alloc_f32(n), and scratch.alloc_u8(n) bump storage out of the
    region and return the pointer+length pair in rax/rdx. A zero
@@ -1063,6 +1065,7 @@ static void emit_expr(CodeGen *cg, ASTNode *node);
 static void emit_statement(CodeGen *cg, ASTNode *node);
 static void emit_call(CodeGen *cg, ASTNode *node);
 static void emit_failure(CodeGen *cg, const char *message);
+static void emit_failure_at(CodeGen *cg, ASTNode *node, const char *message);
 
 static void emit_string_literal(CodeGen *cg, const char *value) {
     int id = cg->string_count++;
@@ -1137,7 +1140,7 @@ static void emit_string_char_at(CodeGen *cg, ASTNode *n) {
     emit_expr(cg, n->children[0]); fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", text);
     emit_expr(cg, n->children[1]); fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n    cmp rax, 0\n    jl .Lstr_char_fail_%d\n", index, fail);
     fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    call strlen@PLT\n    mov QWORD PTR [rbp-%d], rax\n    cmp QWORD PTR [rbp-%d], rax\n    jae .Lstr_char_fail_%d\n    mov rax, QWORD PTR [rbp-%d]\n    mov rdx, QWORD PTR [rbp-%d]\n    movzx eax, BYTE PTR [rax + rdx]\n    jmp .Lstr_char_done_%d\n.Lstr_char_fail_%d:\n", text, length, index, fail, text, index, fail, fail);
-    emit_failure(cg, "string index out of bounds");
+    emit_failure_at(cg, n, "string index out of bounds");
     fprintf(cg->out, ".Lstr_char_done_%d:\n", fail);
 }
 
@@ -1158,6 +1161,19 @@ static void emit_failure(CodeGen *cg, const char *message) {
     fputc(10, cg->out);
     fputs("    .text", cg->out);
     fputc(10, cg->out);
+}
+
+/* Same as emit_failure, but prefixes the message with the source location of
+   node, so a runtime fatal error points at the offending line the way a
+   compile-time diagnostic already does. */
+static void emit_failure_at(CodeGen *cg, ASTNode *node, const char *message) {
+    if (!node || !node->source_file[0] || node->source_line <= 0) {
+        emit_failure(cg, message);
+        return;
+    }
+    char buf[COBRA_MAX_SOURCE_PATH + 256];
+    snprintf(buf, sizeof(buf), "%s:%d: %s", node->source_file, node->source_line, message);
+    emit_failure(cg, buf);
 }
 
 static void emit_float_literal(CodeGen *cg, float value) {
@@ -1242,7 +1258,7 @@ static void emit_struct_field_index_read(CodeGen *cg, ASTNode *node) {
             index, index, fail);
     fprintf(cg->out, "    lea rbx, [rbp-%d]\n    mov rcx, QWORD PTR [rbx + %d]\n    cmp rax, rcx\n    jae .Lstruct_view_index_fail_%d\n    mov rbx, QWORD PTR [rbx + %d]\n    movzx eax, BYTE PTR [rbx + rax]\n    jmp .Lstruct_view_index_done_%d\n.Lstruct_view_index_fail_%d:\n",
             s->array_base, offset + 8, fail, offset, fail, fail);
-    emit_failure(cg, "byte-view index out of bounds");
+    emit_failure_at(cg, node, "byte-view index out of bounds");
     fprintf(cg->out, ".Lstruct_view_index_done_%d:\n", fail);
 }
 
@@ -1282,7 +1298,7 @@ static void emit_index_read(CodeGen *cg, const char *name, ASTNode **indices, si
         fprintf(cg->out, "    movss xmm0, DWORD PTR [rbx + rdx*4]\n");
     else fprintf(cg->out, "    mov rax, QWORD PTR [rbx + rdx*8]\n");
     fprintf(cg->out, "    jmp .Lidx_done_%d\n.Lidx_fail_%d:\n", fail, fail);
-    emit_failure(cg, "buffer index out of bounds");
+    emit_failure_at(cg, count > 0 ? indices[0] : NULL, "buffer index out of bounds");
     fprintf(cg->out, ".Lidx_done_%d:\n", fail);
 }
 
@@ -1304,7 +1320,7 @@ static void emit_struct_field_index_store(CodeGen *cg, ASTNode *node, ASTNode *v
     fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n    lea rbx, [rbp-%d]\n    mov rcx, QWORD PTR [rbx + %d]\n    cmp QWORD PTR [rbp-%d], 0\n    jl .Lstruct_view_store_fail_%d\n    cmp QWORD PTR [rbp-%d], rcx\n    jae .Lstruct_view_store_fail_%d\n    mov rbx, QWORD PTR [rbx + %d]\n    mov rax, QWORD PTR [rbp-%d]\n    mov rcx, QWORD PTR [rbp-%d]\n    mov BYTE PTR [rbx + rax], cl\n    jmp .Lstruct_view_store_done_%d\n.Lstruct_view_store_fail_%d:\n",
             index, s->array_base, offset + 8, index, fail, index, fail,
             offset, index, stored, fail, fail);
-    emit_failure(cg, "byte-view index out of bounds");
+    emit_failure_at(cg, node, "byte-view index out of bounds");
     fprintf(cg->out, ".Lstruct_view_store_done_%d:\n", fail);
 }
 
@@ -1344,7 +1360,7 @@ static void emit_index_store(CodeGen *cg, const char *name, ASTNode **indices, s
         fprintf(cg->out, "    movss DWORD PTR [rbx + rdx*4], xmm0\n");
     } else fprintf(cg->out, "    mov QWORD PTR [rbx + rdx*8], rax\n");
     fprintf(cg->out, "    jmp .Lstore_done_%d\n.Lstore_fail_%d:\n", fail, fail);
-    emit_failure(cg, "buffer index out of bounds");
+    emit_failure_at(cg, count > 0 ? indices[0] : value, "buffer index out of bounds");
     fprintf(cg->out, ".Lstore_done_%d:\n", fail);
 }
 
@@ -1667,7 +1683,7 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
                 if (!strcmp(node->name, "+")) fprintf(cg->out, "    add rax, rbx\n"); else if (!strcmp(node->name, "-")) fprintf(cg->out, "    sub rax, rbx\n"); else if (!strcmp(node->name, "*")) fprintf(cg->out, "    imul rax, rbx\n"); else if (!strcmp(node->name, "/")) {
                     int fail = cg->label_count++;
                     fprintf(cg->out, "    cmp rbx, 0\n    je .Ldiv_zero_%d\n    cqo\n    idiv rbx\n    jmp .Ldiv_done_%d\n.Ldiv_zero_%d:\n", fail, fail, fail);
-                    emit_failure(cg, "division by zero");
+                    emit_failure_at(cg, node, "division by zero");
                     fprintf(cg->out, ".Ldiv_done_%d:\n", fail);
                 } else { fprintf(cg->out, "    cmp rax, rbx\n"); const char *set = !strcmp(node->name, "==") ? "sete" : !strcmp(node->name, "!=") ? "setne" : !strcmp(node->name, "<") ? "setl" : !strcmp(node->name, ">") ? "setg" : !strcmp(node->name, "<=") ? "setle" : "setge"; fprintf(cg->out, "    %s al\n    movzx eax, al\n", set); }
                 fprintf(cg->out, "    pop rbx\n");
@@ -4117,7 +4133,7 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
                 fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    cmp rax, QWORD PTR [rbp-%d]\n    ja .Lslice_u8_fail_%d\n", start, source_len, fail);
                 fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n    sub rdx, rax\n    cmp QWORD PTR [rbp-%d], rdx\n    ja .Lslice_u8_fail_%d\n", source_len, length, fail);
                 fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    add rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n    jmp .Lslice_u8_done_%d\n.Lslice_u8_fail_%d:\n", source_ptr, start, s->offset, length, s->length_offset, fail, fail);
-                emit_failure(cg, "byte slice bounds error");
+                emit_failure_at(cg, v, "byte slice bounds error");
                 fprintf(cg->out, ".Lslice_u8_done_%d:\n", fail);
                 return;
             }
@@ -4321,7 +4337,7 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
                 fprintf(cg->out, "    pxor xmm1, xmm1\n    ucomiss xmm0, xmm1\n    setne al\n    movzx eax, al\n");
             }
             fprintf(cg->out, "    cmp rax, 0\n    jne .Lassert_ok_%d\n", ok);
-            emit_failure(cg, "assertion failed");
+            emit_failure_at(cg, n, "assertion failed");
             fprintf(cg->out, ".Lassert_ok_%d:\n", ok);
             return;
         }
@@ -4396,9 +4412,9 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             /* Exactly one release at scope exit. */
             fprintf(cg->out, "    lea rdi, [rbp-%d]\n    call arena_destroy@PLT\n    jmp .Lreg_done_%d\n", r->state_base, done);
             fprintf(cg->out, ".Lreg_neg_%d:\n", fail_neg);
-            emit_failure(cg, "region capacity must be non-negative");
+            emit_failure_at(cg, n, "region capacity must be non-negative");
             fprintf(cg->out, ".Lreg_oom_%d:\n", fail_oom);
-            emit_failure(cg, "region creation failed");
+            emit_failure_at(cg, n, "region creation failed");
             fprintf(cg->out, ".Lreg_done_%d:\n", done);
             cg->region_depth--;
             return;
