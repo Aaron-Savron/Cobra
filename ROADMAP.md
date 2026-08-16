@@ -680,6 +680,19 @@ Finish the language contracts for:
   bounds (`def f[T: Shape](x: T)`), default trait methods, supertraits, and
   multiple impls of the same trait for the same type (last registration
   wins silently - not yet diagnosed).
+- [x] Static vtables for dyn Trait dispatch. The dispatch block is now a
+  fixed 2 words (`data_ptr`, `vtable_ptr`) instead of `method_count + 1`
+  words filled in with per-call mov instructions - the method-pointer
+  portion is emitted once per (Trait,ConcreteType) pairing as a `.rodata`
+  array (`emit_dyn_vtable_label`, src/codegen.c) and shared by every
+  dispatch block built for that pairing, since method addresses never vary
+  per instance. The remaining malloc per coercion is a fixed 16 bytes
+  regardless of trait size; still heap-allocated and never freed, matching
+  the existing no-automatic-drop convention. Eliminating that last malloc
+  entirely would require widening the dyn Trait value from one pointer to
+  a 16-byte {data_ptr, vtable_ptr} pair passed by value, touching every
+  storage/parameter/return site that assumes a single 8-byte slot -
+  deferred as a separate, larger ABI change.
 - Recursion
 - Casts and explicit conversions
 - Constant evaluation

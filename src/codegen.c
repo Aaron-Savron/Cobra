@@ -155,6 +155,13 @@ typedef struct {
        automatically at scope exit; see compute_safe_autofree_structs. */
     char safe_autofree_structs[64][COBRA_MAX_IDENT_LEN];
     int safe_autofree_count;
+    /* One static .rodata method-pointer array per (Trait,ConcreteType) pair
+       actually coerced to dyn Trait, keyed "<Trait>|<Type>". Emitted once on
+       first use (see emit_dyn_vtable_label) so every dispatch block for that
+       pairing shares the same vtable instead of writing method pointers with
+       per-call mov instructions into a freshly malloc'd block. */
+    char dyn_vtables_emitted[128][COBRA_MAX_IDENT_LEN * 2];
+    int dyn_vtable_count;
 } CodeGen;
 
 static const char *SYSV_REGS[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
@@ -2427,10 +2434,43 @@ static ASTNode *find_trait_decl(CodeGen *cg, const char *trait_name) {
    block is the coercion step (struct value -> dyn Trait); reading it back
    is emit_dyn_dispatch_call below. ir.c's cobra_ir_build already verified
    the concrete type implements every trait method before codegen runs. */
+/* Emit (once per program) a static .rodata method-pointer array for one
+   (Trait,ConcreteType) pairing and write its label into `label_out`. Every
+   dispatch block for that pairing points its second word at this same
+   array instead of a per-call malloc'd copy of the method pointers - the
+   method pointers never vary across instances of the same concrete type,
+   so there is nothing per-instance to allocate for them. */
+static void emit_dyn_vtable_label(CodeGen *cg, const char *trait_name, ASTNode *trait_decl,
+                                   const char *type_name, char *label_out, size_t label_out_size) {
+    snprintf(label_out, label_out_size, ".Ldyn_vtable_%.31s_%.31s", trait_name, type_name);
+    char key[COBRA_MAX_IDENT_LEN * 2];
+    snprintf(key, sizeof(key), "%.63s|%.63s", trait_name, type_name);
+    for (int i = 0; i < cg->dyn_vtable_count; i++) {
+        if (!strcmp(cg->dyn_vtables_emitted[i], key)) return;
+    }
+    if (cg->dyn_vtable_count < 128) {
+        snprintf(cg->dyn_vtables_emitted[cg->dyn_vtable_count++], sizeof(cg->dyn_vtables_emitted[0]), "%s", key);
+    }
+    fprintf(cg->out, "    .section .rodata\n    .align 8\n%s:\n", label_out);
+    for (size_t m = 0; m < trait_decl->child_count; m++) {
+        fprintf(cg->out, "    .quad __impl_%.31s_%.31s_%.31s\n",
+                trait_name, type_name, trait_decl->children[m]->name);
+    }
+    fprintf(cg->out, "    .text\n");
+}
+
 /* Build a `dyn TraitName` dispatch block for the struct value held by `s`
    and store the resulting pointer at dest_slot. Mirrors the block
    construction inside emit_dyn_trait_call's per-argument loop, factored out
    so `let x: dyn Trait = value` and `return` can build the same block.
+
+   The block is always exactly 2 words: word 0 is the data pointer, word 1
+   is the address of the static per-(Trait,Type) vtable from
+   emit_dyn_vtable_label. This replaces the previous (method_count+1)-word
+   block whose method-pointer slots were filled in with per-call mov
+   instructions - the vtable portion is now zero-allocation and shared
+   across every dispatch-block construction for the same pairing, so the
+   remaining malloc is a fixed 16 bytes regardless of trait size.
 
    heap_copy_data must be true whenever the dispatch block's data_ptr can
    outlive the struct's current stack frame - concretely, a `-> dyn Trait`
@@ -2447,9 +2487,9 @@ static void emit_build_dyn_dispatch_block_ex(CodeGen *cg, const char *trait_name
         fprintf(stderr, "CodeGen Error: unknown trait '%s'\n", trait_name);
         exit(EXIT_FAILURE);
     }
-    size_t method_count = trait_decl->child_count;
-    fprintf(cg->out, "    mov rdi, %d\n    call malloc@PLT\n    mov QWORD PTR [rbp-%d], rax\n",
-            (int)(method_count + 1) * 8, dest_slot);
+    char vtable_label[80];
+    emit_dyn_vtable_label(cg, trait_name, trait_decl, s->type_name, vtable_label, sizeof(vtable_label));
+    fprintf(cg->out, "    mov rdi, 16\n    call malloc@PLT\n    mov QWORD PTR [rbp-%d], rax\n", dest_slot);
     if (heap_copy_data) {
         int struct_size = struct_storage_size(cg, s->type_name);
         fprintf(cg->out, "    mov rdi, %d\n    call malloc@PLT\n    mov rbx, rax\n", struct_size);
@@ -2459,13 +2499,8 @@ static void emit_build_dyn_dispatch_block_ex(CodeGen *cg, const char *trait_name
         fprintf(cg->out, "    lea rbx, [rbp-%d]\n", s->array_base);
     }
     fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rcx], rbx\n", dest_slot);
-    for (size_t m = 0; m < method_count; m++) {
-        char mangled[COBRA_MAX_IDENT_LEN];
-        snprintf(mangled, sizeof(mangled), "__impl_%.31s_%.31s_%.31s",
-                 trait_name, s->type_name, trait_decl->children[m]->name);
-        fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    lea rax, [rip+%s]\n    mov QWORD PTR [rcx+%d], rax\n",
-                dest_slot, mangled, (int)(8 * (1 + m)));
-    }
+    fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    lea rax, [rip+%s]\n    mov QWORD PTR [rcx+8], rax\n",
+            dest_slot, vtable_label);
 }
 
 static void emit_build_dyn_dispatch_block(CodeGen *cg, const char *trait_name,
@@ -2496,18 +2531,13 @@ static void emit_dyn_trait_call(CodeGen *cg, ASTNode *n, ASTNode *fn) {
                 fprintf(stderr, "CodeGen Error: unknown trait '%s'\n", param->dyn_trait_name);
                 exit(EXIT_FAILURE);
             }
-            size_t method_count = trait_decl->child_count;
-            fprintf(cg->out, "    mov rdi, %d\n    call malloc@PLT\n    mov QWORD PTR [rbp-%d], rax\n",
-                    (int)(method_count + 1) * 8, slot);
+            char vtable_label[80];
+            emit_dyn_vtable_label(cg, param->dyn_trait_name, trait_decl, s->type_name, vtable_label, sizeof(vtable_label));
+            fprintf(cg->out, "    mov rdi, 16\n    call malloc@PLT\n    mov QWORD PTR [rbp-%d], rax\n", slot);
             fprintf(cg->out, "    lea rbx, [rbp-%d]\n    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rcx], rbx\n",
                     s->array_base, slot);
-            for (size_t m = 0; m < method_count; m++) {
-                char mangled[COBRA_MAX_IDENT_LEN];
-                snprintf(mangled, sizeof(mangled), "__impl_%.31s_%.31s_%.31s",
-                         param->dyn_trait_name, s->type_name, trait_decl->children[m]->name);
-                fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    lea rax, [rip+%s]\n    mov QWORD PTR [rcx+%d], rax\n",
-                        slot, mangled, (int)(8 * (1 + m)));
-            }
+            fprintf(cg->out, "    mov rcx, QWORD PTR [rbp-%d]\n    lea rax, [rip+%s]\n    mov QWORD PTR [rcx+8], rax\n",
+                    slot, vtable_label);
         } else if (expression_is_float_codegen(cg, arg)) {
             emit_expr(cg, arg);
             fprintf(cg->out, "    movss DWORD PTR [rbp-%d], xmm0\n", slot);
@@ -2564,8 +2594,8 @@ static void emit_dyn_dispatch_call(CodeGen *cg, ASTNode *n, VarSymbol *recv) {
         int slot = arg_slot + (int)i * 8;
         fprintf(cg->out, "    mov %s, QWORD PTR [rbp-%d]\n", param_reg(cg, (int)(i + 1)), slot);
     }
-    fprintf(cg->out, "    mov r11, QWORD PTR [rbp-%d]\n    mov r10, QWORD PTR [r11+%d]\n    xor eax, eax\n    call r10\n",
-            block_slot, (int)(8 * (1 + method_index)));
+    fprintf(cg->out, "    mov r11, QWORD PTR [rbp-%d]\n    mov r10, QWORD PTR [r11+8]\n    mov r10, QWORD PTR [r10+%d]\n    xor eax, eax\n    call r10\n",
+            block_slot, (int)(8 * method_index));
 }
 
 static void emit_call(CodeGen *cg, ASTNode *n) {
