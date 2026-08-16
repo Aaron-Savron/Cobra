@@ -1585,6 +1585,17 @@ static bool direct_struct_field_supported_kind(const CobraType *type, CobraOwner
         if (nested) return owned_value;
         return borrowed_view || owned_value;
     }
+    if (type->kind == COBRA_TYPE_LIST) {
+        /* A list[T] field stores one 8-byte pointer to a heap-boxed
+           {data, length, capacity} header (see the COBRA_TYPE_LIST case in
+           direct_struct_field_supported_kind's codegen counterpart,
+           emit_struct_field_list_box_address). Same ownership rule as an
+           owned string/slice field: only a plain owned value, byte-copied
+           (shallow - both structs then share the same box) on struct
+           assignment. */
+        return ownership == COBRA_OWNERSHIP_OWNED && mutability == COBRA_MUTABILITY_DEFAULT &&
+               region_id == -1;
+    }
     if (type->kind != COBRA_TYPE_STRUCT) return false;
     for (size_t i = 0; i < type->field_count; i++) {
         const CobraTypeField *field = &type->fields[i];
@@ -2184,8 +2195,8 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                             break;
                         }
                     }
-                    if (base_type != COBRA_TYPE_SLICE_U8)
-                        ir_error(ctx, node, "only readonly or out []u8 struct fields are indexable");
+                    if (base_type != COBRA_TYPE_SLICE_U8 && base_type != COBRA_TYPE_LIST)
+                        ir_error(ctx, node, "only readonly or out []u8 struct fields, or list[T] struct fields, are indexable");
                 }
             } else if (!find_local(ctx, node->name, &base_type)) {
                 char message[160];
@@ -2231,8 +2242,16 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                     ir_error(ctx, node, "flat tensor access requires rank-1 or rank-2 storage");
                 }
             }
-            IRLocal *indexed_local = find_local_entry(ctx, node->name);
-            CobraTypeKind indexed_element = indexed_local ? indexed_local->element_type : COBRA_TYPE_UNTYPED;
+            CobraTypeKind indexed_element = COBRA_TYPE_UNTYPED;
+            if (node->secondary_name[0] != '\0' && base_type == COBRA_TYPE_LIST) {
+                IRLocal *owner = find_local_entry(ctx, node->name);
+                const CobraType *field_type = owner ? canonical_field_value(ctx, owner->type_name, node->secondary_name) : NULL;
+                const CobraType *element = field_type ? cobra_type_element(field_type) : NULL;
+                indexed_element = element ? element->kind : COBRA_TYPE_UNTYPED;
+            } else {
+                IRLocal *indexed_local = find_local_entry(ctx, node->name);
+                indexed_element = indexed_local ? indexed_local->element_type : COBRA_TYPE_UNTYPED;
+            }
             node->value_type = (base_type == COBRA_TYPE_DICT) ? COBRA_TYPE_I64 :
                                (is_f32_buffer_type(base_type) || indexed_element == COBRA_TYPE_F32 ? COBRA_TYPE_F32 :
                                 (indexed_element != COBRA_TYPE_UNTYPED ? indexed_element : COBRA_TYPE_I64));
@@ -2259,9 +2278,10 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                     }
                     if (base_type != COBRA_TYPE_SLICE &&
                         base_type != COBRA_TYPE_SLICE_F32 &&
-                        base_type != COBRA_TYPE_SLICE_U8)
-                        ir_error(ctx, node, "only slice struct fields are writable by index");
-                    if (field_qualifier != 2)
+                        base_type != COBRA_TYPE_SLICE_U8 &&
+                        base_type != COBRA_TYPE_LIST)
+                        ir_error(ctx, node, "only slice or list[T] struct fields are writable by index");
+                    if (base_type != COBRA_TYPE_LIST && field_qualifier != 2)
                         ir_error(ctx, node, "cannot write readonly borrowed slice field");
                 }
             } else if (!find_local(ctx, node->name, &base_type) ||
@@ -3756,9 +3776,10 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                     }
                     if (base_type != COBRA_TYPE_SLICE &&
                         base_type != COBRA_TYPE_SLICE_F32 &&
-                        base_type != COBRA_TYPE_SLICE_U8)
-                        ir_error(ctx, node, "only slice struct fields are writable by index");
-                    if (field_qualifier != 2)
+                        base_type != COBRA_TYPE_SLICE_U8 &&
+                        base_type != COBRA_TYPE_LIST)
+                        ir_error(ctx, node, "only slice or list[T] struct fields are writable by index");
+                    if (base_type != COBRA_TYPE_LIST && field_qualifier != 2)
                         ir_error(ctx, node, "cannot write readonly borrowed slice field");
                 }
             } else if (!find_local(ctx, node->name, &base_type) ||
@@ -4469,6 +4490,46 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
                 ir_error(&root_context, impl, message);
                 ir->error_count++;
             }
+        }
+
+        /* Supertrait chain: a type implementing Name must also satisfy every
+           method of Name's declared supertrait (trait_node->secondary_name),
+           recursively. Satisfaction is checked against ANY impl block for
+           this same implementing type (find_impl_method's own lookup is
+           already type-scoped, not impl-block-scoped - a separate
+           `impl Shape for Circle` block is the natural way to provide it),
+           not just this specific impl's own children. Bounded depth guards
+           against a cyclic supertrait chain looping forever. */
+        const char *super_name = trait->secondary_name;
+        int chain_depth = 0;
+        while (super_name[0] && chain_depth++ < 8) {
+            ASTNode *super_trait = NULL;
+            for (size_t j = 0; j < root->child_count; j++) {
+                if (root->children[j]->type == AST_TRAIT_DECL && strcmp(root->children[j]->name, super_name) == 0) {
+                    super_trait = root->children[j];
+                    break;
+                }
+            }
+            if (!super_trait) {
+                char message[280];
+                snprintf(message, sizeof(message), "trait '%.63s' declares unknown supertrait '%.63s'",
+                         trait->name, super_name);
+                ir_error(&root_context, impl, message);
+                ir->error_count++;
+                break;
+            }
+            for (size_t m = 0; m < super_trait->child_count; m++) {
+                const char *required = super_trait->children[m]->name;
+                if (!find_impl_method(&root_context, impl->secondary_name, required)) {
+                    char message[400];
+                    snprintf(message, sizeof(message),
+                             "'%.63s' implements '%.63s' but is missing supertrait '%.63s' method '%.63s'",
+                             impl->secondary_name, trait->name, super_trait->name, required);
+                    ir_error(&root_context, impl, message);
+                    ir->error_count++;
+                }
+            }
+            super_name = super_trait->secondary_name;
         }
     }
 

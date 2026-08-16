@@ -1305,6 +1305,140 @@ static void emit_load_buffer_len(CodeGen *cg, const char *name, const char *reg)
     else fprintf(cg->out, "    mov %s, QWORD PTR [rbp-%d]\n", reg, s->length_offset);
 }
 
+/* A list[T] struct field stores one 8-byte pointer to a heap-boxed
+   {data, length, capacity} header (24 bytes) - the canonical layer already
+   models list[T] as a single COBRA_ABI_REFERENCE word (src/type.c), so the
+   field itself is just that pointer. Materializing the field into a fresh
+   synthetic list symbol, seeded from the box, reuses every existing list
+   codegen path (append/index/len) completely unchanged - the same
+   seed-then-writeback shape list/dict reference parameters already use
+   (see emit_list_dict_ref_writeback), just performed per field access
+   instead of once per call. Returns the synthetic symbol; *out_field_addr
+   receives the stack slot holding the field's own address (where the box
+   pointer lives), needed by callers that must write a new/grown box
+   pointer back after a mutating operation. */
+static CobraTypeKind struct_field_kind(CodeGen *cg, const char *type_name, const char *field_name) {
+    if (!cg->root || !cg->root->canonical_arena || !type_name || !field_name) return COBRA_TYPE_UNKNOWN;
+    const CobraType *st = cobra_type_struct_layout(cg->root->canonical_arena, cg->root, type_name);
+    if (!st) return COBRA_TYPE_UNKNOWN;
+    for (size_t i = 0; i < st->field_count; i++)
+        if (!strcmp(st->fields[i].name, field_name)) return st->fields[i].type->kind;
+    return COBRA_TYPE_UNKNOWN;
+}
+
+static CobraTypeKind struct_field_list_element_kind(CodeGen *cg, const char *type_name, const char *field_name,
+                                                     char *out_type_name, size_t out_type_name_size) {
+    if (!cg->root || !cg->root->canonical_arena || !type_name || !field_name) return COBRA_TYPE_UNTYPED;
+    const CobraType *st = cobra_type_struct_layout(cg->root->canonical_arena, cg->root, type_name);
+    if (!st) return COBRA_TYPE_UNTYPED;
+    for (size_t i = 0; i < st->field_count; i++) {
+        if (strcmp(st->fields[i].name, field_name)) continue;
+        const CobraType *element = cobra_type_element(st->fields[i].type);
+        if (!element) return COBRA_TYPE_UNTYPED;
+        if (element->kind == COBRA_TYPE_STRUCT && element->name[0] && out_type_name)
+            snprintf(out_type_name, out_type_name_size, "%.63s", element->name);
+        return element->kind;
+    }
+    return COBRA_TYPE_UNTYPED;
+}
+
+/* Shared core once the field's address is in rax and its element type is
+   known: allocates the synthetic local list symbol and seeds it from the
+   box. Two thin wrappers below compute the address/element-type inputs
+   differently for the two AST shapes list-field access can take
+   (AST_MEMBER_ACCESS for append/len targets, the name+secondary_name shape
+   AST_ARRAY_INDEX/AST_INDEX_ASSIGN use for `s.field[i]`). */
+static VarSymbol *materialize_list_field_core(CodeGen *cg, CobraTypeKind element_type, const char *element_type_name,
+                                               int *out_field_addr) {
+    int field_addr = reserve(cg, 8);
+    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", field_addr);
+    char synthetic_name[COBRA_MAX_IDENT_LEN];
+    snprintf(synthetic_name, sizeof(synthetic_name), "__list_field_%d", cg->label_count++);
+    VarSymbol *s = new_symbol(cg, synthetic_name);
+    s->kind = SYM_LIST;
+    s->type = COBRA_TYPE_LIST;
+    s->element_type = element_type;
+    if (element_type == COBRA_TYPE_STRUCT && element_type_name && element_type_name[0])
+        snprintf(s->type_name, sizeof(s->type_name), "%.63s", element_type_name);
+    s->offset = reserve(cg, 8);
+    s->length_offset = reserve(cg, 8);
+    s->capacity_offset = reserve(cg, 8);
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov rax, QWORD PTR [rax]\n", field_addr);
+    fprintf(cg->out,
+            "    mov rcx, QWORD PTR [rax]\n    mov QWORD PTR [rbp-%d], rcx\n"
+            "    mov rcx, QWORD PTR [rax+8]\n    mov QWORD PTR [rbp-%d], rcx\n"
+            "    mov rcx, QWORD PTR [rax+16]\n    mov QWORD PTR [rbp-%d], rcx\n",
+            s->offset, s->length_offset, s->capacity_offset);
+    if (out_field_addr) *out_field_addr = field_addr;
+    return s;
+}
+
+/* A list[T] struct field stores one 8-byte pointer to a heap-boxed
+   {data, length, capacity} header (24 bytes) - the canonical layer already
+   models list[T] as a single COBRA_ABI_REFERENCE word (src/type.c), so the
+   field itself is just that pointer. Materializing the field into a fresh
+   synthetic list symbol, seeded from the box, reuses every existing list
+   codegen path (append/index/len) completely unchanged - the same
+   seed-then-writeback shape list/dict reference parameters already use
+   (see emit_list_dict_ref_writeback), just performed per field access
+   instead of once per call. Returns the synthetic symbol; *out_field_addr
+   receives the stack slot holding the field's own address (where the box
+   pointer lives), needed by callers that must write a new/grown box
+   pointer back after a mutating operation. */
+static VarSymbol *materialize_list_field(CodeGen *cg, ASTNode *member, int *out_field_addr) {
+    if (!member || member->child_count == 0) {
+        fprintf(stderr, "CodeGen Error: list field access requires a struct value\n");
+        exit(EXIT_FAILURE);
+    }
+    emit_struct_address(cg, member->children[0]);
+    int offset = field_offset_for(cg, ast_payload_name(member->children[0]), member->secondary_name);
+    fprintf(cg->out, "    add rax, %d\n", offset);
+    CobraTypeKind element_type = ast_element_kind(member);
+    const char *type_name = element_type == COBRA_TYPE_STRUCT ? ast_payload_name(member) : NULL;
+    return materialize_list_field_core(cg, element_type, type_name, out_field_addr);
+}
+
+/* Same as materialize_list_field but for the name+secondary_name AST shape
+   AST_ARRAY_INDEX/AST_INDEX_ASSIGN use for `s.field[i]` (base is always a
+   plain struct-local identifier for this node shape, not a general
+   expression). */
+static VarSymbol *materialize_list_field_by_name(CodeGen *cg, const char *base_name, const char *field_name,
+                                                  int *out_field_addr) {
+    VarSymbol *owner = find_symbol(cg, base_name);
+    if (!owner || owner->kind != SYM_STRUCT) {
+        fprintf(stderr, "CodeGen Error: '%s' is not a struct value\n", base_name ? base_name : "<null>");
+        exit(EXIT_FAILURE);
+    }
+    if (owner->indirect) fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n", owner->array_base);
+    else fprintf(cg->out, "    lea rax, [rbp-%d]\n", owner->array_base);
+    int offset = field_offset_for(cg, owner->type_name, field_name);
+    fprintf(cg->out, "    add rax, %d\n", offset);
+    char type_name[COBRA_MAX_IDENT_LEN] = {0};
+    CobraTypeKind element_type = struct_field_list_element_kind(cg, owner->type_name, field_name,
+                                                                 type_name, sizeof(type_name));
+    return materialize_list_field_core(cg, element_type, type_name, out_field_addr);
+}
+
+/* Writes a (possibly-grown, possibly-freshly-boxed) list's descriptor back
+   into its owning struct field's box. field_addr holds the address of the
+   field itself (where the box pointer lives); box_ptr_slot, if >= 0, holds
+   an already-loaded box pointer to reuse instead of re-dereferencing
+   field_addr (used when the box was freshly allocated in this same
+   sequence and the field hasn't been updated to point at it yet). */
+static void emit_list_field_writeback(CodeGen *cg, VarSymbol *s, int field_addr) {
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov rax, QWORD PTR [rax]\n", field_addr);
+    fprintf(cg->out,
+            "    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rax], rcx\n"
+            "    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rax+8], rcx\n"
+            "    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rax+16], rcx\n",
+            s->offset, s->length_offset, s->capacity_offset);
+}
+
+static bool is_list_field_access(ASTNode *node) {
+    return node && node->type == AST_MEMBER_ACCESS && ast_element_kind(node) != COBRA_TYPE_UNTYPED &&
+           node->value_type == COBRA_TYPE_LIST;
+}
+
 static void emit_list_append(CodeGen *cg, VarSymbol *s, ASTNode *value) {
     int temp = reserve(cg, 8);
     emit_expr(cg, value);
@@ -1346,6 +1480,9 @@ static void emit_dict_set(CodeGen *cg, VarSymbol *s, ASTNode *key, ASTNode *valu
     fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n    lea rdi, [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    mov rdx, QWORD PTR [rbp-%d]\n    call cobra_dict_set_i64@PLT\n    mov rdi, QWORD PTR [rbp-%d]\n    call cobra_dict_len@PLT\n    mov QWORD PTR [rbp-%d], rax\n", value_temp, s->offset, key_temp, value_temp, s->offset, s->length_offset);
 }
 
+static void emit_index_read(CodeGen *cg, const char *name, ASTNode **indices, size_t count);
+static void emit_index_store(CodeGen *cg, const char *name, ASTNode **indices, size_t count, ASTNode *value);
+
 static void emit_struct_field_index_read(CodeGen *cg, ASTNode *node) {
     if (!node || node->child_count != 1) {
         fprintf(stderr, "CodeGen Error: struct byte-view indexing requires one index\n");
@@ -1355,6 +1492,11 @@ static void emit_struct_field_index_read(CodeGen *cg, ASTNode *node) {
     if (!s || s->kind != SYM_STRUCT) {
         fprintf(stderr, "CodeGen Error: '%s' is not a struct value\n", node ? node->name : "<null>");
         exit(EXIT_FAILURE);
+    }
+    if (struct_field_kind(cg, s->type_name, node->secondary_name) == COBRA_TYPE_LIST) {
+        VarSymbol *field_list = materialize_list_field_by_name(cg, node->name, node->secondary_name, NULL);
+        emit_index_read(cg, field_list->name, node->children, node->child_count);
+        return;
     }
     int index = reserve(cg, 8), fail = cg->label_count++;
     int offset = field_offset_for(cg, s->type_name, node->secondary_name);
@@ -1416,6 +1558,15 @@ static void emit_struct_field_index_store(CodeGen *cg, ASTNode *node, ASTNode *v
     if (!s || s->kind != SYM_STRUCT) {
         fprintf(stderr, "CodeGen Error: '%s' is not a struct value\n", node ? node->name : "<null>");
         exit(EXIT_FAILURE);
+    }
+    if (struct_field_kind(cg, s->type_name, node->secondary_name) == COBRA_TYPE_LIST) {
+        /* Index-write only stores through the already-boxed data pointer -
+           it never reallocates (that's append's job), so no writeback of
+           the box's own 3 words is needed after seeding the synthetic
+           symbol from it. */
+        VarSymbol *field_list = materialize_list_field_by_name(cg, node->name, node->secondary_name, NULL);
+        emit_index_store(cg, field_list->name, node->children, 1, value);
+        return;
     }
     int index = reserve(cg, 8), stored = reserve(cg, 8), fail = cg->label_count++;
     int offset = field_offset_for(cg, s->type_name, node->secondary_name);
@@ -1755,6 +1906,10 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
                       a->value_type == COBRA_TYPE_SLICE_U8)) {
                 emit_expr(cg, a);
                 fprintf(cg->out, "    mov rax, rdx\n");
+            } else if (a && is_list_field_access(a)) {
+                int field_addr;
+                VarSymbol *s = materialize_list_field(cg, a, &field_addr);
+                fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n", s->length_offset);
             } else if (a && a->type == AST_VAR_REF) {
                 VarSymbol *s = find_symbol(cg, a->name);
                 if (s && s->type == COBRA_TYPE_STRING) {
@@ -2972,7 +3127,17 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
         return;
     }
     if (!strcmp(n->name, "append")) {
-        if (n->child_count != 2 || n->children[0]->type != AST_VAR_REF) {
+        if (n->child_count != 2) {
+            fprintf(stderr, "CodeGen Error: append requires (list, value)\n"); exit(EXIT_FAILURE);
+        }
+        if (is_list_field_access(n->children[0])) {
+            int field_addr;
+            VarSymbol *s = materialize_list_field(cg, n->children[0], &field_addr);
+            emit_list_append(cg, s, n->children[1]);
+            emit_list_field_writeback(cg, s, field_addr);
+            return;
+        }
+        if (n->children[0]->type != AST_VAR_REF) {
             fprintf(stderr, "CodeGen Error: append requires (list, value)\n"); exit(EXIT_FAILURE);
         }
         VarSymbol *s = find_symbol(cg, n->children[0]->name);
@@ -4510,6 +4675,34 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             if (n->child_count != 2) {
                 fprintf(stderr, "CodeGen Error: member assignment requires a struct value\n");
                 exit(EXIT_FAILURE);
+            }
+            if (n->declared_type == COBRA_TYPE_LIST) {
+                /* Box the source list's 3 descriptor words into a fresh
+                   24-byte heap block and store the box pointer into the
+                   field - the field itself is just that one pointer (see
+                   materialize_list_field_core), matching the canonical
+                   layer's COBRA_ABI_REFERENCE/size=8 model for list[T]. */
+                if (n->children[1]->type != AST_VAR_REF) {
+                    fprintf(stderr, "CodeGen Error: list field assignment requires a named list value\n");
+                    exit(EXIT_FAILURE);
+                }
+                VarSymbol *src = find_symbol(cg, n->children[1]->name);
+                if (!src || src->kind != SYM_LIST) {
+                    fprintf(stderr, "CodeGen Error: '%s' is not a list value\n", n->children[1]->name);
+                    exit(EXIT_FAILURE);
+                }
+                int field_address = reserve(cg, 8);
+                emit_struct_address(cg, n->children[0]);
+                int offset = field_offset_for(cg, ast_payload_name(n->children[0]), n->secondary_name);
+                fprintf(cg->out, "    add rax, %d\n    mov QWORD PTR [rbp-%d], rax\n", offset, field_address);
+                fprintf(cg->out, "    mov rdi, 24\n    call malloc@PLT\n");
+                fprintf(cg->out,
+                        "    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rax], rcx\n"
+                        "    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rax+8], rcx\n"
+                        "    mov rcx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rax+16], rcx\n",
+                        src->offset, src->length_offset, src->capacity_offset);
+                fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rdx], rax\n", field_address);
+                return;
             }
             int field_address = reserve(cg, 8);
             emit_struct_address(cg, n->children[0]);

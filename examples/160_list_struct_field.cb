@@ -1,0 +1,63 @@
+# list[T] as a struct field: construction, append, index-read,
+# index-write, and len all working through a boxed heap representation.
+
+struct Node: { value: i64 }
+
+struct Graph: { nodes: list[Node] }
+
+struct Bag: { counts: list[i64] }
+
+def test_list_struct_field_basic(): {
+    let n1: Node
+    n1.value = 10
+    let n2: Node
+    n2.value = 20
+
+    let items: list[Node] = []
+    append(items, n1)
+    append(items, n2)
+
+    let g: Graph
+    g.nodes = items
+
+    assert(len(g.nodes) == 2)
+    let first: Node = g.nodes[0]
+    let second: Node = g.nodes[1]
+    assert(first.value == 10)
+    assert(second.value == 20)
+    return 0
+}
+
+def test_list_struct_field_append(): {
+    let g: Graph
+    let empty_nodes: list[Node] = []
+    g.nodes = empty_nodes
+
+    let i: i64 = 0
+    while i < 5: {
+        let n: Node
+        n.value = i * 100
+        append(g.nodes, n)
+        i = i + 1
+    }
+
+    assert(len(g.nodes) == 5)
+    let first: Node = g.nodes[0]
+    let last: Node = g.nodes[4]
+    assert(first.value == 0)
+    assert(last.value == 400)
+    return 0
+}
+
+def test_list_struct_field_scalar(): {
+    let b: Bag
+    let empty_counts: list[i64] = []
+    b.counts = empty_counts
+    append(b.counts, 7)
+    append(b.counts, 8)
+    b.counts[0] = 70
+    assert(len(b.counts) == 2)
+    assert(b.counts[0] == 70)
+    assert(b.counts[1] == 8)
+    return 0
+}

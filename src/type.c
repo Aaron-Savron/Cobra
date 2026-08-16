@@ -1058,7 +1058,8 @@ static const CobraType *cobra_type_struct_layout_depth(CobraTypeArena *arena, AS
             }
             CobraOwnershipKind ownership = declared->ownership;
             CobraMutabilityKind mutability = declared->mutability;
-            if (field_kind == COBRA_TYPE_STRING && ownership == COBRA_OWNERSHIP_VALUE)
+            if ((field_kind == COBRA_TYPE_STRING || field_kind == COBRA_TYPE_LIST) &&
+                ownership == COBRA_OWNERSHIP_VALUE)
                 ownership = COBRA_OWNERSHIP_OWNED;
             if (!cobra_type_add_field(type, field->name, field_type, ownership,
                                       mutability, declared->region_id)) {
