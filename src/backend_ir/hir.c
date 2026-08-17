@@ -3292,6 +3292,19 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
         }
     } else {
         if (!hir_build_expr(b, target, &bound_expr)) return false;
+        /* A bare `for i in x:` with x not a range()/array-literal only has a
+           defined scalar-bound meaning when x is itself an i64 (loop from 0
+           to x). Iterating the elements of a slice/list/dict this way needs
+           real container-iteration lowering (length read, per-element load,
+           writeback) that this backend does not implement yet; without this
+           check the code below silently assigns the container value itself
+           into an i64 bound local, which is not a type error the type
+           checker catches this deep, so guard it explicitly here. */
+        if (bound_expr->type != b->module->type_i64) {
+            bir_fail(b, stmt->source_line, stmt->source_col,
+                     "for-loop over a slice, list, or dict value is outside the backend-IR subset");
+            return false;
+        }
     }
     if (!hir_emit_assign(b, (uint32_t)start_local, start_expr) ||
         !hir_emit_assign(b, (uint32_t)bound_local, bound_expr)) {

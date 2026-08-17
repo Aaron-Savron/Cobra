@@ -1258,26 +1258,36 @@ static bool mir_check_instruction(const MirModule *module, size_t function_index
             const MirFunction *callee = &module->functions[inst->callee_index];
             const BirFunctionInfo *source_callee =
                 &module->source->functions[inst->callee_index];
-            if (inst->operand_count != callee->call_abi.param_count ||
+            /* Extern (`import c`) callees carry no lowered signature; the
+               call site's own operand count is the only thing to check,
+               matching x86_emit_call's separate extern-call path below. */
+            if (source_callee->is_extern) {
+                if (inst->operand_count > BIR_ABI_MAX_GPR_ARGUMENT_REGISTERS) {
+                    mir_set_error(err, err_size, "MIR call does not match the callee ABI");
+                    return false;
+                }
+            } else if (inst->operand_count != callee->call_abi.param_count ||
                 memcmp(&callee->call_abi, &source_callee->call_abi,
                        sizeof(BirCallAbi)) != 0 ||
                 !bir_validate_function_abi(module->source, source_callee)) {
                 mir_set_error(err, err_size, "MIR call does not match the callee ABI");
                 return false;
             }
-            for (size_t arg = 0; arg < inst->operand_count; arg++) {
-                MirReg reg = arena->operands[inst->operand_start + arg];
-                const CobraType *expected = NULL;
-                if (source_callee->has_hidden_return_storage && arg == 0)
-                    expected = source_callee->return_value_type;
-                else {
-                    size_t source_arg = arg -
-                        (source_callee->has_hidden_return_storage ? 1U : 0U);
-                    expected = source_callee->param_value_types[source_arg];
-                }
-                if (!mir_types_equal(arena->regs[reg].type, expected)) {
-                    mir_set_error(err, err_size, "MIR call argument type does not match the callee");
-                    return false;
+            if (!source_callee->is_extern) {
+                for (size_t arg = 0; arg < inst->operand_count; arg++) {
+                    MirReg reg = arena->operands[inst->operand_start + arg];
+                    const CobraType *expected = NULL;
+                    if (source_callee->has_hidden_return_storage && arg == 0)
+                        expected = source_callee->return_value_type;
+                    else {
+                        size_t source_arg = arg -
+                            (source_callee->has_hidden_return_storage ? 1U : 0U);
+                        expected = source_callee->param_value_types[source_arg];
+                    }
+                    if (!mir_types_equal(arena->regs[reg].type, expected)) {
+                        mir_set_error(err, err_size, "MIR call argument type does not match the callee");
+                        return false;
+                    }
                 }
             }
             if (source_callee->has_return && !source_callee->has_hidden_return_storage &&

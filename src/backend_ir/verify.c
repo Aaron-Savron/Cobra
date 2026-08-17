@@ -221,6 +221,7 @@ static bool assign_function_ownership(VerifyCtx *ctx) {
     const SsaArena *arena = &ctx->module->arena;
     for (size_t f = 0; f < ctx->module->function_count; f++) {
         const BirFunctionInfo *info = &ctx->module->functions[f];
+        if (info->is_extern) continue;
         if (info->first_block == SSA_BLOCK_NONE || info->block_count == 0 ||
             info->first_block >= arena->block_count ||
             info->block_count > arena->block_count - info->first_block) {
@@ -243,6 +244,7 @@ static bool check_function_table(VerifyCtx *ctx) {
     const SsaArena *arena = &ctx->module->arena;
     for (size_t f = 0; f < ctx->module->function_count; f++) {
         const BirFunctionInfo *info = &ctx->module->functions[f];
+        if (info->is_extern) continue;
         if (info->entry == SSA_BLOCK_NONE || info->entry >= arena->block_count ||
             info->first_block != info->entry || info->block_count == 0 ||
             info->block_count > arena->block_count - info->first_block) {

@@ -412,7 +412,7 @@ static bool finalize_type(CobraTypeArena *arena, CobraType *type,
         abi = COBRA_ABI_REFERENCE;
         size = 8;
         alignment = 8;
-    } else if (size == 0 && type->kind != COBRA_TYPE_UNTYPED) {
+    } else if (size == 0 && type->kind != COBRA_TYPE_UNTYPED && type->kind != COBRA_TYPE_VOID) {
         if (type->kind == COBRA_TYPE_GENERIC_PARAM)
             type_error(arena, "generic parameter '%s' must be instantiated before ABI lowering",
                        type->name[0] ? type->name : "<unnamed>");

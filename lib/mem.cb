@@ -28,15 +28,15 @@ struct PoolState: {
 
 # --- Raw byte helpers ------------------------------------------------------
 
-def mem_copy(dst: []i64, src: []i64, n: i64) -> i64: {
+def mem_copy(dst: out []i64, src: readonly []i64, n: i64) -> i64: {
     return memcpy(dst, src, n)
 }
 
-def mem_set(ptr: []i64, value: i64, n: i64) -> i64: {
+def mem_set(ptr: out []i64, value: i64, n: i64) -> i64: {
     return memset(ptr, value, n)
 }
 
-def mem_equal(a: []i64, b: []i64, n: i64) -> i64: {
+def mem_equal(a: readonly []i64, b: readonly []i64, n: i64) -> i64: {
     return memcmp(a, b, n)
 }
 
