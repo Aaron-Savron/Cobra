@@ -1603,16 +1603,31 @@ static bool emit_block(SsaPass *p, size_t block, HirBlock *hb) {
     /* Slice-value locals (views and owned slices) are SSA values, not frame
        memory. A definition in a predecessor block is visible in successor
        blocks: join the known predecessor definitions conservatively. If any
-       predecessor is unknown or the defs disagree, the block keeps the local
-       unknown and a later use is rejected as not initialized on this path. */
+       *already-emitted* predecessor is unknown or the defs disagree, the
+       block keeps the local unknown and a later use is rejected as not
+       initialized on this path.
+
+       Blocks are emitted in creation order, and loop bodies are always
+       created after their header (see hir_build_for/hir_build_for_container/
+       hir_build_while), so a pred with index >= block is necessarily a
+       back-edge (the loop latch) that hasn't run through this join yet.
+       Skipping it rather than forcing the whole join unknown lets a loop
+       header/body see a container local defined before the loop, which is
+       the common case (the local isn't itself reassigned inside the loop);
+       ignoring it and finding no known preds at all still resolves to
+       unknown below, so a header with only a back-edge pred correctly stays
+       rejected. */
     for (size_t local = 0; local < p->local_count; local++) {
         if (!ssa_is_slice_value_type(p->fn->locals[local].type)) continue;
         size_t index = block * p->local_count + local;
         if (p->block_def_known[index]) continue;
         SsaValueRef joined = SSA_VALUE_NONE;
         bool known = true;
+        bool any_forward_pred = false;
         for (size_t s = 0; s < hb->pred_count; s++) {
             size_t pred = hb->preds[s];
+            if (pred >= block) continue; /* not yet emitted: back-edge */
+            any_forward_pred = true;
             size_t pred_index = pred * p->local_count + local;
             if (!p->block_def_known[pred_index]) {
                 known = false;
@@ -1625,7 +1640,7 @@ static bool emit_block(SsaPass *p, size_t block, HirBlock *hb) {
                 break;
             }
         }
-        if (known && hb->pred_count && joined != SSA_VALUE_NONE) {
+        if (known && any_forward_pred && joined != SSA_VALUE_NONE) {
             p->block_defs[index] = joined;
             p->block_def_known[index] = true;
         }

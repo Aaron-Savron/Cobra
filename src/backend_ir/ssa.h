@@ -550,6 +550,15 @@ typedef struct {
        normal call_abi/param_types machinery in favor of the raw SysV
        integer-register convention (see x86_emit_extern_call). */
     bool is_extern;
+    /* True unless bir_build_program proved this function unreachable from
+       main (or there is no main, in which case every function is treated as
+       reachable - see mark_reachable_functions). A handful of verify.c's
+       whole-module semantic checks (e.g. the owned-slice-parameter liveness
+       check) are relaxed for unreachable functions: nothing the program
+       actually runs needs them, but they still get fully built and verified
+       for structural soundness, and a std.cb helper the program never calls
+       must not be able to hard-fail every build that happens to pull it in. */
+    bool reachable_from_main;
 } BirFunctionInfo;
 
 typedef struct {

@@ -1597,6 +1597,11 @@ bool bir_declare_function(BackendIrModule *module, const char *name,
     BirFunctionInfo *info = &module->functions[module->function_count++];
     memset(info, 0, sizeof(*info));
     snprintf(info->name, sizeof(info->name), "%s", name);
+    /* Conservative default: only bir_build_program's reachability pass ever
+       clears this, once it has actually proven the function unreachable from
+       main. Every other caller (unit tests building a module without a
+       main, imported/extern declarations) keeps full verification. */
+    info->reachable_from_main = true;
     info->entry = SSA_BLOCK_NONE;
     info->first_block = SSA_BLOCK_NONE;
     info->block_count = 0;
@@ -1716,6 +1721,11 @@ bool bir_declare_extern_function(BackendIrModule *module, const char *name) {
     BirFunctionInfo *info = &module->functions[module->function_count++];
     memset(info, 0, sizeof(*info));
     snprintf(info->name, sizeof(info->name), "%s", name);
+    /* Conservative default: only bir_build_program's reachability pass ever
+       clears this, once it has actually proven the function unreachable from
+       main. Every other caller (unit tests building a module without a
+       main, imported/extern declarations) keeps full verification. */
+    info->reachable_from_main = true;
     info->entry = SSA_BLOCK_NONE;
     info->first_block = SSA_BLOCK_NONE;
     info->block_count = 0;

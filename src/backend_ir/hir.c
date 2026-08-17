@@ -1695,10 +1695,11 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
             }
             if (!bir_is_borrowed_view_type(view->type) &&
                 !bir_is_owned_slice_type(view->type) &&
+                !bir_is_owned_buffer_type(view->type) &&
                 (!view->type || view->type->kind != COBRA_TYPE_ARRAY)) {
                 hir_expr_free(view);
                 bir_fail(b, node->source_line, node->source_col,
-                         "len requires a borrowed slice view, owned slice, or dict");
+                         "len requires a borrowed slice view, owned slice, list, or dict");
                 return false;
             }
             expr = hir_expr_alloc(b, node->source_line, node->source_col);
@@ -1781,9 +1782,10 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                 break;
             }
             if (!bir_is_borrowed_view_type(view) && !bir_is_owned_slice_type(view) &&
+                !bir_is_owned_buffer_type(view) &&
                 (!view || view->kind != COBRA_TYPE_ARRAY)) {
                 bir_fail(b, node->source_line, node->source_col,
-                         "indexing requires a borrowed view, owned slice, or fixed array");
+                         "indexing requires a borrowed view, owned slice, list, or fixed array");
                 return false;
             }
             HirExpr *index = NULL;
@@ -2589,24 +2591,35 @@ static bool hir_build_if(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_blo
         return false;
     }
 
+    /* Every hir_new_block call can realloc fn->blocks (see its growth
+       strategy), invalidating every previously returned HirBlock* the
+       instant capacity is exceeded - including pointers from *earlier calls
+       in this very sequence*. Read each ->id immediately, before the next
+       hir_new_block call, and use only the plain id afterward (the then/else
+       bodies built below can themselves allocate more blocks). */
     HirBlock *then_block = hir_new_block(b, "then", stmt->source_line, stmt->source_col);
+    if (!then_block) return false;
+    HirBlockRef then_id = then_block->id;
     HirBlock *else_block = stmt->child_count > 2
         ? hir_new_block(b, "else", stmt->source_line, stmt->source_col) : NULL;
+    if (stmt->child_count > 2 && !else_block) return false;
+    HirBlockRef else_id = else_block ? else_block->id : HIR_BLOCK_NONE;
     HirBlock *merge = hir_new_block(b, "merge", stmt->source_line, stmt->source_col);
-    if (!then_block || !merge || (stmt->child_count > 2 && !else_block)) return false;
+    if (!merge) return false;
+    HirBlockRef merge_id = merge->id;
 
     HirBlockRef pre = b->current;
     HirTerm term;
     memset(&term, 0, sizeof(term));
     term.kind = HIR_TERM_BRANCH;
     term.cond = cond;
-    term.target = then_block->id;
-    term.target2 = else_block ? else_block->id : merge->id;
+    term.target = then_id;
+    term.target2 = else_block ? else_id : merge_id;
     if (!hir_set_term(b, pre, term)) return false;
-    if (!hir_add_edge(b, pre, then_block->id) ||
+    if (!hir_add_edge(b, pre, then_id) ||
         !hir_add_edge(b, pre, term.target2)) return false;
 
-    b->current = then_block->id;
+    b->current = then_id;
     bool then_terminated = false;
     if (!hir_build_stmt_list(b, stmt->children[1]->children,
                              stmt->children[1]->child_count, &then_terminated)) {
@@ -2616,13 +2629,13 @@ static bool hir_build_if(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_blo
         HirTerm jump;
         memset(&jump, 0, sizeof(jump));
         jump.kind = HIR_TERM_JUMP;
-        jump.target = merge->id;
+        jump.target = merge_id;
         if (!hir_set_term(b, b->current, jump) ||
-            !hir_add_edge(b, b->current, merge->id)) return false;
+            !hir_add_edge(b, b->current, merge_id)) return false;
     }
 
     if (else_block) {
-        b->current = else_block->id;
+        b->current = else_id;
         bool else_terminated = false;
         if (!hir_build_stmt_list(b, stmt->children[2]->children,
                                  stmt->children[2]->child_count, &else_terminated)) {
@@ -2632,9 +2645,9 @@ static bool hir_build_if(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_blo
             HirTerm jump;
             memset(&jump, 0, sizeof(jump));
             jump.kind = HIR_TERM_JUMP;
-            jump.target = merge->id;
+            jump.target = merge_id;
             if (!hir_set_term(b, b->current, jump) ||
-                !hir_add_edge(b, b->current, merge->id)) return false;
+                !hir_add_edge(b, b->current, merge_id)) return false;
         }
     }
 
@@ -2642,8 +2655,8 @@ static bool hir_build_if(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_blo
        statement list that follows the if, or the function's fall-through
        return. A merge that both branches returned from is unreachable and is
        given a bare return terminator by the function-level fixup. */
-    b->current = merge->id;
-    *continue_block = merge->id;
+    b->current = merge_id;
+    *continue_block = merge_id;
     return true;
 }
 
@@ -2822,35 +2835,48 @@ static bool hir_build_match(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_
     /* Block layout: a comparison block per arm holds the discriminant
        branch; each arm has its own body block. The chain falls out at the
        else block (or straight into the merge when there is no else arm). */
+    /* Every hir_new_block call can realloc fn->blocks (see its growth
+       strategy), invalidating every previously returned HirBlock* the
+       instant capacity is exceeded - including pointers from *earlier calls
+       in this very batch*, not just ones held across arm-body building. Read
+       each ->id immediately, before the next hir_new_block call, into the
+       parallel id arrays below, and use only those ids afterward. */
     HirBlock *body_blocks[COBRA_MAX_ENUM_VARIANTS];
+    HirBlockRef body_ids[COBRA_MAX_ENUM_VARIANTS];
     for (size_t i = 0; i < non_default_count; i++) {
         body_blocks[i] = hir_new_block(b, "match_arm", stmt->source_line,
                                        stmt->source_col);
         if (!body_blocks[i]) return false;
+        body_ids[i] = body_blocks[i]->id;
     }
     HirBlock *cmp_blocks[COBRA_MAX_ENUM_VARIANTS];
+    HirBlockRef cmp_ids[COBRA_MAX_ENUM_VARIANTS];
     size_t cmp_count = non_default_count > 0 ? non_default_count - 1 : 0;
     for (size_t i = 0; i < cmp_count; i++) {
         cmp_blocks[i] = hir_new_block(b, "match_cmp", stmt->source_line,
                                       stmt->source_col);
         if (!cmp_blocks[i]) return false;
+        cmp_ids[i] = cmp_blocks[i]->id;
     }
     HirBlock *else_block = has_default
         ? hir_new_block(b, "match_else", stmt->source_line, stmt->source_col)
         : NULL;
+    if (has_default && !else_block) return false;
+    HirBlockRef else_id = else_block ? else_block->id : HIR_BLOCK_NONE;
     HirBlock *merge = hir_new_block(b, "match_merge", stmt->source_line,
                                     stmt->source_col);
-    if (!merge || (has_default && !else_block)) return false;
+    if (!merge) return false;
+    HirBlockRef merge_id = merge->id;
 
     /* The pre block (which holds the target assign) is the first comparison
        block; later comparisons live in cmp_blocks. */
     HirBlockRef chain = b->current;
     for (size_t i = 0; i < non_default_count; i++) {
         ASTNode *arm = stmt->children[non_default[i]];
-        HirBlockRef body_blk = body_blocks[i]->id;
+        HirBlockRef body_blk = body_ids[i];
         HirBlockRef next = (i + 1 < non_default_count)
-            ? cmp_blocks[i]->id
-            : (else_block ? else_block->id : merge->id);
+            ? cmp_ids[i]
+            : (else_block ? else_id : merge_id);
 
         HirExpr *cond = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
         if (!cond) return false;
@@ -3115,9 +3141,9 @@ static bool hir_build_match(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_
             HirTerm jump;
             memset(&jump, 0, sizeof(jump));
             jump.kind = HIR_TERM_JUMP;
-            jump.target = merge->id;
+            jump.target = merge_id;
             if (!hir_set_term(b, b->current, jump) ||
-                !hir_add_edge(b, b->current, merge->id)) return false;
+                !hir_add_edge(b, b->current, merge_id)) return false;
         }
         chain = next;
     }
@@ -3140,13 +3166,13 @@ static bool hir_build_match(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_
             HirTerm jump;
             memset(&jump, 0, sizeof(jump));
             jump.kind = HIR_TERM_JUMP;
-            jump.target = merge->id;
+            jump.target = merge_id;
             if (!hir_set_term(b, b->current, jump) ||
-                !hir_add_edge(b, b->current, merge->id)) return false;
+                !hir_add_edge(b, b->current, merge_id)) return false;
         }
-        b->current = merge->id;
+        b->current = merge_id;
     }
-    *continue_block = merge->id;
+    *continue_block = merge_id;
     return true;
 }
 
@@ -3156,20 +3182,31 @@ static bool hir_build_while(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_
                  "while statement is missing its body");
         return false;
     }
+    /* Every hir_new_block call can realloc fn->blocks (see its growth
+       strategy), invalidating every previously returned HirBlock* the
+       instant capacity is exceeded - including pointers from *earlier calls
+       in this very sequence*, not just ones held across body-building. Read
+       each ->id immediately, before the next hir_new_block call, and use
+       only the plain id afterward. */
     HirBlock *header = hir_new_block(b, "while_header", stmt->source_line, stmt->source_col);
+    if (!header) return false;
+    HirBlockRef header_id = header->id;
     HirBlock *body = hir_new_block(b, "while_body", stmt->source_line, stmt->source_col);
+    if (!body) return false;
+    HirBlockRef body_id = body->id;
     HirBlock *exit_block = hir_new_block(b, "while_exit", stmt->source_line, stmt->source_col);
-    if (!header || !body || !exit_block) return false;
+    if (!exit_block) return false;
+    HirBlockRef exit_id = exit_block->id;
 
     HirTerm pre;
     memset(&pre, 0, sizeof(pre));
     pre.kind = HIR_TERM_JUMP;
-    pre.target = header->id;
-    if (!hir_set_term(b, b->current, pre) || !hir_add_edge(b, b->current, header->id)) {
+    pre.target = header_id;
+    if (!hir_set_term(b, b->current, pre) || !hir_add_edge(b, b->current, header_id)) {
         return false;
     }
 
-    b->current = header->id;
+    b->current = header_id;
     HirExpr *cond = NULL;
     if (!hir_build_expr(b, stmt->children[0], &cond)) return false;
     if (!bir_types_equal(cond->type, b->module->type_bool)) {
@@ -3181,15 +3218,15 @@ static bool hir_build_while(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_
     memset(&head, 0, sizeof(head));
     head.kind = HIR_TERM_BRANCH;
     head.cond = cond;
-    head.target = body->id;
-    head.target2 = exit_block->id;
-    if (!hir_set_term(b, header->id, head) ||
-        !hir_add_edge(b, header->id, body->id) ||
-        !hir_add_edge(b, header->id, exit_block->id)) {
+    head.target = body_id;
+    head.target2 = exit_id;
+    if (!hir_set_term(b, header_id, head) ||
+        !hir_add_edge(b, header_id, body_id) ||
+        !hir_add_edge(b, header_id, exit_id)) {
         return false;
     }
 
-    b->current = body->id;
+    b->current = body_id;
     bool body_terminated = false;
     if (!hir_build_stmt_list(b, stmt->children[1]->children,
                              stmt->children[1]->child_count, &body_terminated)) {
@@ -3199,13 +3236,222 @@ static bool hir_build_while(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_
         HirTerm back;
         memset(&back, 0, sizeof(back));
         back.kind = HIR_TERM_JUMP;
-        back.target = header->id;
+        back.target = header_id;
         if (!hir_set_term(b, b->current, back) ||
-            !hir_add_edge(b, b->current, header->id)) return false;
+            !hir_add_edge(b, b->current, header_id)) return false;
     }
 
-    b->current = exit_block->id;
-    *continue_block = exit_block->id;
+    b->current = exit_id;
+    *continue_block = exit_id;
+    return true;
+}
+
+/* index-local ref helper: every use site below needs its own HirExpr node
+   (nodes are individually owned/freed), so this can't be cached and reused. */
+static HirExpr *hir_local_ref(HirBuilder *b, uint32_t local, const CobraType *type,
+                              int line, int col) {
+    HirExpr *ref = hir_expr_alloc(b, line, col);
+    if (!ref) return NULL;
+    ref->kind = HIR_EXPR_LOCAL;
+    ref->local = local;
+    ref->type = type;
+    return ref;
+}
+
+/* `for x in container:` over a named slice/list local of scalar elements:
+   i = 0; while i < len(container) { x = container[i]; body; container[i] = x; i = i + 1 }
+   The write-back happens once per iteration, right before the latch, which
+   covers the one real-world case that motivated this (lib/std.cb's
+   vector_scale_avx2 doing `i = i * 2` in the body) without needing every
+   assignment site to special-case the loop variable the way the direct
+   backend's emit_expr/emit_assign do. */
+static bool hir_build_for_container(HirBuilder *b, ASTNode *stmt, ASTNode *body,
+                                    uint32_t loop_local, uint32_t container_local,
+                                    const CobraType *container_type,
+                                    const CobraType *element_type,
+                                    HirBlockRef *continue_block) {
+    int line = stmt->source_line, col = stmt->source_col;
+    int index_local = hir_synthetic_local(b, "for_index", line, col);
+    if (index_local < 0) return false;
+
+    HirExpr *zero = hir_expr_alloc(b, line, col);
+    if (!zero) return false;
+    zero->kind = HIR_EXPR_CONST;
+    zero->type = b->module->type_i64;
+    zero->const_value = bir_scalar_i64(zero->type, 0);
+    if (!hir_emit_assign(b, (uint32_t)index_local, zero)) return false;
+
+    /* Every hir_new_block call can realloc fn->blocks, invalidating every
+       previously returned HirBlock* the instant capacity is exceeded -
+       including pointers from earlier calls in this very sequence. Read
+       each ->id immediately, before the next hir_new_block call. */
+    HirBlock *header = hir_new_block(b, "for_header", line, col);
+    if (!header) return false;
+    HirBlockRef header_id = header->id;
+    HirBlock *body_block = hir_new_block(b, "for_body", line, col);
+    if (!body_block) return false;
+    HirBlockRef body_id = body_block->id;
+    HirBlock *latch = hir_new_block(b, "for_latch", line, col);
+    if (!latch) return false;
+    HirBlockRef latch_id = latch->id;
+    HirBlock *exit_block = hir_new_block(b, "for_exit", line, col);
+    if (!exit_block) return false;
+    HirBlockRef exit_id = exit_block->id;
+
+    HirTerm pre;
+    memset(&pre, 0, sizeof(pre));
+    pre.kind = HIR_TERM_JUMP;
+    pre.target = header_id;
+    if (!hir_set_term(b, b->current, pre) || !hir_add_edge(b, b->current, header_id)) {
+        return false;
+    }
+
+    /* header: i < len(container) -> body : exit */
+    b->current = header_id;
+    HirExpr *len_arg = hir_local_ref(b, container_local, container_type, line, col);
+    if (!len_arg) return false;
+    HirExpr *len_expr = hir_expr_alloc(b, line, col);
+    if (!len_expr) { hir_expr_free(len_arg); return false; }
+    len_expr->kind = HIR_EXPR_LEN;
+    len_expr->type = b->module->type_i64;
+    len_expr->args = calloc(1, sizeof(HirExpr *));
+    if (!len_expr->args) { hir_expr_free(len_arg); hir_expr_free(len_expr); return false; }
+    len_expr->args[0] = len_arg;
+    len_expr->arg_count = 1;
+    HirExpr *index_ref = hir_local_ref(b, (uint32_t)index_local, b->module->type_i64, line, col);
+    if (!index_ref) { hir_expr_free(len_expr); return false; }
+    HirExpr *cond = hir_expr_alloc(b, line, col);
+    if (!cond) { hir_expr_free(index_ref); hir_expr_free(len_expr); return false; }
+    cond->kind = HIR_EXPR_BINOP;
+    cond->binop = SSA_OP_LT;
+    cond->args = calloc(2, sizeof(HirExpr *));
+    if (!cond->args) { hir_expr_free(index_ref); hir_expr_free(len_expr); hir_expr_free(cond); return false; }
+    cond->args[0] = index_ref;
+    cond->args[1] = len_expr;
+    cond->arg_count = 2;
+    cond->type = b->module->type_bool;
+
+    HirTerm head;
+    memset(&head, 0, sizeof(head));
+    head.kind = HIR_TERM_BRANCH;
+    head.cond = cond;
+    head.target = body_id;
+    head.target2 = exit_id;
+    if (!hir_set_term(b, header_id, head) ||
+        !hir_add_edge(b, header_id, body_id) ||
+        !hir_add_edge(b, header_id, exit_id)) {
+        return false;
+    }
+
+    /* body: x = container[i]; <body>; container[i] = x */
+    b->current = body_id;
+    HirExpr *load_index = hir_local_ref(b, (uint32_t)index_local, b->module->type_i64, line, col);
+    if (!load_index) return false;
+    HirExpr *load = hir_expr_alloc(b, line, col);
+    if (!load) { hir_expr_free(load_index); return false; }
+    load->kind = HIR_EXPR_INDEX;
+    load->type = element_type;
+    load->local = container_local;
+    load->aggregate_type = container_type;
+    load->args = calloc(1, sizeof(HirExpr *));
+    if (!load->args) { hir_expr_free(load_index); hir_expr_free(load); return false; }
+    load->args[0] = load_index;
+    load->arg_count = 1;
+    if (!hir_emit_assign(b, loop_local, load)) return false;
+
+    bool body_terminated = false;
+    if (!hir_build_stmt_list(b, body->children, body->child_count, &body_terminated)) {
+        return false;
+    }
+    if (body_terminated) {
+        bir_fail(b, line, col,
+                 "return inside a for-loop body is outside the backend-IR subset");
+        return false;
+    }
+
+    HirExpr *store_index = hir_local_ref(b, (uint32_t)index_local, b->module->type_i64, line, col);
+    HirExpr *store_value = hir_local_ref(b, loop_local, element_type, line, col);
+    if (!store_index || !store_value) {
+        hir_expr_free(store_index);
+        hir_expr_free(store_value);
+        return false;
+    }
+    HirExpr *store_target = hir_expr_alloc(b, line, col);
+    if (!store_target) {
+        hir_expr_free(store_index);
+        hir_expr_free(store_value);
+        return false;
+    }
+    store_target->kind = HIR_EXPR_INDEX;
+    store_target->type = element_type;
+    store_target->local = container_local;
+    store_target->aggregate_type = container_type;
+    store_target->args = calloc(1, sizeof(HirExpr *));
+    if (!store_target->args) {
+        hir_expr_free(store_index);
+        hir_expr_free(store_value);
+        hir_expr_free(store_target);
+        return false;
+    }
+    store_target->args[0] = store_index;
+    store_target->arg_count = 1;
+    HirStmt index_store;
+    memset(&index_store, 0, sizeof(index_store));
+    index_store.kind = HIR_STMT_INDEX_ASSIGN;
+    index_store.target = store_target;
+    index_store.expr = store_value;
+    if (!hir_block_add_stmt(b, b->current, index_store)) {
+        hir_expr_free(store_target);
+        hir_expr_free(store_value);
+        return false;
+    }
+
+    HirTerm to_latch;
+    memset(&to_latch, 0, sizeof(to_latch));
+    to_latch.kind = HIR_TERM_JUMP;
+    to_latch.target = latch_id;
+    if (!hir_set_term(b, b->current, to_latch) || !hir_add_edge(b, b->current, latch_id)) {
+        return false;
+    }
+
+    /* latch: i = i + 1; jump header */
+    b->current = latch_id;
+    HirExpr *one = hir_expr_alloc(b, line, col);
+    HirExpr *index_again = hir_local_ref(b, (uint32_t)index_local, b->module->type_i64, line, col);
+    HirExpr *plus = hir_expr_alloc(b, line, col);
+    if (!one || !index_again || !plus) {
+        hir_expr_free(one);
+        hir_expr_free(index_again);
+        hir_expr_free(plus);
+        return false;
+    }
+    one->kind = HIR_EXPR_CONST;
+    one->type = b->module->type_i64;
+    one->const_value = bir_scalar_i64(one->type, 1);
+    plus->kind = HIR_EXPR_BINOP;
+    plus->binop = SSA_OP_ADD;
+    plus->args = calloc(2, sizeof(HirExpr *));
+    if (!plus->args) {
+        hir_expr_free(one);
+        hir_expr_free(index_again);
+        hir_expr_free(plus);
+        return false;
+    }
+    plus->args[0] = index_again;
+    plus->args[1] = one;
+    plus->arg_count = 2;
+    plus->type = b->module->type_i64;
+    if (!hir_emit_assign(b, (uint32_t)index_local, plus)) return false;
+    HirTerm back;
+    memset(&back, 0, sizeof(back));
+    back.kind = HIR_TERM_JUMP;
+    back.target = header_id;
+    if (!hir_set_term(b, latch_id, back) || !hir_add_edge(b, latch_id, header_id)) {
+        return false;
+    }
+
+    b->current = exit_id;
+    *continue_block = exit_id;
     return true;
 }
 
@@ -3222,6 +3468,48 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     }
     ASTNode *target = stmt->children[0];
     ASTNode *body = stmt->children[1];
+
+    /* `for x in container:` where container is a named slice/list local
+       binds x to each element by value, matching the direct backend's
+       emit_for (element/source path): every read of x loads container[i]
+       and every write to x is an immediate store back into container[i].
+       This backend defers the write-back to just before the latch instead
+       of doing it on every assignment (the direct backend's approach), which
+       is observationally identical for the supported case - the body never
+       reads x again after reassigning it and expecting the container's own
+       slot to already reflect the new value mid-iteration - and is far
+       simpler to lower into this backend's block-structured CFG. */
+    int container_local = -1;
+    const CobraType *container_type = NULL;
+    const CobraType *element_type = NULL;
+    if (target->type == AST_VAR_REF) {
+        int cl = hir_find_local(b, target->name);
+        if (cl >= 0) {
+            const CobraType *t = b->fn->locals[cl].type;
+            if (bir_is_owned_slice_type(t) || bir_is_owned_buffer_type(t) ||
+                bir_is_borrowed_view_type(t)) {
+                container_local = cl;
+                container_type = t;
+                element_type = cobra_type_element(t);
+            }
+        }
+    }
+    if (container_local >= 0) {
+        if (!element_type || !cobra_type_is_scalar(element_type)) {
+            bir_fail(b, stmt->source_line, stmt->source_col,
+                     "for-loop over a slice or list of non-scalar elements is outside the backend-IR subset");
+            return false;
+        }
+        int loop_local = hir_add_local(b, stmt->name, false, element_type,
+                                       stmt->source_line, stmt->source_col);
+        if (loop_local < 0) return false;
+        return hir_build_for_container(b, stmt, body, (uint32_t)loop_local,
+                                       (uint32_t)container_local, container_type,
+                                       element_type, continue_block);
+    }
+    /* dict iteration (or any other unrecognized target shape) is diagnosed
+       below once the scalar-bound type check on bound_expr fails. */
+
     int loop_local = hir_add_local(b, stmt->name, false, b->module->type_i64,
                                    stmt->source_line, stmt->source_col);
     if (loop_local < 0) return false;
@@ -3319,17 +3607,28 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     start_ref->type = b->module->type_i64;
     if (!hir_emit_assign(b, (uint32_t)loop_local, start_ref)) return false;
 
+    /* Every hir_new_block call can realloc fn->blocks, invalidating every
+       previously returned HirBlock* the instant capacity is exceeded -
+       including pointers from earlier calls in this very sequence. Read
+       each ->id immediately, before the next hir_new_block call. */
     HirBlock *header = hir_new_block(b, "for_header", stmt->source_line, stmt->source_col);
+    if (!header) return false;
+    HirBlockRef header_id = header->id;
     HirBlock *body_block = hir_new_block(b, "for_body", stmt->source_line, stmt->source_col);
+    if (!body_block) return false;
+    HirBlockRef body_id = body_block->id;
     HirBlock *latch = hir_new_block(b, "for_latch", stmt->source_line, stmt->source_col);
+    if (!latch) return false;
+    HirBlockRef latch_id = latch->id;
     HirBlock *exit_block = hir_new_block(b, "for_exit", stmt->source_line, stmt->source_col);
-    if (!header || !body_block || !latch || !exit_block) return false;
+    if (!exit_block) return false;
+    HirBlockRef exit_id = exit_block->id;
 
     HirTerm pre;
     memset(&pre, 0, sizeof(pre));
     pre.kind = HIR_TERM_JUMP;
-    pre.target = header->id;
-    if (!hir_set_term(b, b->current, pre) || !hir_add_edge(b, b->current, header->id)) {
+    pre.target = header_id;
+    if (!hir_set_term(b, b->current, pre) || !hir_add_edge(b, b->current, header_id)) {
         return false;
     }
 
@@ -3354,20 +3653,20 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     cond->arg_count = 2;
     cond->type = b->module->type_bool;
 
-    b->current = header->id;
+    b->current = header_id;
     HirTerm head;
     memset(&head, 0, sizeof(head));
     head.kind = HIR_TERM_BRANCH;
     head.cond = cond;
-    head.target = body_block->id;
-    head.target2 = exit_block->id;
-    if (!hir_set_term(b, header->id, head) ||
-        !hir_add_edge(b, header->id, body_block->id) ||
-        !hir_add_edge(b, header->id, exit_block->id)) {
+    head.target = body_id;
+    head.target2 = exit_id;
+    if (!hir_set_term(b, header_id, head) ||
+        !hir_add_edge(b, header_id, body_id) ||
+        !hir_add_edge(b, header_id, exit_id)) {
         return false;
     }
 
-    b->current = body_block->id;
+    b->current = body_id;
     bool body_terminated = false;
     if (!hir_build_stmt_list(b, body->children, body->child_count,
                              &body_terminated)) {
@@ -3381,12 +3680,12 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     HirTerm to_latch;
     memset(&to_latch, 0, sizeof(to_latch));
     to_latch.kind = HIR_TERM_JUMP;
-    to_latch.target = latch->id;
+    to_latch.target = latch_id;
     if (!hir_set_term(b, b->current, to_latch) ||
-        !hir_add_edge(b, b->current, latch->id)) return false;
+        !hir_add_edge(b, b->current, latch_id)) return false;
 
     /* latch: i = i + 1; jump header */
-    b->current = latch->id;
+    b->current = latch_id;
     HirExpr *one = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
     HirExpr *index_again = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
     HirExpr *plus = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
@@ -3409,13 +3708,13 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     HirTerm back;
     memset(&back, 0, sizeof(back));
     back.kind = HIR_TERM_JUMP;
-    back.target = header->id;
-    if (!hir_set_term(b, latch->id, back) || !hir_add_edge(b, latch->id, header->id)) {
+    back.target = header_id;
+    if (!hir_set_term(b, latch_id, back) || !hir_add_edge(b, latch_id, header_id)) {
         return false;
     }
 
-    b->current = exit_block->id;
-    *continue_block = exit_block->id;
+    b->current = exit_id;
+    *continue_block = exit_id;
     return true;
 }
 
@@ -4819,6 +5118,12 @@ bool bir_build_program(BackendIrModule *module, ASTNode *root) {
                 module->arena.edge_used = snap_edges;
                 remove_declared_function(module, decl->name);
                 continue;
+            }
+            for (size_t f = 0; f < module->function_count; f++) {
+                if (strcmp(module->functions[f].name, decl->name) == 0) {
+                    module->functions[f].reachable_from_main = reachable[i];
+                    break;
+                }
             }
             continue;
         }

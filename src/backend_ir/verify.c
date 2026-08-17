@@ -967,7 +967,8 @@ static bool check_instruction_signature(VerifyCtx *ctx, SsaBlockRef ref,
     }
     if (inst->op == SSA_OP_VIEW_LEN) {
         if (!is_view_type(arena->values[ops[0]].type) &&
-            !is_owned_slice_type(arena->values[ops[0]].type)) {
+            !is_owned_slice_type(arena->values[ops[0]].type) &&
+            !bir_is_owned_buffer_type(arena->values[ops[0]].type)) {
             verr(ctx, "block b%u view length requires a slice view", ref);
             return false;
         }
@@ -2382,6 +2383,13 @@ static bool flow_simulate_block(VerifyCtx *ctx, SsaBlockRef block,
         int owner = block < arena->block_count ? ctx->function_index[block] : -1;
         if (owner >= 0) {
             const BirFunctionInfo *info = &ctx->module->functions[owner];
+            /* A function nothing reachable from main ever calls (e.g. a
+               lib.cb helper the program doesn't use) still gets fully built
+               and structurally verified, but a parameter-ownership gap in
+               its body must not be able to hard-fail every build that
+               happens to pull in the module defining it. See
+               reachable_from_main's declaration for the full rationale. */
+            if (!info->reachable_from_main) return true;
             for (size_t param = 0; param < info->param_count; param++) {
                 if (!is_owned_slice_type(info->param_types[param])) continue;
                 size_t lowered = param + (info->has_hidden_return_storage ? 1U : 0U);
@@ -2399,8 +2407,8 @@ static bool flow_simulate_block(VerifyCtx *ctx, SsaBlockRef block,
                             is_owned_slice_type(arena->values[returned].type);
                     }
                     if (!returned_parameter) {
-                        verr(ctx, "block b%u returns while owned slice parameter %zu is still live",
-                             block, param + 1);
+                        verr(ctx, "block b%u in function '%s' returns while owned slice parameter %zu is still live",
+                             block, info->name, param + 1);
                         return false;
                     }
                 }
