@@ -5030,6 +5030,52 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             }
             return;
         case AST_MATCH_STMT: {
+            bool any_literal_arm = false;
+            for (size_t i = 1; i < n->child_count; i++) {
+                if (n->children[i]->is_literal_case) { any_literal_arm = true; break; }
+            }
+            if (any_literal_arm) {
+                /* Guards can have side effects and must be re-evaluated per
+                   arm, so this is a sequential compare-and-branch chain
+                   (like an if/elif ladder) rather than the jump table below,
+                   which assumes every arm is an unconditional constant. */
+                int target_slot = reserve(cg, 8);
+                int end_label = cg->label_count++;
+                emit_expr(cg, n->children[0]);
+                fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", target_slot);
+                for (size_t i = 1; i < n->child_count; i++) {
+                    ASTNode *arm = n->children[i];
+                    if (arm->is_default_case) continue;
+                    int matched_label = cg->label_count++;
+                    int next_label = cg->label_count++;
+                    if (arm->match_literal_count > 0) {
+                        for (int j = 0; j < arm->match_literal_count; j++) {
+                            fprintf(cg->out, "    cmp QWORD PTR [rbp-%d], %lld\n    je .Lmatch_lit_%d\n",
+                                    target_slot, (long long)arm->match_literals[j], matched_label);
+                        }
+                        fprintf(cg->out, "    jmp .Lmatch_next_%d\n", next_label);
+                    }
+                    /* Zero literals means an unconditional `_ if guard`
+                       pattern: fall straight into the guard check below. */
+                    fprintf(cg->out, ".Lmatch_lit_%d:\n", matched_label);
+                    if (arm->match_guard) {
+                        emit_expr(cg, arm->match_guard);
+                        fprintf(cg->out, "    cmp rax, 0\n    je .Lmatch_next_%d\n", next_label);
+                    }
+                    if (arm->child_count > 0) emit_statement(cg, arm->children[0]);
+                    fprintf(cg->out, "    jmp .Lmatch_end_%d\n", end_label);
+                    fprintf(cg->out, ".Lmatch_next_%d:\n", next_label);
+                }
+                for (size_t i = 1; i < n->child_count; i++) {
+                    ASTNode *arm = n->children[i];
+                    if (arm->is_default_case && arm->child_count > 0) {
+                        emit_statement(cg, arm->children[0]);
+                        break;
+                    }
+                }
+                fprintf(cg->out, ".Lmatch_end_%d:\n", end_label);
+                return;
+            }
             int target_slot = reserve(cg, 8);
             int end_label = cg->label_count++;
             int fallback_label = cg->label_count++;

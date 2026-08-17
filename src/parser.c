@@ -1302,6 +1302,70 @@ static ASTNode *parse_statement(Parser *parser) {
         if (match(parser, TOKEN_COLON)) advance_token(parser);
         expect(parser, TOKEN_LBRACE, "Expected '{' after match expression");
         while (!match(parser, TOKEN_RBRACE) && !match(parser, TOKEN_EOF)) {
+            /* `_` is a wildcard arm, semantically identical to `else`, unless
+               it carries an `if` guard: `_ if cond:` matches unconditionally
+               (match_literal_count == 0) but only fires when the guard is
+               true, so it stays a literal-case arm and does not count toward
+               exhaustiveness the way a bare `_`/`else` does. */
+            if (match(parser, TOKEN_IDENTIFIER) && strcmp(parser->current_token.text, "_") == 0) {
+                Token wild_token = parser->current_token;
+                advance_token(parser);
+                ASTNode *case_node = parser_create_node_at(parser, AST_MATCH_CASE, "_", wild_token);
+                if (match(parser, TOKEN_IF)) {
+                    advance_token(parser);
+                    case_node->is_literal_case = true;
+                    case_node->match_guard = parse_expression(parser);
+                } else {
+                    case_node->is_default_case = true;
+                }
+                if (match(parser, TOKEN_COLON)) advance_token(parser);
+                ast_add_child(case_node, parse_block(parser));
+                ast_add_child(match_node, case_node);
+                continue;
+            }
+            /* Literal pattern arm: one or more int/bool literals (an
+               or-pattern), an optional `if` guard, then the body. This is
+               independent of the enum-variant `case` arm shape below;
+               is_literal_case disambiguates the two at IR/codegen time. */
+            if (match(parser, TOKEN_INT_LITERAL) || match(parser, TOKEN_TRUE) ||
+                match(parser, TOKEN_FALSE) || match(parser, TOKEN_MINUS)) {
+                Token pattern_token = parser->current_token;
+                ASTNode *case_node = parser_create_node_at(parser, AST_MATCH_CASE, NULL, pattern_token);
+                case_node->is_literal_case = true;
+                while (true) {
+                    bool negative = false;
+                    if (match(parser, TOKEN_MINUS)) { negative = true; advance_token(parser); }
+                    int64_t value;
+                    if (match(parser, TOKEN_TRUE)) { value = 1; advance_token(parser); }
+                    else if (match(parser, TOKEN_FALSE)) { value = 0; advance_token(parser); }
+                    else if (match(parser, TOKEN_INT_LITERAL)) {
+                        bool is_unsigned = false;
+                        uint64_t magnitude = parse_integer_magnitude(parser, &is_unsigned);
+                        value = negative ? -(int64_t)magnitude : (int64_t)magnitude;
+                        advance_token(parser);
+                    } else {
+                        fprintf(stderr, "%s:%d:%d: error: expected literal pattern in match arm\n",
+                                parser->source_file, parser->current_token.line, parser->current_token.col);
+                        exit(1);
+                    }
+                    if (case_node->match_literal_count >= 8) {
+                        fprintf(stderr, "%s:%d:%d: error: match arm has too many or-pattern values (max 8)\n",
+                                parser->source_file, parser->current_token.line, parser->current_token.col);
+                        exit(1);
+                    }
+                    case_node->match_literals[case_node->match_literal_count++] = value;
+                    if (!match(parser, TOKEN_COMMA)) break;
+                    advance_token(parser);
+                }
+                if (match(parser, TOKEN_IF)) {
+                    advance_token(parser);
+                    case_node->match_guard = parse_expression(parser);
+                }
+                if (match(parser, TOKEN_COLON)) advance_token(parser);
+                ast_add_child(case_node, parse_block(parser));
+                ast_add_child(match_node, case_node);
+                continue;
+            }
             if (match(parser, TOKEN_CASE)) {
                 advance_token(parser);
                 if (!match(parser, TOKEN_IDENTIFIER) && !match(parser, TOKEN_NONE)) {

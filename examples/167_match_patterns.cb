@@ -1,0 +1,64 @@
+def digit_name(n: i64) -> i64: {
+    match n: {
+        0: { return 100 }
+        1: { return 101 }
+        2: { return 102 }
+        _: { return -1 }
+    }
+    return -2
+}
+
+def is_weekend(day: i64) -> i64: {
+    match day: {
+        6, 7: { return 1 }
+        _: { return 0 }
+    }
+    return -1
+}
+
+def bucket(n: i64) -> i64: {
+    match n: {
+        _ if n < 0: { return -1 }
+        0: { return 0 }
+        _ if n > 100: { return 2 }
+        _: { return 1 }
+    }
+    return -9
+}
+
+def flag_label(flag: bool) -> i64: {
+    match flag: {
+        true: { return 1 }
+        false: { return 0 }
+    }
+    return -1
+}
+
+def test_literal_match_wildcard(): {
+    assert(digit_name(0) == 100)
+    assert(digit_name(1) == 101)
+    assert(digit_name(2) == 102)
+    assert(digit_name(9) == -1)
+    return 0
+}
+
+def test_or_pattern_match(): {
+    assert(is_weekend(6) == 1)
+    assert(is_weekend(7) == 1)
+    assert(is_weekend(3) == 0)
+    return 0
+}
+
+def test_guard_clause_match(): {
+    assert(bucket(-5) == -1)
+    assert(bucket(0) == 0)
+    assert(bucket(50) == 1)
+    assert(bucket(101) == 2)
+    return 0
+}
+
+def test_bool_literal_match(): {
+    assert(flag_label(true) == 1)
+    assert(flag_label(false) == 0)
+    return 0
+}

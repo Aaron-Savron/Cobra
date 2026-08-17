@@ -791,7 +791,27 @@ Finish the language contracts for:
   tests/negative/102_cast_f64_reserved.cb cover the rejected cases.
 - Constant evaluation
 - Compile-time execution
-- Richer pattern matching
+- [x] Richer pattern matching (partial). `match` arms now also accept
+  literal int/bool patterns alongside the pre-existing enum-variant `case`
+  form, on an integer or bool scrutinee: `match n: { 0: {...} 1: {...} _:
+  {...} }`. Adds, on top of the existing enum-variant match: a `_` wildcard
+  arm (same semantics as `else`); or-patterns (`6, 7: {...}`, up to 8
+  literals per arm, new `match_literals`/`match_literal_count` on
+  AST_MATCH_CASE); and `if` guards (`5 if cond: {...}`, or `_ if cond:
+  {...}` for an unconditional-pattern/guarded catch, via the new
+  `match_guard` field) - guards re-evaluate per arm since they can have
+  side effects, so a literal-pattern match compiles to a sequential
+  compare-and-branch chain rather than the jump table the plain
+  enum-variant form still uses. A literal match with no default/`_` arm is
+  rejected as non-exhaustive except for `bool`, where `true`/`false` both
+  present is recognized as exhaustive; comparing a literal pattern against
+  a non-integer/bool scrutinee (e.g. `string`) is rejected too
+  (examples/167_match_patterns.cb,
+  tests/negative/100_match_non_exhaustive_literal.cb,
+  tests/negative/101_match_literal_type_mismatch.cb). Out of scope still:
+  struct field/nested destructuring patterns in match arms - deliberately
+  the same flat-destructuring boundary chosen for `let (a, b) = ...`
+  tuple binding, not attempted here.
 - Package visibility
 - Stable module rules
 

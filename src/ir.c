@@ -3335,6 +3335,82 @@ static void validate_match_arm_block(ASTNode *block, IRContext *ctx) {
     ctx->count = saved_count;
 }
 
+/* Literal-pattern match: `match x: { 0: ... 1, 2: ... n if n > 10: ... _: ... }`.
+   Unlike the enum-variant form below, the domain of the scrutinee (any
+   integer or bool) is unbounded/impractical to prove exhaustive from a
+   finite literal list, so an else/_ arm is always required rather than
+   computed from variant coverage. */
+static void validate_literal_match_statement(ASTNode *node, IRContext *ctx, CobraTypeKind target_type) {
+    if (target_type != COBRA_TYPE_UNKNOWN && !is_integer(target_type) && target_type != COBRA_TYPE_BOOL) {
+        ir_error(ctx, node, "literal match patterns require an integer or bool scrutinee");
+        return;
+    }
+    bool has_default = false;
+    int64_t seen_literals[64];
+    int seen_count = 0;
+    for (size_t i = 1; i < node->child_count; i++) {
+        ASTNode *arm = node->children[i];
+        if (arm->type != AST_MATCH_CASE || arm->child_count == 0) {
+            ir_error(ctx, arm, "invalid match arm");
+            continue;
+        }
+        if (arm->is_default_case) {
+            if (has_default) ir_error(ctx, arm, "match may contain only one else/_ arm");
+            has_default = true;
+            validate_match_arm_block(arm->children[0], ctx);
+            continue;
+        }
+        if (!arm->is_literal_case) {
+            ir_error(ctx, arm, "cannot mix enum-variant case arms with literal patterns in the same match");
+            validate_match_arm_block(arm->children[0], ctx);
+            continue;
+        }
+        if (target_type == COBRA_TYPE_BOOL) {
+            for (int j = 0; j < arm->match_literal_count; j++) {
+                if (arm->match_literals[j] != 0 && arm->match_literals[j] != 1) {
+                    ir_error(ctx, arm, "bool match pattern must be true or false");
+                }
+            }
+        }
+        if (!arm->match_guard) {
+            for (int j = 0; j < arm->match_literal_count; j++) {
+                bool dup = false;
+                for (int k = 0; k < seen_count; k++) {
+                    if (seen_literals[k] == arm->match_literals[j]) { dup = true; break; }
+                }
+                if (dup) {
+                    ir_error(ctx, arm, "duplicate literal value in match");
+                } else if (seen_count < 64) {
+                    seen_literals[seen_count++] = arm->match_literals[j];
+                }
+            }
+        }
+        if (arm->match_guard) {
+            IRLocal saved_locals[128];
+            size_t saved_count = ctx->count;
+            memcpy(saved_locals, ctx->locals, sizeof(saved_locals));
+            CobraTypeKind guard_type = infer_expr(arm->match_guard, ctx);
+            if (guard_type != COBRA_TYPE_BOOL && guard_type != COBRA_TYPE_UNKNOWN && !is_integer(guard_type)) {
+                ir_error(ctx, arm, "match guard must be a boolean expression");
+            }
+            memcpy(ctx->locals, saved_locals, sizeof(saved_locals));
+            ctx->count = saved_count;
+        }
+        validate_match_arm_block(arm->children[0], ctx);
+    }
+    if (!has_default && target_type == COBRA_TYPE_BOOL) {
+        bool seen_true = false, seen_false = false;
+        for (int k = 0; k < seen_count; k++) {
+            if (seen_literals[k] == 1) seen_true = true;
+            if (seen_literals[k] == 0) seen_false = true;
+        }
+        has_default = seen_true && seen_false;
+    }
+    if (!has_default) {
+        ir_error(ctx, node, "non-exhaustive match requires an else or _ arm");
+    }
+}
+
 static void validate_match_statement(ASTNode *node, IRContext *ctx) {
     if (!node || node->child_count < 2) {
         ir_error(ctx, node, "match requires a value and at least one arm");
@@ -3342,8 +3418,20 @@ static void validate_match_statement(ASTNode *node, IRContext *ctx) {
     }
     ASTNode *target = node->children[0];
     CobraTypeKind target_type = infer_expr(target, ctx);
+    bool any_literal_arm = false;
+    for (size_t i = 1; i < node->child_count; i++) {
+        if (node->children[i]->type == AST_MATCH_CASE && node->children[i]->is_literal_case) {
+            any_literal_arm = true;
+            break;
+        }
+    }
+    if (any_literal_arm || (target_type != COBRA_TYPE_ENUM &&
+                             (is_integer(target_type) || target_type == COBRA_TYPE_BOOL))) {
+        validate_literal_match_statement(node, ctx, target_type);
+        return;
+    }
     if (target_type != COBRA_TYPE_ENUM) {
-        ir_error(ctx, node, "match currently requires an enum value");
+        ir_error(ctx, node, "match currently requires an enum value or an integer/bool scrutinee with literal patterns");
         return;
     }
     IREnum *enum_decl = find_enum(ctx, cobra_type_node_name(target));

@@ -472,6 +472,16 @@ struct ASTNode {
     bool is_exported;
     /* Match cases use this flag for the single `else` arm. */
     bool is_default_case;
+    /* A literal-pattern match arm (`match x: { 0: ... }`) compares the
+       scrutinee against one or more constant values instead of an enum
+       variant tag; match_literals holds the or-pattern list (usually one
+       entry) and match_guard, if present, is an extra boolean the arm must
+       also satisfy. Kept distinct from match_type_name/int_val, which stay
+       reserved for the pre-existing enum-variant arm shape. */
+    bool is_literal_case;
+    int64_t match_literals[8];
+    int match_literal_count;
+    struct ASTNode *match_guard;
     /* Source imports are compile-time composition; C imports retain linker
        metadata and are handled by the native C bridge. */
     bool source_import;

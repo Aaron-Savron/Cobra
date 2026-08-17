@@ -1,0 +1,11 @@
+def classify(n: i64) -> i64: {
+    match n: {
+        0: { return 0 }
+        1: { return 1 }
+    }
+    return -1
+}
+
+def test_match_non_exhaustive_literal() -> i64: {
+    return classify(2)
+}
