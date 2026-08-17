@@ -3379,6 +3379,74 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
         }
         case AST_COMPTIME_EXPR:
             return hir_build_expr(b, node->child_count ? node->children[0] : NULL, out);
+        case AST_MEMBERSHIP: {
+            /* `key in dict` / `key not in dict` reuses the has() lowering -
+               list/array/slice membership scans are a separate, unscoped
+               gap (they need a loop inside expression position, which this
+               backend has no precedent for). */
+            if (node->child_count != 2 || node->children[1]->type != AST_VAR_REF) {
+                bir_fail(b, node->source_line, node->source_col,
+                         "membership test requires a named dict in the backend-IR subset");
+                return false;
+            }
+            int local = hir_require_local(b, node->children[1]->name,
+                                          node->source_line, node->source_col);
+            if (local < 0) return false;
+            if (!bir_is_owned_dict_type(b->fn->locals[local].type)) {
+                bir_fail(b, node->source_line, node->source_col,
+                         "membership test over a non-dict collection is outside the backend-IR subset");
+                return false;
+            }
+            if (node->children[0]->type != AST_STRING_LITERAL) {
+                bir_fail(b, node->source_line, node->source_col,
+                         "dict keys must be string literals in the backend-IR subset");
+                return false;
+            }
+            bool negated = strcmp(node->name, "not in") == 0;
+            expr = hir_expr_alloc(b, node->source_line, node->source_col);
+            if (!expr) return false;
+            expr->kind = HIR_EXPR_DICT_HAS;
+            expr->type = b->module->type_i64;
+            expr->local = (uint32_t)local;
+            snprintf(expr->dict_key, sizeof(expr->dict_key), "%s",
+                     node->children[0]->string_val);
+            expr->args = calloc(1, sizeof(HirExpr *));
+            if (!expr->args) {
+                hir_expr_free(expr);
+                return false;
+            }
+            expr->args[0] = hir_expr_alloc(b, node->source_line, node->source_col);
+            if (!expr->args[0]) {
+                hir_expr_free(expr);
+                return false;
+            }
+            expr->args[0]->kind = HIR_EXPR_LOCAL;
+            expr->args[0]->local = (uint32_t)local;
+            expr->args[0]->type = b->fn->locals[local].type;
+            expr->arg_count = 1;
+            if (negated) {
+                HirExpr *has = expr;
+                HirExpr *zero = hir_expr_alloc(b, node->source_line, node->source_col);
+                if (!zero) { hir_expr_free(has); return false; }
+                zero->kind = HIR_EXPR_CONST;
+                zero->type = b->module->type_i64;
+                zero->const_value = bir_scalar_i64(zero->type, 0);
+                expr = hir_expr_alloc(b, node->source_line, node->source_col);
+                if (!expr) { hir_expr_free(has); hir_expr_free(zero); return false; }
+                expr->kind = HIR_EXPR_BINOP;
+                expr->binop = SSA_OP_EQ;
+                expr->type = b->module->type_bool;
+                expr->args = calloc(2, sizeof(HirExpr *));
+                if (!expr->args) {
+                    hir_expr_free(has); hir_expr_free(zero); hir_expr_free(expr);
+                    return false;
+                }
+                expr->args[0] = has;
+                expr->args[1] = zero;
+                expr->arg_count = 2;
+            }
+            break;
+        }
         default:
             bir_fail(b, node->source_line, node->source_col,
                      "expression form is outside the backend-IR subset");
