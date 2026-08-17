@@ -2149,6 +2149,11 @@ int main(int argc, char **argv) {
         char *isolated_cpu_source = read_library_file("cpu.cb");
         char *isolated_time_source = read_library_file("time.cb");
         char *isolated_net_source = read_library_file("net.cb");
+        /* lib/http.cb is not part of this prelude yet: it needs a borrowed
+           u8-view local (`let window: []u8 = slice_u8(...)`) to type-check
+           against an owned-slice-typed local declaration, a distinct gap
+           from the ones fixed alongside fs/cpu/time/net above. See
+           ROADMAP.md's borrow-lifetime entry. */
         if (isolated_std_source) {
             source_buffer_append(&isolated_buffer, isolated_std_source, "lib/std.cb");
             free(isolated_std_source);

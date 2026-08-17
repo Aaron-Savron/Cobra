@@ -2826,6 +2826,20 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                     return false;
                 }
             }
+            /* A scalar u8 operand (a byte read from a []u8 buffer) is
+               already zero-extended in its full register/stack slot (see
+               x86_64_alloc.c's movzbq loads), so mixing it with i64 in
+               arithmetic needs no runtime instruction, just widening the
+               type tag - matching the direct backend's implicit u8-to-i64
+               promotion in binary operators. */
+            if (expr->args[0]->type && expr->args[0]->type->kind == COBRA_TYPE_U8 &&
+                expr->args[1]->type && expr->args[1]->type->kind == COBRA_TYPE_I64) {
+                expr->args[0]->type = expr->args[1]->type;
+            }
+            if (expr->args[1]->type && expr->args[1]->type->kind == COBRA_TYPE_U8 &&
+                expr->args[0]->type && expr->args[0]->type->kind == COBRA_TYPE_I64) {
+                expr->args[1]->type = expr->args[0]->type;
+            }
             /* Integer-backed unit enums support comparisons on their
                discriminants; arithmetic stays numeric-only. */
             bool is_comparison = op >= SSA_OP_EQ && op <= SSA_OP_GE;
@@ -3294,6 +3308,18 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                                                  callee->param_types[i])) {
                         hir_expr_free(expr);
                         return false;
+                    }
+                    /* A scalar u8 value (a byte read from a []u8 buffer, for
+                       instance) is already zero-extended into its full
+                       register/stack slot everywhere this backend stores it
+                       (see x86_64_alloc.c's movzbq loads) - passing one where
+                       an i64 parameter is expected needs no runtime
+                       instruction, just widening the type tag to match the
+                       direct backend's implicit u8-to-i64 call-argument
+                       promotion. */
+                    if (expr->args[i]->type && expr->args[i]->type->kind == COBRA_TYPE_U8 &&
+                        callee->param_types[i] && callee->param_types[i]->kind == COBRA_TYPE_I64) {
+                        expr->args[i]->type = callee->param_types[i];
                     }
                     if (!bir_call_arg_type_compatible(expr->args[i]->type,
                                                       callee->param_types[i])) {
