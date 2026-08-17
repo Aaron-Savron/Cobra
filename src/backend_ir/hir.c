@@ -4935,10 +4935,17 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
         if (block_terminated) continue; /* dead code after a return */
         switch (stmt->type) {
             case AST_VAR_DECL:
+            case AST_HEAP_DECL:
             case AST_ASSIGN: {
                 int existing = hir_find_local(b, stmt->name);
                 const CobraType *declared = NULL;
-                if (stmt->type == AST_VAR_DECL) {
+                /* `heap x = v` only differs from `let x = v` in lifetime
+                   tracking, which the type checker already validates (see
+                   ir.c's AST_HEAP_DECL case) - this backend has no separate
+                   heap-storage class for scalars, so it declares the local
+                   exactly like AST_VAR_DECL, matching the direct backend's
+                   codegen.c, which has no AST_HEAP_DECL case either. */
+                if (stmt->type == AST_VAR_DECL || stmt->type == AST_HEAP_DECL) {
                     declared = bir_import_ast_type(b->module, b->root, stmt, true);
                     if (!declared) {
                         bir_fail(b, stmt->source_line, stmt->source_col,
@@ -4970,7 +4977,7 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                     if (!hir_build_try_propagate(b, stmt->children[0], &value)) return false;
                 } else if (!hir_build_expr(b, stmt->children[0], &value)) return false;
                 if (!declared ||
-                    (stmt->type == AST_VAR_DECL &&
+                    ((stmt->type == AST_VAR_DECL || stmt->type == AST_HEAP_DECL) &&
                      stmt->declared_type == COBRA_TYPE_UNTYPED &&
                      !stmt->canonical_type)) declared = value->type;
                 /* A fresh concat assigned to a declared string is an owned
