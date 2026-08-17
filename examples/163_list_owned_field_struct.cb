@@ -1,0 +1,61 @@
+# list[T] where T is a struct with owned fields (string, and a nested
+# struct that itself has an owned string field). append copies the whole
+# struct into a private heap-owned element (see emit_list_append's struct
+# case); destroying the list (scope exit, explicit free, or loop-scoped
+# reuse) now walks every live element and frees its owned fields before
+# freeing the element itself and the backing buffer - see
+# emit_list_struct_element_cleanup in codegen.c.
+
+struct Inner: { label: string, value: i64 }
+struct Item: { name: string, count: i64, inner: Inner }
+
+def build(n: i64) -> list[Item]: {
+    let items: list[Item] = []
+    let i: i64 = 0
+    while i < n: {
+        let it: Item
+        it.name = "item-" + "x"
+        it.count = i
+        it.inner.label = "lbl-" + "y"
+        it.inner.value = i * 2
+        append(items, it)
+        i = i + 1
+    }
+    return items
+}
+
+def test_append_and_index_owned_fields(): {
+    let items: list[Item] = build(50)
+    assert(len(items) == 50)
+    let e0: Item = items[0]
+    assert(e0.name == "item-x")
+    let e7: Item = items[7]
+    assert(e7.count == 7)
+    assert(e7.inner.label == "lbl-y")
+    assert(e7.inner.value == 14)
+}
+
+def test_iterate_owned_fields(): {
+    let items: list[Item] = build(20)
+    let total: i64 = 0
+    for it in items: {
+        assert(it.name == "item-x")
+        total = total + it.count
+    }
+    assert(total == 190)
+}
+
+def test_explicit_free(): {
+    let items: list[Item] = build(30)
+    assert(len(items) == 30)
+    free(items)
+}
+
+def test_repeated_build_no_crash(): {
+    let round: i64 = 0
+    while round < 200: {
+        let items: list[Item] = build(10)
+        assert(len(items) == 10)
+        round = round + 1
+    }
+}

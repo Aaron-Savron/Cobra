@@ -484,6 +484,55 @@ static void emit_struct_owned_field_frees(CodeGen *cg, const CobraType *canonica
     }
 }
 
+/* Register-relative counterpart to emit_struct_owned_field_frees: frees
+   owned string/slice fields of a struct reached through a heap pointer
+   (list element) rather than a stack local. `reg` must be callee-saved
+   (rbx) since it stays live across the `free@PLT` calls this emits. */
+static void emit_heap_struct_owned_field_frees(CodeGen *cg, const CobraType *canonical,
+                                               const char *reg, int base_offset, int depth) {
+    if (!canonical || depth > 8) return;
+    for (size_t f = 0; f < canonical->field_count; f++) {
+        const CobraTypeField *field = &canonical->fields[f];
+        if (!field->type) continue;
+        int field_offset = base_offset + (int)field->offset;
+        if (field->ownership == COBRA_OWNERSHIP_OWNED &&
+            (field->type->kind == COBRA_TYPE_STRING || cobra_type_is_slice_kind(field->type->kind))) {
+            fprintf(cg->out,
+                    "    mov rdi, QWORD PTR [%s + %d]\n    cmp rdi, 0\n    je .Lheap_autofree_skip_%d\n    call free@PLT\n.Lheap_autofree_skip_%d:\n",
+                    reg, field_offset, cg->label_count, cg->label_count);
+            cg->label_count++;
+        } else if (field->type->kind == COBRA_TYPE_STRUCT) {
+            emit_heap_struct_owned_field_frees(cg, field->type, reg, field_offset, depth + 1);
+        }
+    }
+}
+
+/* Freeing list[T] where T is a struct: emit_list_append heap-allocates a
+   private copy of each element (see its struct case), so those copies are
+   exclusively owned by the list's own buffer - nothing else can alias them.
+   Before the buffer itself is freed, walk every live element, free any
+   owned string/slice fields it carries (recursing into embedded structs
+   just like emit_struct_owned_field_frees does for a stack local), then
+   free the element's own heap block. Scalar-only struct elements just get
+   the block itself freed, closing the leak emit_list_append's malloc
+   otherwise left behind. */
+static void emit_list_struct_element_cleanup(CodeGen *cg, VarSymbol *s) {
+    if (s->element_type != COBRA_TYPE_STRUCT || !s->type_name[0]) return;
+    const CobraType *canonical = (cg->root && cg->root->canonical_arena)
+        ? cobra_type_struct_layout(cg->root->canonical_arena, cg->root, s->type_name) : NULL;
+    if (!canonical) return;
+    int loop = cg->label_count++;
+    int i = reserve(cg, 8);
+    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], 0\n.Llist_elem_free_%d:\n", i, loop);
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    cmp rax, QWORD PTR [rbp-%d]\n    jge .Llist_elem_free_done_%d\n",
+            i, s->length_offset, loop);
+    fprintf(cg->out, "    mov rbx, QWORD PTR [rbp-%d]\n    mov rbx, QWORD PTR [rbx + rax*8]\n", s->offset);
+    emit_heap_struct_owned_field_frees(cg, canonical, "rbx", 0, 0);
+    fprintf(cg->out, "    mov rdi, rbx\n    call free@PLT\n");
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    add rax, 1\n    mov QWORD PTR [rbp-%d], rax\n    jmp .Llist_elem_free_%d\n.Llist_elem_free_done_%d:\n",
+            i, i, loop, loop);
+}
+
 /* A list/dict reference parameter's local descriptor slots are a private
    working copy seeded from the caller's block at function entry (see the
    COBRA_TYPE_LIST/COBRA_TYPE_DICT parameter-binding branches in
@@ -516,6 +565,7 @@ static void emit_scope_cleanup(CodeGen *cg, const char *skip_name) {
         VarSymbol *s = &cg->symbols[i];
         if (!s->owned || (skip_name && strcmp(skip_name, s->name) == 0)) continue;
         if (s->kind == SYM_LIST) {
+            emit_list_struct_element_cleanup(cg, s);
             fprintf(cg->out,
                     "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free@PLT\n",
                     s->offset, s->length_offset, s->capacity_offset);
@@ -1604,6 +1654,38 @@ static void emit_index_store(CodeGen *cg, const char *name, ASTNode **indices, s
         fprintf(cg->out, "    cmp rdx, QWORD PTR [rbp-%d]\n    jae .Lstore_fail_%d\n", s->length_offset, fail);
     }
     fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rdx\n", address);
+    if (s->kind == SYM_LIST && s->element_type == COBRA_TYPE_STRUCT) {
+        /* Index-write into list[Struct] mirrors emit_list_append's struct
+           case: the new element gets its own heap-owned copy (never the
+           source expression's raw address - see append's comment for why).
+           The slot's old element is freed first - its owned fields, then
+           the element block itself - so overwriting a slot never leaks or
+           leaves an element double-referenced. */
+        int struct_size = struct_storage_size(cg, s->type_name);
+        int src_slot = reserve(cg, 8), new_slot = reserve(cg, 8), old_slot = reserve(cg, 8);
+        emit_expr(cg, value);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", src_slot);
+        fprintf(cg->out, "    mov rdi, %d\n    call malloc@PLT\n", struct_size);
+        fprintf(cg->out, "    mov rdi, rax\n    mov rsi, QWORD PTR [rbp-%d]\n", src_slot);
+        emit_copy_memory(cg, "rsi", "rdi", struct_size);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rdi\n", new_slot);
+        emit_load_buffer_ptr(cg, name, "rbx");
+        fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n    mov rax, QWORD PTR [rbx + rdx*8]\n    mov QWORD PTR [rbp-%d], rax\n",
+                address, old_slot);
+        const CobraType *canonical = (cg->root && cg->root->canonical_arena)
+            ? cobra_type_struct_layout(cg->root->canonical_arena, cg->root, s->type_name) : NULL;
+        fprintf(cg->out, "    mov rbx, QWORD PTR [rbp-%d]\n", old_slot);
+        if (canonical) emit_heap_struct_owned_field_frees(cg, canonical, "rbx", 0, 0);
+        fprintf(cg->out, "    mov rdi, rbx\n    call free@PLT\n");
+        emit_load_buffer_ptr(cg, name, "rbx");
+        fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbx + rdx*8], rax\n",
+                address, new_slot);
+        fprintf(cg->out, "    jmp .Lstore_done_%d\n", fail);
+        fprintf(cg->out, ".Lstore_fail_%d:\n", fail);
+        emit_failure_at(cg, count > 0 ? indices[0] : value, "buffer index out of bounds");
+        fprintf(cg->out, ".Lstore_done_%d:\n", fail);
+        return;
+    }
     emit_expr(cg, value);
     fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n", address);
     emit_load_buffer_ptr(cg, name, "rbx");
@@ -3206,6 +3288,7 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
     if (!strcmp(n->name, "free")) {
         if (n->child_count && n->children[0]->type == AST_VAR_REF) {
             VarSymbol *s = find_symbol(cg, n->children[0]->name);            if (s && s->kind == SYM_LIST) {
+                emit_list_struct_element_cleanup(cg, s);
                 fprintf(cg->out, "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free@PLT\n", s->offset, s->length_offset, s->capacity_offset);
                 s->owned = false;
                 return;
@@ -4397,6 +4480,7 @@ static void emit_loop_owned_cleanup(CodeGen *cg, ASTNode *body) {
         VarSymbol *s = find_symbol(cg, cands[i].name);
         if (!s || !s->owned) continue;
         if (s->kind == SYM_LIST) {
+            emit_list_struct_element_cleanup(cg, s);
             fprintf(cg->out,
                     "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free@PLT\n",
                     s->offset, s->length_offset, s->capacity_offset);

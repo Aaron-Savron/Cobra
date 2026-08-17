@@ -559,7 +559,7 @@ Finish the language contracts for:
 - [x] Scalar generic collections over `list[T]` with canonical substitution,
   owned-buffer calls, returns, append, pop, destruction, and ownership checks
 - [ ] Owned generic values
-- Non-scalar generic collections (list[T] for all-scalar-field struct T now works for append/index/iteration; owned-field T remains deferred)
+- Non-scalar generic collections (list[T] for all-scalar-field struct T works for append/index/iteration; list[T] for a struct T with owned fields - owned strings, owned slices, or nested owning structs - now also works for append, index-read, index-write, iteration, and destruction: each append/index-write gives the element its own heap-owned copy, and destroying the list (scope exit, explicit `free`, or loop-scoped reuse) walks every live element and frees its owned fields before freeing the element and the buffer. No new move-tracking was added - a source local passed to append is simply left un-autofreed by the existing conservative autofree analysis, matching the codebase's existing leak-not-double-free convention for owned struct fields. `pop` is not implemented for list[T] at all yet (only for dict), so pop-out-of-list ownership transfer remains unaddressed for any element type)
 - Generic dictionaries
 - [x] Scalar mutable generic slices through `out []T` writable views, including
   indexed stores, calls, borrowed returns, provenance, and borrow-contract checks
