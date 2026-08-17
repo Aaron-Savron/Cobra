@@ -3974,6 +3974,25 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                 }
                 break;
             }
+            case AST_COMPUTE_BLOCK: {
+                /* @compute is a vectorization hint for the direct backend
+                   (see codegen.c's AST_COMPUTE_BLOCK case); lowering the
+                   wrapped block as plain statements matches that behavior. */
+                if (stmt->child_count != 1) {
+                    bir_fail(b, stmt->source_line, stmt->source_col,
+                             "compute block form is outside the backend-IR subset");
+                    return false;
+                }
+                ASTNode *body = stmt->children[0];
+                bool inner_terminated = false;
+                if (!hir_build_stmt_list(b, body->children, body->child_count,
+                                         &inner_terminated)) {
+                    return false;
+                }
+                cur = b->current;
+                if (inner_terminated) block_terminated = true;
+                break;
+            }
             default:
                 bir_fail(b, stmt->source_line, stmt->source_col,
                          "statement form is outside the backend-IR subset");
