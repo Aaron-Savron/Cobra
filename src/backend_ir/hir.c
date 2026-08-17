@@ -785,6 +785,26 @@ static HirExpr *hir_coerce_int_const(HirBuilder *b, HirExpr *value,
 static bool hir_complete_sum_type(HirBuilder *b, HirExpr *expr,
                                   const CobraType *expected) {
     if (!expr || expr->kind != HIR_EXPR_SUM_MAKE) return true;
+    /* A bare `none` against a plain scalar declaration (not an Option/Result)
+       is not really a sum value - the direct backend just treats it as that
+       scalar's zero value (codegen.c's AST_NONE_LITERAL emits `xor eax, eax`
+       unconditionally). Match that instead of demanding a sum type here. */
+    if (expr->sum_variant == 0 && expr->arg_count == 0 && !expr->type &&
+        expected && !bir_is_sum_type(expected) && cobra_type_is_scalar(expected)) {
+        expr->kind = HIR_EXPR_CONST;
+        expr->type = expected;
+        if (expected->kind == COBRA_TYPE_F32) {
+            expr->const_value = bir_scalar_f32(expected, 0.0f);
+        } else if (expected->kind == COBRA_TYPE_F64) {
+            expr->const_value = bir_scalar_f64(expected, 0.0);
+        } else if (expected->kind == COBRA_TYPE_BOOL) {
+            expr->const_value = bir_scalar_bool(expected, false);
+        } else {
+            expr->const_value = bir_scalar_i64(expected, 0);
+            expr->type = expected;
+        }
+        return true;
+    }
     if (expr->type) {
         if (!expected) return true;
         /* A fully determined some(x) can still narrow an integer constant
