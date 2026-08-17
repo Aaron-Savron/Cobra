@@ -4557,7 +4557,7 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
         if (cl >= 0) {
             const CobraType *t = b->fn->locals[cl].type;
             if (bir_is_owned_slice_type(t) || bir_is_owned_buffer_type(t) ||
-                bir_is_borrowed_view_type(t)) {
+                bir_is_borrowed_view_type(t) || t->kind == COBRA_TYPE_ARRAY) {
                 container_local = cl;
                 container_type = t;
                 element_type = cobra_type_element(t);
@@ -4582,7 +4582,7 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     }
     if (is_enumerate) {
         bir_fail(b, stmt->source_line, stmt->source_col,
-                 "enumerate() source must be a named slice or list local in the backend-IR subset");
+                 "enumerate() source must be a named array, slice, or list local in the backend-IR subset");
         return false;
     }
     /* dict iteration (or any other unrecognized target shape) is diagnosed
