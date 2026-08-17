@@ -1,0 +1,56 @@
+# pop(list, default) removes and returns the last element, mirroring dict's
+# pop(dict, key, default): an empty list yields the default instead of a
+# runtime abort, so no Option wrapper is needed. Struct elements transfer
+# their owned fields out of the list's heap-owned element block (see
+# emit_list_pop in codegen.c) before that block is freed.
+
+struct Item: { name: string, count: i64 }
+
+def test_pop_scalar_to_empty(): {
+    let xs: list[i64] = []
+    append(xs, 10)
+    append(xs, 20)
+    append(xs, 30)
+    assert(len(xs) == 3)
+    assert(pop(xs, -1) == 30)
+    assert(pop(xs, -1) == 20)
+    assert(len(xs) == 1)
+    assert(pop(xs, -1) == 10)
+    assert(len(xs) == 0)
+}
+
+def test_pop_empty_list_returns_default(): {
+    let xs: list[i64] = []
+    assert(pop(xs, -1) == -1)
+    assert(pop(xs, 99) == 99)
+    assert(len(xs) == 0)
+}
+
+def test_pop_struct(): {
+    let items: list[Item] = []
+    let a: Item
+    a.name = "first"
+    a.count = 1
+    append(items, a)
+    let b: Item
+    b.name = "second"
+    b.count = 2
+    append(items, b)
+
+    let fallback: Item
+    fallback.name = "none"
+    fallback.count = 0
+
+    let popped: Item = pop(items, fallback)
+    assert(popped.name == "second")
+    assert(popped.count == 2)
+    assert(len(items) == 1)
+
+    let popped2: Item = pop(items, fallback)
+    assert(popped2.name == "first")
+    assert(len(items) == 0)
+
+    let popped3: Item = pop(items, fallback)
+    assert(popped3.name == "none")
+    assert(popped3.count == 0)
+}

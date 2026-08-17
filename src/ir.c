@@ -2104,6 +2104,31 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
             node->value_type = COBRA_TYPE_I64;
             return node->value_type;
         }
+        case AST_CAST_EXPR: {
+            CobraTypeKind source = node->child_count > 0
+                ? infer_expr(node->children[0], ctx) : COBRA_TYPE_UNKNOWN;
+            CobraTypeKind target = node->declared_type;
+            /* f64 is reserved language-wide (see the other "f64 is reserved"
+               sites above) until native double-precision lowering lands, so
+               casts must not be a backdoor into an otherwise-blocked type. */
+            if (source == COBRA_TYPE_F64 || target == COBRA_TYPE_F64) {
+                ir_error(ctx, node, "f64 is reserved until native double-precision lowering is implemented");
+                return COBRA_TYPE_UNKNOWN;
+            }
+            bool source_ok = source == COBRA_TYPE_UNKNOWN || is_integer(source) ||
+                source == COBRA_TYPE_F32 || source == COBRA_TYPE_BOOL;
+            bool target_ok = is_integer(target) || target == COBRA_TYPE_F32 ||
+                target == COBRA_TYPE_BOOL;
+            if (!source_ok || !target_ok) {
+                char message[180];
+                snprintf(message, sizeof(message), "cannot cast %s to %s; 'as' only converts between numeric and bool scalar types",
+                         type_name(source), type_name(target));
+                ir_error(ctx, node, message);
+                return COBRA_TYPE_UNKNOWN;
+            }
+            node->value_type = target;
+            return node->value_type;
+        }
         case AST_MEMBERSHIP: {
             if (node->child_count != 2) {
                 ir_error(ctx, node, "membership requires (element, collection)");
@@ -2683,6 +2708,23 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                 }
                 node->value_type = COBRA_TYPE_VOID;
                 return node->value_type;
+            }
+            if (strcmp(node->name, "pop") == 0) {
+                CobraTypeKind target0 = node->child_count > 0 ? infer_expr(node->children[0], ctx) : COBRA_TYPE_UNKNOWN;
+                if (target0 == COBRA_TYPE_LIST) {
+                    if (node->child_count != 2) ir_error(ctx, node, "list pop requires (list, default)");
+                    IRLocal *list_local = node->children[0]->type == AST_VAR_REF ?
+                        find_local_entry(ctx, node->children[0]->name) : NULL;
+                    CobraTypeKind indexed_element = list_local ? list_local->element_type : COBRA_TYPE_UNTYPED;
+                    CobraTypeKind default_type = node->child_count > 1 ? infer_expr(node->children[1], ctx) : COBRA_TYPE_UNKNOWN;
+                    if (indexed_element != COBRA_TYPE_UNTYPED && default_type != COBRA_TYPE_UNKNOWN &&
+                        default_type != indexed_element && !(is_integer(indexed_element) && is_integer(default_type))) {
+                        ir_error(ctx, node, "pop default does not match the list element type");
+                    }
+                    node->value_type = indexed_element == COBRA_TYPE_F32 ? COBRA_TYPE_F32 :
+                                       (indexed_element != COBRA_TYPE_UNTYPED ? indexed_element : COBRA_TYPE_I64);
+                    return node->value_type;
+                }
             }
             if (strcmp(node->name, "set") == 0 || strcmp(node->name, "get") == 0 ||
                 strcmp(node->name, "has") == 0 || strcmp(node->name, "delete") == 0 ||

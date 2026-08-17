@@ -1544,6 +1544,56 @@ static void emit_list_append(CodeGen *cg, VarSymbol *s, ASTNode *value) {
     }
 }
 
+/* pop(list, default) mirrors dict's pop convention: an empty list yields the
+   default instead of a runtime abort, so pop never needs an Option wrapper.
+   Struct elements are copied out of their heap-owned block (see
+   emit_list_append's struct case) into a scratch stack region before the
+   block itself is freed - the scratch copy keeps the popped struct's owned
+   fields alive across the free() call so the caller's value never reads
+   through freed memory, and the list's buffer is left holding no reference
+   to the block at all (length already dropped past it). */
+static void emit_list_pop(CodeGen *cg, VarSymbol *s, ASTNode *default_expr) {
+    int empty = cg->label_count++, done = cg->label_count++;
+    fprintf(cg->out, "    cmp QWORD PTR [rbp-%d], 0\n    je .Llist_pop_empty_%d\n", s->length_offset, empty);
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    sub rax, 1\n    mov QWORD PTR [rbp-%d], rax\n",
+            s->length_offset, s->length_offset);
+    if (s->element_type == COBRA_TYPE_STRUCT) {
+        int struct_size = struct_storage_size(cg, s->type_name);
+        int scratch = reserve(cg, struct_size);
+        int elem_ptr = reserve(cg, 8);
+        emit_load_buffer_ptr(cg, s->name, "rbx");
+        fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov rax, QWORD PTR [rbx + rax*8]\n    mov QWORD PTR [rbp-%d], rax\n",
+                s->length_offset, elem_ptr);
+        fprintf(cg->out, "    mov rsi, rax\n    lea rdi, [rbp-%d]\n", scratch);
+        emit_copy_memory(cg, "rsi", "rdi", struct_size);
+        fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    call free@PLT\n", elem_ptr);
+        fprintf(cg->out, "    lea rax, [rbp-%d]\n    jmp .Llist_pop_done_%d\n", scratch, done);
+        fprintf(cg->out, ".Llist_pop_empty_%d:\n", empty);
+        emit_expr(cg, default_expr);
+        fprintf(cg->out, "    mov rsi, rax\n    lea rdi, [rbp-%d]\n", scratch);
+        emit_copy_memory(cg, "rsi", "rdi", struct_size);
+        fprintf(cg->out, "    lea rax, [rbp-%d]\n", scratch);
+        fprintf(cg->out, ".Llist_pop_done_%d:\n", done);
+        return;
+    }
+    if (s->element_type == COBRA_TYPE_F32) {
+        emit_load_buffer_ptr(cg, s->name, "rbx");
+        fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    movss xmm0, DWORD PTR [rbx + rax*4]\n    jmp .Llist_pop_done_%d\n",
+                s->length_offset, done);
+        fprintf(cg->out, ".Llist_pop_empty_%d:\n", empty);
+        emit_expr(cg, default_expr);
+        if (!expression_is_float_codegen(cg, default_expr)) fprintf(cg->out, "    cvtsi2ss xmm0, rax\n");
+        fprintf(cg->out, ".Llist_pop_done_%d:\n", done);
+        return;
+    }
+    emit_load_buffer_ptr(cg, s->name, "rbx");
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov rax, QWORD PTR [rbx + rax*8]\n    jmp .Llist_pop_done_%d\n",
+            s->length_offset, done);
+    fprintf(cg->out, ".Llist_pop_empty_%d:\n", empty);
+    emit_expr(cg, default_expr);
+    fprintf(cg->out, ".Llist_pop_done_%d:\n", done);
+}
+
 static void emit_dict_set_key(CodeGen *cg, VarSymbol *s, const char *key, ASTNode *value) {
     int temp = reserve(cg, 8);
     emit_expr(cg, value);
@@ -3256,6 +3306,13 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
         if (!s || s->kind != SYM_LIST) { fprintf(stderr, "CodeGen Error: append target is not a list\\n"); exit(EXIT_FAILURE); }
         emit_list_append(cg, s, n->children[1]);
         return;
+    }
+    if (!strcmp(n->name, "pop") && n->child_count == 2 && n->children[0]->type == AST_VAR_REF) {
+        VarSymbol *maybe_list = find_symbol(cg, n->children[0]->name);
+        if (maybe_list && maybe_list->kind == SYM_LIST) {
+            emit_list_pop(cg, maybe_list, n->children[1]);
+            return;
+        }
     }
     if (!strcmp(n->name, "set")) {
         if (n->child_count != 3 || n->children[0]->type != AST_VAR_REF) {
