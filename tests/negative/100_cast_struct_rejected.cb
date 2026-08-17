@@ -1,0 +1,9 @@
+struct Point: { x: i64, y: i64 }
+
+def test_cast_struct_rejected() -> i64: {
+    let p: Point
+    p.x = 1
+    p.y = 2
+    let bad: i64 = p as i64
+    return bad
+}

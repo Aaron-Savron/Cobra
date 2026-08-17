@@ -1,0 +1,118 @@
+# expr as Type: explicit scalar numeric/bool conversion.
+#
+# Coverage is every pairwise combination among i32, i64, u8, u32, u64, f32,
+# and bool that the direct backend can express with one instruction sequence
+# (see emit_cast_int_width and the AST_CAST_EXPR case in codegen.c). f64 is
+# deliberately excluded - it stays reserved language-wide until native
+# double-precision lowering exists (see the "f64 is reserved" checks in
+# ir.c), so a cast to or from f64 is rejected the same as any other f64 use.
+#
+# int -> int narrowing truncates (two's-complement wraparound, no rounding).
+# int -> int widening sign- or zero-extends depending on the source type's
+# signedness. float -> int truncates toward zero (the "t" cvttss2si form,
+# not banker's/nearest rounding). int -> float and float -> float go through
+# the existing single-precision xmm path this backend already uses for
+# implicit mixed-numeric coercion.
+
+def test_i64_to_f32_widen() -> i64: {
+    let x: i64 = 42
+    let y: f32 = x as f32
+    assert(y == 42.0)
+    return 0
+}
+
+def test_f32_to_i64_truncates_not_rounds() -> i64: {
+    let x: f32 = 9.9
+    let y: i64 = x as i64
+    assert(y == 9)
+    let neg: f32 = 0.0 - 9.9
+    let neg_i: i64 = neg as i64
+    assert(neg_i == 0 - 9)
+    return 0
+}
+
+def test_u8_to_i64_zero_extends() -> i64: {
+    let x: u8 = 250
+    let y: i64 = x as i64
+    assert(y == 250)
+    return 0
+}
+
+def test_i64_to_u8_wraps() -> i64: {
+    let x: i64 = 1000
+    let y: u8 = x as u8
+    assert(y == 232)
+    return 0
+}
+
+def test_i32_widen_preserves_sign() -> i64: {
+    let x: i64 = 0 - 12345
+    let narrowed: i32 = x as i32
+    let widened: i64 = narrowed as i64
+    assert(widened == 0 - 12345)
+    return 0
+}
+
+def test_u32_widen_zero_extends() -> i64: {
+    let x: i64 = 0 - 1
+    let narrowed: u32 = x as u32
+    let widened: i64 = narrowed as i64
+    assert(widened == 4294967295)
+    return 0
+}
+
+def test_i64_to_u32_truncates() -> i64: {
+    let x: i64 = 4294967297
+    let y: u32 = x as u32
+    let back: i64 = y as i64
+    assert(back == 1)
+    return 0
+}
+
+def test_u64_narrows_to_u8() -> i64: {
+    let x: u64 = 258
+    let y: u8 = x as u8
+    assert(y == 2)
+    return 0
+}
+
+def test_bool_to_i64() -> i64: {
+    let flag: bool = true
+    let one: i64 = flag as i64
+    assert(one == 1)
+    let off: bool = false
+    let zero: i64 = off as i64
+    assert(zero == 0)
+    return 0
+}
+
+def test_i64_to_bool_is_nonzero() -> i64: {
+    let nonzero: i64 = 7
+    assert((nonzero as bool) == true)
+    let zero: i64 = 0
+    assert((zero as bool) == false)
+    return 0
+}
+
+def test_bool_to_f32() -> i64: {
+    let flag: bool = true
+    let f: f32 = flag as f32
+    assert(f == 1.0)
+    return 0
+}
+
+def test_f32_to_bool_is_nonzero() -> i64: {
+    let x: f32 = 0.5
+    assert((x as bool) == true)
+    let z: f32 = 0.0
+    assert((z as bool) == false)
+    return 0
+}
+
+def test_cast_binds_tighter_than_arithmetic() -> i64: {
+    let a: i64 = 2
+    let b: f32 = 3.5
+    let total: f32 = a as f32 + b
+    assert(total == 5.5)
+    return 0
+}

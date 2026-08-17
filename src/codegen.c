@@ -820,6 +820,23 @@ static VarSymbol *find_symbol(CodeGen *cg, const char *name) {
     return NULL;
 }
 
+/* Every integer-family type shares the same 8-byte GPR slot in this backend,
+   so an explicit cast has to actually re-shape the bit pattern in rax rather
+   than just relabel it: narrowing must wrap (mask off the high bits) and
+   widening a signed source must sign-extend rather than leave garbage above
+   the narrower width. Used both to normalize a source value up to a clean
+   64-bit quantity and to truncate a result down to its target width - same
+   instructions serve both directions. */
+static void emit_cast_int_width(CodeGen *cg, CobraTypeKind type) {
+    switch (type) {
+        case COBRA_TYPE_U8: fprintf(cg->out, "    movzx eax, al\n"); break;
+        case COBRA_TYPE_I32: fprintf(cg->out, "    movsxd rax, eax\n"); break;
+        case COBRA_TYPE_U32: fprintf(cg->out, "    mov eax, eax\n"); break;
+        case COBRA_TYPE_BOOL: fprintf(cg->out, "    movzx eax, al\n"); break;
+        default: break; /* i64/u64 already occupy the full register */
+    }
+}
+
 static bool expression_is_float_codegen(CodeGen *cg, ASTNode *node) {
     if (expression_is_float(node)) return true;
     if (!node) return false;
@@ -1785,6 +1802,31 @@ static void emit_index_store(CodeGen *cg, const char *name, ASTNode **indices, s
 static void emit_expr(CodeGen *cg, ASTNode *node) {
     if (!node) return;
     switch (node->type) {
+        case AST_CAST_EXPR: {
+            ASTNode *src = node->children[0];
+            CobraTypeKind from = src->value_type;
+            CobraTypeKind to = node->declared_type;
+            bool from_float = expression_is_float_codegen(cg, src) || from == COBRA_TYPE_F64;
+            bool to_float = to == COBRA_TYPE_F32 || to == COBRA_TYPE_F64;
+            emit_expr(cg, src);
+            /* f32 and f64 share this backend's single-precision xmm
+               representation (see the mixed-arithmetic coercion comment in
+               ir.c), so widening/narrowing between them costs no instruction. */
+            if (from_float && to_float) return;
+            if (to == COBRA_TYPE_BOOL) {
+                /* bool is "nonzero", not "nonzero after truncation" - a
+                   fractional float like 0.5 must cast to true, so this can't
+                   route through the truncating cvttss2si int path below. */
+                if (from_float) fprintf(cg->out, "    pxor xmm1, xmm1\n    ucomiss xmm0, xmm1\n    setne al\n    movzx eax, al\n");
+                else fprintf(cg->out, "    test rax, rax\n    setne al\n    movzx eax, al\n");
+                return;
+            }
+            if (from_float) fprintf(cg->out, "    cvttss2si rax, xmm0\n");
+            else emit_cast_int_width(cg, from);
+            if (to_float) { fprintf(cg->out, "    cvtsi2ss xmm0, rax\n"); return; }
+            emit_cast_int_width(cg, to);
+            return;
+        }
         case AST_INT_LITERAL: fprintf(cg->out, "    mov rax, %lld\n", (long long)node->literal_i64); return;
         case AST_FLOAT_LITERAL: emit_float_literal(cg, node->float_val); return;
         case AST_STRING_LITERAL: emit_string_literal(cg, node->string_val); return;

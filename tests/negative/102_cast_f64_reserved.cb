@@ -1,0 +1,5 @@
+def test_cast_f64_reserved() -> i64: {
+    let x: i64 = 3
+    let bad: f64 = x as f64
+    return 0
+}

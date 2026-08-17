@@ -74,6 +74,7 @@ typedef enum {
     TOKEN_REGION,
     TOKEN_TRAIT,
     TOKEN_IMPL,
+    TOKEN_AS,           // as (explicit numeric/bool cast: expr as Type)
     TOKEN_TYPE_I32,     // i32
     TOKEN_TYPE_I64,     // i64
     TOKEN_TYPE_U8,      // u8
@@ -215,7 +216,10 @@ typedef enum {
        reaches codegen as a free-standing addressable value the way a struct
        local does. Element types are restricted to scalars (see
        parse_type_into's tuple-type branch and parse_primary). */
-    AST_TUPLE
+    AST_TUPLE,
+    /* expr as Type -- explicit scalar numeric/bool conversion. child[0] is
+       the source expression; declared_type holds the target scalar type. */
+    AST_CAST_EXPR
 } ASTNodeType;
 
 typedef enum {

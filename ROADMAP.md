@@ -762,7 +762,33 @@ Finish the language contracts for:
   storage/parameter/return site that assumes a single 8-byte slot -
   deferred as a separate, larger ABI change.
 - Recursion
-- Casts and explicit conversions
+- [x] Casts and explicit conversions. `expr as Type` (new `TOKEN_AS`/`AST_CAST_EXPR`)
+  converts between the scalar numeric/bool types: i32, i64, u8, u32, u64, f32,
+  bool - full pairwise coverage across all seven, including bool <-> numeric.
+  f64 is excluded on purpose: it's already reserved language-wide (`let`,
+  params, returns all reject it - see the "f64 is reserved until native
+  double-precision lowering is implemented" checks in ir.c) and a cast is not
+  a backdoor around that. String/struct/collection casts are out of scope -
+  `as` only ever accepts a scalar numeric-or-bool source and target
+  (ir.c rejects anything else with "cannot cast ... 'as' only converts
+  between numeric and bool scalar types"). Parses at the same precedence as
+  the other postfix-ish primaries so `a + b as f32` reads as `a + (b as f32)`
+  (examples/166_casts.cb). Codegen (`emit_cast_int_width`,
+  src/codegen.c) is real bit-pattern conversion, not a type relabel:
+  int narrowing truncates (two's-complement wraparound - `1000 as u8 == 232`),
+  int widening sign- or zero-extends per the source type's signedness
+  (`movsxd` for i32, `movzx`/`mov r32,r32` for the unsigned widths),
+  float-to-int truncates toward zero via `cvttss2si` (not round-to-nearest),
+  int-to-float goes through the same `cvtsi2ss` path this backend already
+  uses for implicit mixed-numeric coercion, and bool conversions are a
+  nonzero test in either direction (float bool casts compare against 0.0
+  directly rather than routing through the truncating int path, so `0.5 as
+  bool` is `true`, not `false`). f32 and f64 share one single-precision xmm
+  representation in this backend already, so a hypothetical f32<->f64 cast
+  would cost no instruction - moot while f64 stays reserved.
+  tests/negative/100_cast_struct_rejected.cb,
+  tests/negative/101_cast_string_rejected.cb, and
+  tests/negative/102_cast_f64_reserved.cb cover the rejected cases.
 - Constant evaluation
 - Compile-time execution
 - Richer pattern matching

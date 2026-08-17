@@ -1103,20 +1103,47 @@ static bool is_comparison(Parser *parser) {
            match(parser, TOKEN_LTE) || match(parser, TOKEN_GTE);
 }
 
+static ASTNode *parse_cast(Parser *parser);
+
 static ASTNode *make_binary(Parser *parser, ASTNode *left) {
     char op[8];
     Token op_token = parser->current_token;
     strcpy(op, parser->current_token.text);
     advance_token(parser);
-    ASTNode *right = parse_primary(parser);
+    ASTNode *right = parse_cast(parser);
     ASTNode *binary = parser_create_node_at(parser, AST_BINARY_OP, op, op_token);
     ast_add_child(binary, left);
     ast_add_child(binary, right);
     return binary;
 }
 
-static ASTNode *parse_multiplicative(Parser *parser) {
+/* expr as Type binds tighter than the arithmetic operators (so `a + b as f32`
+   reads as `a + (b as f32)`) but looser than a primary, matching how most
+   C-like languages place an explicit cast. */
+static ASTNode *parse_cast(Parser *parser) {
     ASTNode *left = parse_primary(parser);
+    while (match(parser, TOKEN_AS)) {
+        Token op_token = parser->current_token;
+        advance_token(parser);
+        CobraTypeKind target = token_to_type(parser->current_token.type);
+        if (target != COBRA_TYPE_I32 && target != COBRA_TYPE_I64 &&
+            target != COBRA_TYPE_U8 && target != COBRA_TYPE_U32 && target != COBRA_TYPE_U64 &&
+            target != COBRA_TYPE_F32 && target != COBRA_TYPE_F64 && target != COBRA_TYPE_BOOL) {
+            fprintf(stderr, "%s:%d:%d: error: 'as' requires a scalar numeric or bool type\n",
+                    parser->source_file, parser->current_token.line, parser->current_token.col);
+            exit(1);
+        }
+        advance_token(parser);
+        ASTNode *cast = parser_create_node_at(parser, AST_CAST_EXPR, "as", op_token);
+        cast->declared_type = target;
+        ast_add_child(cast, left);
+        left = cast;
+    }
+    return left;
+}
+
+static ASTNode *parse_multiplicative(Parser *parser) {
+    ASTNode *left = parse_cast(parser);
     while (is_multiplicative(parser)) left = make_binary(parser, left);
     return left;
 }
@@ -2519,8 +2546,7 @@ ASTNode *parser_parse_program(Parser *parser) {
             ASTNode *import_node = parser_create_node_at(parser, AST_IMPORT_DECL, import_name, import_token);
             import_node->source_import = !is_c_import;
 
-            if (!is_c_import && match(parser, TOKEN_IDENTIFIER) &&
-                strcmp(parser->current_token.text, "as") == 0) {
+            if (!is_c_import && match(parser, TOKEN_AS)) {
                 advance_token(parser);
                 if (!match(parser, TOKEN_IDENTIFIER)) {
                     fprintf(stderr, "%s:%d:%d: error: expected module alias after 'as'\n",

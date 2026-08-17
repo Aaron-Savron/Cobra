@@ -1,0 +1,5 @@
+def test_cast_string_rejected() -> i64: {
+    let s: string = "hello"
+    let bad: i64 = s as i64
+    return bad
+}
