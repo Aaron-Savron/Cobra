@@ -2063,13 +2063,27 @@ static ASTNode *parse_trait_declaration(Parser *parser) {
 static ASTNode *parse_impl_declaration(Parser *parser) {
     Token impl_token = parser->current_token;
     expect(parser, TOKEN_IMPL, "Expected 'impl'");
+    char first_name[COBRA_MAX_IDENT_LEN];
+    copy_token_text(parser, first_name, sizeof(first_name), "trait or type name");
+    expect(parser, TOKEN_IDENTIFIER, "Expected trait or type name after 'impl'");
+
+    /* `impl Trait for Type: {...}` vs plain `impl Type: {...}` (no trait, a
+       bare method block on a struct) are told apart by whether 'for'
+       follows. Plain impls store an empty name as the sentinel meaning "no
+       trait" - real trait names come from TOKEN_IDENTIFIER text and can
+       never be empty, so this can't collide with a real trait-qualified
+       mangled name (see find_impl_method / the conformance pass skip). */
     char trait_name[COBRA_MAX_IDENT_LEN];
-    copy_token_text(parser, trait_name, sizeof(trait_name), "trait name");
-    expect(parser, TOKEN_IDENTIFIER, "Expected trait name after 'impl'");
-    expect(parser, TOKEN_FOR, "Expected 'for' after trait name in impl block");
     char type_name[COBRA_MAX_IDENT_LEN];
-    copy_token_text(parser, type_name, sizeof(type_name), "implementing type name");
-    expect(parser, TOKEN_IDENTIFIER, "Expected implementing type name after 'for'");
+    if (match(parser, TOKEN_FOR)) {
+        advance_token(parser);
+        snprintf(trait_name, sizeof(trait_name), "%.63s", first_name);
+        copy_token_text(parser, type_name, sizeof(type_name), "implementing type name");
+        expect(parser, TOKEN_IDENTIFIER, "Expected implementing type name after 'for'");
+    } else {
+        trait_name[0] = '\0';
+        snprintf(type_name, sizeof(type_name), "%.63s", first_name);
+    }
 
     ASTNode *impl_node = parser_create_node_at(parser, AST_IMPL_DECL, trait_name, impl_token);
     snprintf(impl_node->secondary_name, sizeof(impl_node->secondary_name), "%.63s", type_name);

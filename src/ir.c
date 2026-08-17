@@ -4463,6 +4463,12 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
     for (size_t i = 0; i < root->child_count; i++) {
         ASTNode *impl = root->children[i];
         if (impl->type != AST_IMPL_DECL) continue;
+        /* Plain (traitless) impl block: name left empty by the parser as the
+           sentinel (see parse_impl_declaration) since there is no trait to
+           conform to. Its methods are already registered as ordinary
+           top-level functions and find_impl_method resolves them the same
+           way as trait impls, so there is nothing left to validate here. */
+        if (impl->name[0] == '\0') continue;
         ASTNode *trait = NULL;
         for (size_t j = 0; j < root->child_count; j++) {
             if (root->children[j]->type == AST_TRAIT_DECL && strcmp(root->children[j]->name, impl->name) == 0) {

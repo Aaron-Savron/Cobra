@@ -576,7 +576,30 @@ Finish the language contracts for:
   Production codegen still rejects the syntax.
 - Tuples
 - Destructuring
-- Methods
+- [x] Plain struct methods, no trait required. `impl Type: { def method(params)
+  -> ret: { body } ... }` (same body as `parse_impl_declaration` already
+  parsed for `impl Trait for Type`, just without the `Trait for` prefix)
+  attaches methods directly to a struct. The parser tells the two forms
+  apart by whether `for` follows the first identifier; a plain impl stores
+  an empty trait name as the sentinel meaning "no trait" - real trait names
+  come from a `TOKEN_IDENTIFIER` and can never be empty, so the mangled name
+  (`__impl__<Type>_<method>`, empty trait segment) can't collide with any
+  real trait-qualified `__impl_<Trait>_<Type>_<method>`. `find_impl_method`
+  (src/ir.c) needed no change at all: it already matches on the impl's
+  `secondary_name` (implementing type) and method name only, ignoring the
+  trait name entirely, so `x.method(args)` resolution, call-site rewriting,
+  and codegen are shared unmodified with trait-based dispatch. The one
+  change on the IR side is the conformance pass skipping impl blocks whose
+  trait name is the empty sentinel, since there is nothing to conform to. A
+  struct can have both a plain `impl Type: {...}` and one or more
+  `impl Trait for Type: {...}` blocks at once; a duplicate method across
+  two plain impls (or a plain impl re-declaring the same name twice) is
+  caught for free by the existing duplicate-top-level-function check, since
+  every impl method - plain or trait - is registered as an ordinary
+  top-level function under its mangled name
+  (examples/162_plain_struct_methods.cb,
+  tests/negative/146_plain_impl_unknown_method.cb,
+  tests/negative/147_plain_impl_duplicate_method.cb).
 - [x] Non-capturing function values: `fn(...)->...` is a real checked
   signature type (scalar params + scalar/void return only), covering
   assignment, parameter passing, return, and indirect calls

@@ -1,0 +1,45 @@
+struct Point: { x: i64, y: i64 }
+
+impl Point: {
+    def sum(p: Point) -> i64: {
+        return p.x + p.y
+    }
+    def scaled(p: Point, factor: i64) -> i64: {
+        return (p.x + p.y) * factor
+    }
+}
+
+struct Circle: { radius: i64 }
+
+trait Shape: {
+    def area() -> i64
+}
+
+impl Circle: {
+    def label(c: Circle) -> i64: {
+        return c.radius
+    }
+}
+
+impl Shape for Circle: {
+    def area(c: Circle) -> i64: {
+        return c.radius * c.radius * 3
+    }
+}
+
+def test_plain_struct_method(): {
+    let p: Point
+    p.x = 3
+    p.y = 4
+    assert(p.sum() == 7)
+    assert(p.scaled(2) == 14)
+    return 0
+}
+
+def test_plain_and_trait_impl_coexist(): {
+    let c: Circle
+    c.radius = 2
+    assert(c.label() == 2)
+    assert(c.area() == 12)
+    return 0
+}
