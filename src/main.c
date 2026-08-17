@@ -2045,6 +2045,14 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(command, "test") == 0) {
+        if (use_isolated_backend) {
+            fprintf(stderr, "Error: 'cobra test --backend=native' is not supported yet; "
+                             "the isolated backend has no native test runner. Use "
+                             "'cobra build --backend=native' to check that a program compiles.\n");
+            free(combined_source);
+            ast_free(program);
+            return 1;
+        }
         CobraIR test_ir;
         if (!cobra_ir_build(program, &test_ir)) {
             free(combined_source);
