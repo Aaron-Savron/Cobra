@@ -545,6 +545,11 @@ typedef struct {
     const CobraType *return_value_type; /* pointer[return_type] for structs */
     bool has_hidden_return_storage;
     bool has_return;           /* false = void                         */
+    /* True for a name declared via `import c "lib.so" (...)`: no SSA body
+       (entry/first_block stay SSA_BLOCK_NONE) and calls to it bypass the
+       normal call_abi/param_types machinery in favor of the raw SysV
+       integer-register convention (see x86_emit_extern_call). */
+    bool is_extern;
 } BirFunctionInfo;
 
 typedef struct {
@@ -799,6 +804,10 @@ bool bir_declare_function(BackendIrModule *module, const char *name,
                            const CobraType *return_type, bool has_return);
 bool bir_validate_function_abi(const BackendIrModule *module,
                                const BirFunctionInfo *info);
+/* Registers a name declared via `import c "lib.so" (...)`: no signature, no
+   body, callable with up to BIR_ABI_MAX_GPR_ARGUMENT_REGISTERS raw i64
+   arguments (matching the direct backend's emit_import_call bridge). */
+bool bir_declare_extern_function(BackendIrModule *module, const char *name);
 bool bir_register_function_info(BackendIrModule *module, const char *name,
                                 SsaBlockRef entry, size_t param_count,
                                 const SsaValueRef *params,

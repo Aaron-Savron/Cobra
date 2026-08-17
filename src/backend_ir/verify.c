@@ -1503,6 +1503,14 @@ static bool check_block(VerifyCtx *ctx, SsaBlockRef ref) {
                 verr(ctx, "block b%u calls unknown function '%s'", ref, inst->callee);
                 return false;
             }
+            if (callee->is_extern) {
+                if (inst->operand_count > BIR_ABI_MAX_GPR_ARGUMENT_REGISTERS) {
+                    verr(ctx, "block b%u extern call '%s' has %u arguments, max %d",
+                         ref, inst->callee, inst->operand_count,
+                         BIR_ABI_MAX_GPR_ARGUMENT_REGISTERS);
+                    return false;
+                }
+            } else {
             if (inst->operand_count != callee->ssa_param_count ||
                 inst->operand_count != callee->call_abi.param_count) {
                 verr(ctx, "block b%u call '%s' has %u lowered arguments, expected %zu",
@@ -1533,6 +1541,7 @@ static bool check_block(VerifyCtx *ctx, SsaBlockRef ref) {
                         return false;
                     }
                 }
+            }
             }
             if (callee->has_hidden_return_storage) {
                 if (inst->type || inst->result != SSA_VALUE_NONE) {

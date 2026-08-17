@@ -1324,7 +1324,39 @@ static bool x86_call_arg_moves_ownership(const X86Context *ctx,
            bir_is_owned_slice_type(callee->param_value_types[user_arg]);
 }
 
+/* Imported C functions have no call_abi (declared with no signature - see
+   bir_declare_extern_function): every argument decays to a single 8-byte
+   GPR value, matching the direct backend's emit_import_call bridge. A view
+   argument passes only its base pointer; its length is dropped, exactly as
+   emit_expr on a slice var yields a bare pointer for the direct backend. */
+static bool x86_emit_extern_call(X86Context *ctx, const MirInst *inst) {
+    if (inst->operand_count > BIR_ABI_MAX_GPR_ARGUMENT_REGISTERS) return false;
+    for (size_t arg = 0; arg < inst->operand_count; arg++) {
+        MirReg value = ctx->module->arena.operands[inst->operand_start + arg];
+        MirMachineType type = ctx->module->arena.regs[value].machine_type;
+        const char *gpr = NULL;
+        if (!x86_gpr_name((uint16_t)arg, &gpr)) return false;
+        if (type == MIR_TYPE_VIEW) {
+            if (!x86_emit_load_view_component(ctx, value, false, "%r10")) return false;
+        } else if (x86_is_float(type)) {
+            return false;
+        } else {
+            if (!x86_emit_load_integer(ctx, value, "%r10", "%r10d")) return false;
+        }
+        fprintf(ctx->out, "    movq %%r10, %s\n", gpr);
+    }
+    fprintf(ctx->out, "    xorl %%eax, %%eax\n    call %s@PLT\n", inst->callee);
+    if (inst->result != MIR_REG_NONE) {
+        x86_emit_store_integer(ctx, inst->result, "%rax", "%eax");
+    }
+    return true;
+}
+
 static bool x86_emit_call(X86Context *ctx, const MirInst *inst) {
+    if (inst->callee_index < ctx->module->source->function_count &&
+        ctx->module->source->functions[inst->callee_index].is_extern) {
+        return x86_emit_extern_call(ctx, inst);
+    }
     const MirFunction *callee = &ctx->module->functions[inst->callee_index];
     const BirCallAbi *abi = &callee->call_abi;
     for (size_t arg = 0; arg < inst->operand_count; arg++) {
@@ -1525,6 +1557,7 @@ bool bir_x86_64_emit(const MirModule *module, FILE *out,
     if (!mir_verify(module, errbuf, errbuf_size)) return false;
     fprintf(out, ".text\n");
     for (size_t f = 0; f < module->function_count; f++) {
+        if (module->source->functions[f].is_extern) continue;
         X86Context ctx;
         memset(&ctx, 0, sizeof(ctx));
         ctx.module = module;

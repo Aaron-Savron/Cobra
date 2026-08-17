@@ -2351,6 +2351,34 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                 hir_expr_free(expr);
                 return false;
             }
+            if (callee->is_extern) {
+                if (node->child_count > BIR_ABI_MAX_GPR_ARGUMENT_REGISTERS) {
+                    bir_fail(b, node->source_line, node->source_col,
+                             "call '%s' has %zu arguments; imported C functions "
+                             "support at most %d in the backend-IR bridge",
+                             node->name, node->child_count,
+                             BIR_ABI_MAX_GPR_ARGUMENT_REGISTERS);
+                    hir_expr_free(expr);
+                    return false;
+                }
+                if (node->child_count) {
+                    expr->args = calloc(node->child_count, sizeof(HirExpr *));
+                    expr->arg_count = node->child_count;
+                    if (!expr->args) {
+                        bir_fail(b, node->source_line, node->source_col, "out of memory");
+                        hir_expr_free(expr);
+                        return false;
+                    }
+                    for (size_t i = 0; i < node->child_count; i++) {
+                        if (!hir_build_expr(b, node->children[i], &expr->args[i])) {
+                            hir_expr_free(expr);
+                            return false;
+                        }
+                    }
+                }
+                expr->type = b->module->type_i64;
+                break;
+            }
             if (!bir_validate_function_abi(b->module, callee)) {
                 bir_fail(b, node->source_line, node->source_col,
                          "call '%s' has invalid ABI metadata", node->name);
@@ -4692,6 +4720,21 @@ bool bir_build_program(BackendIrModule *module, ASTNode *root) {
                      "%.40s: aggregate is outside the backend-IR scalar-struct subset",
                      decl->name);
             return false;
+        }
+    }
+
+    /* Register `import c "lib.so" (funcs...)` names before function
+       signatures so calls to them resolve like any other predeclared
+       function. Imports carry no declared signature (see is_imported_function
+       in the direct backend's ir.c); the extern call path below applies the
+       same raw i64/pointer SysV convention as emit_import_call there. */
+    for (size_t i = 0; i < root->child_count; i++) {
+        ASTNode *decl = root->children[i];
+        if (decl->type != AST_IMPORT_DECL) continue;
+        for (size_t j = 0; j < decl->child_count; j++) {
+            ASTNode *ref = decl->children[j];
+            if (ref->type != AST_VAR_REF) continue;
+            if (!bir_declare_extern_function(module, ref->name)) return false;
         }
     }
 

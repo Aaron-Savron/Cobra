@@ -1427,8 +1427,17 @@ static SsaValueRef ssa_eval_expr(SsaPass *p, size_t block, HirExpr *expr) {
         }
         case HIR_EXPR_CALL: {
             const BirFunctionInfo *callee = bir_find_function(p->module, expr->callee);
-            if (!callee || !bir_validate_function_abi(p->module, callee) ||
-                callee->call_abi.param_count != expr->arg_count) {
+            if (!callee) {
+                ssa_fail(p, expr->source_line, expr->source_col,
+                         "call has invalid ABI metadata or lowered argument count");
+                return SSA_VALUE_NONE;
+            }
+            /* Extern calls skip call_abi entirely: they use the raw SysV
+               integer-register convention at x86 emission time, not the
+               internal function-call ABI classification. */
+            if (!callee->is_extern &&
+                (!bir_validate_function_abi(p->module, callee) ||
+                 callee->call_abi.param_count != expr->arg_count)) {
                 ssa_fail(p, expr->source_line, expr->source_col,
                          "call has invalid ABI metadata or lowered argument count");
                 return SSA_VALUE_NONE;

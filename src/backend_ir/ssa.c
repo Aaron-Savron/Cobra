@@ -1698,6 +1698,37 @@ bool bir_declare_function(BackendIrModule *module, const char *name,
     return true;
 }
 
+bool bir_declare_extern_function(BackendIrModule *module, const char *name) {
+    if (!module || !name || !name[0]) {
+        if (module) snprintf(module->error, sizeof(module->error),
+                             "invalid extern function declaration");
+        return false;
+    }
+    /* `import c` may name the same function twice (or across repeated
+       import lines); treat a re-declare as a no-op rather than an error. */
+    const BirFunctionInfo *existing = bir_find_function(module, name);
+    if (existing) return existing->is_extern;
+    if (module->function_count >= BIR_MAX_FUNCTIONS) {
+        snprintf(module->error, sizeof(module->error),
+                 "too many functions in backend-IR module");
+        return false;
+    }
+    BirFunctionInfo *info = &module->functions[module->function_count++];
+    memset(info, 0, sizeof(*info));
+    snprintf(info->name, sizeof(info->name), "%s", name);
+    info->entry = SSA_BLOCK_NONE;
+    info->first_block = SSA_BLOCK_NONE;
+    info->block_count = 0;
+    info->return_type = module->type_i64;
+    info->return_abi = module->type_i64->abi;
+    info->return_value_type = module->type_i64;
+    info->return_value_abi = module->type_i64->abi;
+    info->return_view_param = UINT32_MAX;
+    info->has_return = true;
+    info->is_extern = true;
+    return true;
+}
+
 bool bir_register_function_info(BackendIrModule *module, const char *name,
                                 SsaBlockRef entry, size_t param_count,
                                 const SsaValueRef *params,

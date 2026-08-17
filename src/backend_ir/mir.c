@@ -439,7 +439,22 @@ static bool mir_lower_function(const BackendIrModule *source, MirModule *module,
                                const BirFunctionInfo *info, size_t function_index) {
     const SsaArena *ssa = &source->arena;
     MirArena *arena = &module->arena;
-    if (!info || info->first_block == SSA_BLOCK_NONE || info->block_count == 0 ||
+    if (!info) return false;
+    if (info->is_extern) {
+        /* Extern functions have no SSA body to lower; keep a skeleton entry
+           so this function's index in module->functions still lines up
+           with its index in source->functions (callee_index indexes both
+           arrays identically - see source_callee_index / x86_emit_call). */
+        MirFunction *extern_function = &module->functions[module->function_count++];
+        memset(extern_function, 0, sizeof(*extern_function));
+        snprintf(extern_function->name, sizeof(extern_function->name), "%s", info->name);
+        extern_function->entry = MIR_BLOCK_NONE;
+        extern_function->first_block = MIR_BLOCK_NONE;
+        extern_function->return_type = info->return_type;
+        extern_function->has_return = info->has_return;
+        return true;
+    }
+    if (info->first_block == SSA_BLOCK_NONE || info->block_count == 0 ||
         info->first_block >= ssa->block_count ||
         info->block_count > ssa->block_count - info->first_block) return false;
 
@@ -1466,6 +1481,14 @@ bool mir_verify(const MirModule *module, char *errbuf, size_t errbuf_size) {
     bool ok = true;
     for (size_t f = 0; f < module->function_count && ok; f++) {
         const MirFunction *function = &module->functions[f];
+        if (module->source->functions[f].is_extern) {
+            if (function->entry != MIR_BLOCK_NONE || function->first_block != MIR_BLOCK_NONE) {
+                mir_set_error(errbuf, errbuf_size, "MIR extern function '%s' unexpectedly has a body", function->name);
+                ok = false;
+                break;
+            }
+            continue;
+        }
         if (function->entry == MIR_BLOCK_NONE || function->first_block == MIR_BLOCK_NONE ||
             function->block_count == 0 || function->first_block >= blocks ||
             function->block_count > blocks - function->first_block ||
