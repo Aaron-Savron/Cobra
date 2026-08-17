@@ -907,6 +907,713 @@ static bool hir_complete_array_type(HirBuilder *b, HirExpr *expr,
 /* ------------------------------------------------------------------ */
 
 static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out);
+static HirExpr *hir_local_ref(HirBuilder *b, uint32_t local, const CobraType *type,
+                              int line, int col);
+
+/* f32 tensor builtins (fill_f32/sum_f32/mean_f32/max_f32/matmul_f32). The
+   direct backend hand-emits AVX2/FMA x86 for these; the isolated backend has
+   no equivalent codegen path, and routing them through a real function call
+   runs into the borrow model's whole-function borrow lifetime (an owned
+   buffer borrowed into a view parameter can never be touched directly again
+   in the same function - there is no scope-exit borrow release), which is
+   exactly the alloc/fill/read-back pattern every caller uses. So these are
+   lowered inline, as a hand-built while-loop CFG operating directly on the
+   caller's own local via HIR_EXPR_INDEX (indexing an owned slice needs no
+   borrow at all - see the AST_INDEX_ASSIGN case), the same technique
+   hir_build_for_container uses for `for x in container`. Scalar accumulation
+   order matches a plain left-to-right Cobra loop, not the direct backend's
+   4-way-unrolled AVX2 reduction or FMA matmul, so results can differ from
+   the direct backend by a ULP or so on longer buffers even though both are
+   individually correctly rounded. */
+static bool bir_is_tensor_builtin(const char *name) {
+    return strcmp(name, "fill_f32") == 0 || strcmp(name, "sum_f32") == 0 ||
+           strcmp(name, "mean_f32") == 0 || strcmp(name, "max_f32") == 0 ||
+           strcmp(name, "matmul_f32") == 0;
+}
+
+static HirExpr *hir_tensor_index(HirBuilder *b, uint32_t local,
+                                 const CobraType *container_type,
+                                 const CobraType *element_type,
+                                 HirExpr *index, int line, int col) {
+    HirExpr *expr = hir_expr_alloc(b, line, col);
+    if (!expr) { hir_expr_free(index); return NULL; }
+    expr->kind = HIR_EXPR_INDEX;
+    expr->type = element_type;
+    expr->local = local;
+    expr->aggregate_type = container_type;
+    expr->args = calloc(1, sizeof(HirExpr *));
+    if (!expr->args) { hir_expr_free(index); hir_expr_free(expr); return NULL; }
+    expr->args[0] = index;
+    expr->arg_count = 1;
+    return expr;
+}
+
+static bool hir_tensor_index_store(HirBuilder *b, uint32_t local,
+                                   const CobraType *container_type,
+                                   const CobraType *element_type,
+                                   HirExpr *index, HirExpr *value,
+                                   int line, int col) {
+    HirExpr *target = hir_tensor_index(b, local, container_type, element_type,
+                                       index, line, col);
+    if (!target) { hir_expr_free(value); return false; }
+    HirStmt stmt;
+    memset(&stmt, 0, sizeof(stmt));
+    stmt.kind = HIR_STMT_INDEX_ASSIGN;
+    stmt.target = target;
+    stmt.expr = value;
+    if (!hir_block_add_stmt(b, b->current, stmt)) {
+        hir_expr_free(target);
+        hir_expr_free(value);
+        return false;
+    }
+    return true;
+}
+
+static HirExpr *hir_tensor_binop(HirBuilder *b, SsaOpcode op, HirExpr *lhs,
+                                 HirExpr *rhs, const CobraType *type,
+                                 int line, int col) {
+    HirExpr *expr = hir_expr_alloc(b, line, col);
+    if (!expr) { hir_expr_free(lhs); hir_expr_free(rhs); return NULL; }
+    expr->kind = HIR_EXPR_BINOP;
+    expr->binop = op;
+    expr->args = calloc(2, sizeof(HirExpr *));
+    if (!expr->args) { hir_expr_free(lhs); hir_expr_free(rhs); hir_expr_free(expr); return NULL; }
+    expr->args[0] = lhs;
+    expr->args[1] = rhs;
+    expr->arg_count = 2;
+    expr->type = type;
+    return expr;
+}
+
+/* Requires `buf` (the first argument) to name a plain local, matching the
+   direct backend's own validate_tensor_builtin restriction - these mutate
+   in place and need to know exactly which local's storage to touch. */
+static int hir_tensor_require_buffer(HirBuilder *b, ASTNode *node, size_t arg_index,
+                                     const CobraType **element_out) {
+    if (node->child_count <= arg_index || node->children[arg_index]->type != AST_VAR_REF) {
+        bir_fail(b, node->source_line, node->source_col,
+                 "%s requires a named []f32 local", node->name);
+        return -1;
+    }
+    ASTNode *ref = node->children[arg_index];
+    int local = hir_require_local(b, ref->name, ref->source_line, ref->source_col);
+    if (local < 0) return -1;
+    const CobraType *type = b->fn->locals[local].type;
+    const CobraType *element = type ? cobra_type_element(type) : NULL;
+    if (!bir_is_owned_slice_type(type) || !element || element->kind != COBRA_TYPE_F32) {
+        bir_fail(b, node->source_line, node->source_col,
+                 "%s requires an owned []f32 local", node->name);
+        return -1;
+    }
+    if (element_out) *element_out = element;
+    return local;
+}
+
+/* while i < n: { ... } skeleton shared by fill/sum/mean/max/matmul. Leaves
+   b->current pointed at the body block with `index_local` in scope; the
+   caller fills the body and must jump to *latch_out at the end, and set
+   b->current = *exit_out when done (mirrors hir_build_for_container). */
+static bool hir_tensor_loop_open(HirBuilder *b, int line, int col,
+                                 HirExpr *limit, int *index_local_out,
+                                 HirBlockRef *latch_out, HirBlockRef *exit_out) {
+    int index_local = hir_synthetic_local(b, "tensor_i", line, col);
+    if (index_local < 0) { hir_expr_free(limit); return false; }
+    HirExpr *zero = hir_expr_alloc(b, line, col);
+    if (!zero) { hir_expr_free(limit); return false; }
+    zero->kind = HIR_EXPR_CONST;
+    zero->type = b->module->type_i64;
+    zero->const_value = bir_scalar_i64(zero->type, 0);
+    if (!hir_emit_assign(b, (uint32_t)index_local, zero)) { hir_expr_free(limit); return false; }
+
+    HirBlock *header = hir_new_block(b, "tensor_header", line, col);
+    if (!header) { hir_expr_free(limit); return false; }
+    HirBlockRef header_id = header->id;
+    HirBlock *body = hir_new_block(b, "tensor_body", line, col);
+    if (!body) { hir_expr_free(limit); return false; }
+    HirBlockRef body_id = body->id;
+    HirBlock *latch = hir_new_block(b, "tensor_latch", line, col);
+    if (!latch) { hir_expr_free(limit); return false; }
+    HirBlockRef latch_id = latch->id;
+    HirBlock *exit_block = hir_new_block(b, "tensor_exit", line, col);
+    if (!exit_block) { hir_expr_free(limit); return false; }
+    HirBlockRef exit_id = exit_block->id;
+
+    HirTerm pre;
+    memset(&pre, 0, sizeof(pre));
+    pre.kind = HIR_TERM_JUMP;
+    pre.target = header_id;
+    if (!hir_set_term(b, b->current, pre) || !hir_add_edge(b, b->current, header_id)) {
+        hir_expr_free(limit);
+        return false;
+    }
+
+    b->current = header_id;
+    HirExpr *index_ref = hir_local_ref(b, (uint32_t)index_local, b->module->type_i64, line, col);
+    if (!index_ref) { hir_expr_free(limit); return false; }
+    HirExpr *cond = hir_tensor_binop(b, SSA_OP_LT, index_ref, limit,
+                                     b->module->type_bool, line, col);
+    if (!cond) return false;
+
+    HirTerm head;
+    memset(&head, 0, sizeof(head));
+    head.kind = HIR_TERM_BRANCH;
+    head.cond = cond;
+    head.target = body_id;
+    head.target2 = exit_id;
+    if (!hir_set_term(b, header_id, head) ||
+        !hir_add_edge(b, header_id, body_id) ||
+        !hir_add_edge(b, header_id, exit_id)) {
+        return false;
+    }
+
+    b->current = body_id;
+    *index_local_out = index_local;
+    *latch_out = latch_id;
+    *exit_out = exit_id;
+    return true;
+}
+
+/* Closes the block opened by hir_tensor_loop_open: jump the (already-filled)
+   body to the latch, bump the index, jump back to the header, and leave
+   b->current at the exit block. */
+static bool hir_tensor_loop_close(HirBuilder *b, int line, int col,
+                                  int index_local, HirBlockRef latch_id,
+                                  HirBlockRef header_id, HirBlockRef exit_id) {
+    HirTerm to_latch;
+    memset(&to_latch, 0, sizeof(to_latch));
+    to_latch.kind = HIR_TERM_JUMP;
+    to_latch.target = latch_id;
+    if (!hir_set_term(b, b->current, to_latch) || !hir_add_edge(b, b->current, latch_id))
+        return false;
+
+    b->current = latch_id;
+    HirExpr *one = hir_expr_alloc(b, line, col);
+    HirExpr *index_again = hir_local_ref(b, (uint32_t)index_local, b->module->type_i64, line, col);
+    if (!one || !index_again) { hir_expr_free(one); hir_expr_free(index_again); return false; }
+    one->kind = HIR_EXPR_CONST;
+    one->type = b->module->type_i64;
+    one->const_value = bir_scalar_i64(one->type, 1);
+    HirExpr *plus = hir_tensor_binop(b, SSA_OP_ADD, index_again, one,
+                                     b->module->type_i64, line, col);
+    if (!plus) return false;
+    if (!hir_emit_assign(b, (uint32_t)index_local, plus)) return false;
+
+    HirTerm back;
+    memset(&back, 0, sizeof(back));
+    back.kind = HIR_TERM_JUMP;
+    back.target = header_id;
+    if (!hir_set_term(b, latch_id, back) || !hir_add_edge(b, latch_id, header_id))
+        return false;
+
+    b->current = exit_id;
+    return true;
+}
+
+/* fill_f32(buf, value): buf[i] = value for every element. */
+static HirExpr *hir_build_fill_f32(HirBuilder *b, ASTNode *node) {
+    int line = node->source_line, col = node->source_col;
+    const CobraType *element = NULL;
+    int local = hir_tensor_require_buffer(b, node, 0, &element);
+    if (local < 0) return NULL;
+    if (node->child_count != 2) {
+        bir_fail(b, line, col, "fill_f32 requires ([]f32, numeric f32 scalar)");
+        return NULL;
+    }
+    const CobraType *container_type = b->fn->locals[local].type;
+    HirExpr *value = NULL;
+    if (!hir_build_expr(b, node->children[1], &value)) return NULL;
+    value = hir_coerce_int_const(b, value, b->module->type_f32);
+    if (!value || !hir_complete_float_expr(b, value, b->module->type_f32) ||
+        !bir_types_equal(value->type, b->module->type_f32)) {
+        hir_expr_free(value);
+        bir_fail(b, line, col, "fill_f32 requires a f32-compatible scalar value");
+        return NULL;
+    }
+
+    HirExpr *len_arg = hir_local_ref(b, (uint32_t)local, container_type, line, col);
+    if (!len_arg) { hir_expr_free(value); return NULL; }
+    HirExpr *limit = hir_expr_alloc(b, line, col);
+    if (!limit) { hir_expr_free(len_arg); hir_expr_free(value); return NULL; }
+    limit->kind = HIR_EXPR_LEN;
+    limit->type = b->module->type_i64;
+    limit->args = calloc(1, sizeof(HirExpr *));
+    if (!limit->args) { hir_expr_free(len_arg); hir_expr_free(value); hir_expr_free(limit); return NULL; }
+    limit->args[0] = len_arg;
+    limit->arg_count = 1;
+
+    int index_local; HirBlockRef header_id, latch_id, exit_id;
+    if (!hir_tensor_loop_open(b, line, col, limit, &index_local, &latch_id, &exit_id)) {
+        hir_expr_free(value);
+        return NULL;
+    }
+    header_id = latch_id; /* placeholder, overwritten below */
+    (void)header_id;
+    /* The header block id is the block right before body in creation order;
+       hir_tensor_loop_open doesn't hand it back, so recover it the same way
+       hir_build_for_container does: header = body's sole predecessor. */
+    HirBlockRef body_id = b->current;
+    header_id = b->fn->blocks[body_id].preds[0];
+
+    HirExpr *index_ref = hir_local_ref(b, (uint32_t)index_local, b->module->type_i64, line, col);
+    if (!index_ref) { hir_expr_free(value); return NULL; }
+    if (!hir_tensor_index_store(b, (uint32_t)local, container_type, element,
+                                index_ref, value, line, col)) return NULL;
+
+    if (!hir_tensor_loop_close(b, line, col, index_local, latch_id, header_id, exit_id))
+        return NULL;
+
+    /* Void result: reuse the i64-zero-const shape (the discarding
+       HIR_STMT_EXPR statement path doesn't care about the value), but keep
+       expr->type as void so the builtin still type-checks as non-value
+       everywhere else (matching a real void HIR_EXPR_CALL). bir_add_const
+       lowers strictly off const_value's own type, so const_value must carry
+       a real scalar type even though expr->type is void. */
+    HirExpr *result = hir_expr_alloc(b, line, col);
+    if (!result) return NULL;
+    result->kind = HIR_EXPR_CONST;
+    result->type = b->module->type_void;
+    result->const_value = bir_scalar_i64(b->module->type_i64, 0);
+    return result;
+}
+
+/* sum_f32/mean_f32/max_f32(buf) -> f32: single accumulator reduction. */
+static HirExpr *hir_build_reduce_f32(HirBuilder *b, ASTNode *node, const char *mode) {
+    int line = node->source_line, col = node->source_col;
+    const CobraType *element = NULL;
+    int local = hir_tensor_require_buffer(b, node, 0, &element);
+    if (local < 0) return NULL;
+    if (node->child_count != 1) {
+        bir_fail(b, line, col, "%s requires one owned []f32 local", node->name);
+        return NULL;
+    }
+    const CobraType *container_type = b->fn->locals[local].type;
+    bool is_max = strcmp(mode, "max") == 0;
+    bool is_mean = strcmp(mode, "mean") == 0;
+
+    int acc_local = hir_add_local(b, "@tensor_acc", false, b->module->type_f32, line, col);
+    if (acc_local < 0) return NULL;
+    HirExpr *init = hir_expr_alloc(b, line, col);
+    if (!init) return NULL;
+    init->kind = HIR_EXPR_CONST;
+    init->type = b->module->type_f32;
+    init->const_value = bir_scalar_f32(init->type, 0.0f);
+    if (!hir_emit_assign(b, (uint32_t)acc_local, init)) return NULL;
+
+    HirExpr *len_arg = hir_local_ref(b, (uint32_t)local, container_type, line, col);
+    if (!len_arg) return NULL;
+    HirExpr *limit = hir_expr_alloc(b, line, col);
+    if (!limit) { hir_expr_free(len_arg); return NULL; }
+    limit->kind = HIR_EXPR_LEN;
+    limit->type = b->module->type_i64;
+    limit->args = calloc(1, sizeof(HirExpr *));
+    if (!limit->args) { hir_expr_free(len_arg); hir_expr_free(limit); return NULL; }
+    limit->args[0] = len_arg;
+    limit->arg_count = 1;
+
+    /* max_f32 of an empty buffer is left undefined (matches the direct
+       backend's AVX2 reduce, which returns -inf for an empty vector without
+       a documented contract); sum/mean already fold correctly to 0 via the
+       accumulator's own initial value and the loop simply not running. */
+    int index_local; HirBlockRef latch_id, exit_id;
+    if (!hir_tensor_loop_open(b, line, col, limit, &index_local, &latch_id, &exit_id))
+        return NULL;
+    HirBlockRef body_id = b->current;
+    HirBlockRef header_id = b->fn->blocks[body_id].preds[0];
+
+    HirExpr *index_ref = hir_local_ref(b, (uint32_t)index_local, b->module->type_i64, line, col);
+    if (!index_ref) return NULL;
+    HirExpr *element_val = hir_tensor_index(b, (uint32_t)local, container_type, element,
+                                            index_ref, line, col);
+    if (!element_val) return NULL;
+
+    if (is_max) {
+        /* i == 0: acc = buf[0] unconditionally (seeds with a real element
+           instead of -inf, so max_f32 of a single-element buffer isn't
+           silently wrong); i > 0: acc = buf[i] > acc ? buf[i] : acc. */
+        HirExpr *index_ref2 = hir_local_ref(b, (uint32_t)index_local, b->module->type_i64, line, col);
+        HirExpr *zero_i = hir_expr_alloc(b, line, col);
+        if (!index_ref2 || !zero_i) { hir_expr_free(index_ref2); hir_expr_free(zero_i); hir_expr_free(element_val); return NULL; }
+        zero_i->kind = HIR_EXPR_CONST;
+        zero_i->type = b->module->type_i64;
+        zero_i->const_value = bir_scalar_i64(zero_i->type, 0);
+        HirExpr *is_first = hir_tensor_binop(b, SSA_OP_EQ, index_ref2, zero_i,
+                                             b->module->type_bool, line, col);
+        if (!is_first) { hir_expr_free(element_val); return NULL; }
+
+        HirBlock *then_first = hir_new_block(b, "tensor_max_first", line, col);
+        HirBlock *then_cmp = hir_new_block(b, "tensor_max_cmp", line, col);
+        HirBlock *after = hir_new_block(b, "tensor_max_after", line, col);
+        if (!then_first || !then_cmp || !after) { hir_expr_free(is_first); hir_expr_free(element_val); return NULL; }
+        HirBlockRef then_first_id = then_first->id, then_cmp_id = then_cmp->id, after_id = after->id;
+
+        HirTerm branch;
+        memset(&branch, 0, sizeof(branch));
+        branch.kind = HIR_TERM_BRANCH;
+        branch.cond = is_first;
+        branch.target = then_first_id;
+        branch.target2 = then_cmp_id;
+        if (!hir_set_term(b, body_id, branch) ||
+            !hir_add_edge(b, body_id, then_first_id) ||
+            !hir_add_edge(b, body_id, then_cmp_id)) { hir_expr_free(element_val); return NULL; }
+
+        b->current = then_first_id;
+        if (!hir_emit_assign(b, (uint32_t)acc_local, element_val)) return NULL;
+        HirTerm jump_after;
+        memset(&jump_after, 0, sizeof(jump_after));
+        jump_after.kind = HIR_TERM_JUMP;
+        jump_after.target = after_id;
+        if (!hir_set_term(b, then_first_id, jump_after) || !hir_add_edge(b, then_first_id, after_id))
+            return NULL;
+
+        b->current = then_cmp_id;
+        HirExpr *index_ref3 = hir_local_ref(b, (uint32_t)index_local, b->module->type_i64, line, col);
+        if (!index_ref3) return NULL;
+        HirExpr *element_val2 = hir_tensor_index(b, (uint32_t)local, container_type, element,
+                                                 index_ref3, line, col);
+        if (!element_val2) return NULL;
+        HirExpr *acc_ref = hir_local_ref(b, (uint32_t)acc_local, b->module->type_f32, line, col);
+        if (!acc_ref) { hir_expr_free(element_val2); return NULL; }
+        HirExpr *cmp = hir_tensor_binop(b, SSA_OP_GT, element_val2, acc_ref,
+                                        b->module->type_bool, line, col);
+        if (!cmp) return NULL;
+
+        HirBlock *cmp_true = hir_new_block(b, "tensor_max_gt", line, col);
+        if (!cmp_true) { hir_expr_free(cmp); return NULL; }
+        HirBlockRef cmp_true_id = cmp_true->id;
+        HirTerm cmp_branch;
+        memset(&cmp_branch, 0, sizeof(cmp_branch));
+        cmp_branch.kind = HIR_TERM_BRANCH;
+        cmp_branch.cond = cmp;
+        cmp_branch.target = cmp_true_id;
+        cmp_branch.target2 = after_id;
+        if (!hir_set_term(b, then_cmp_id, cmp_branch) ||
+            !hir_add_edge(b, then_cmp_id, cmp_true_id) ||
+            !hir_add_edge(b, then_cmp_id, after_id)) return NULL;
+
+        b->current = cmp_true_id;
+        HirExpr *index_ref4 = hir_local_ref(b, (uint32_t)index_local, b->module->type_i64, line, col);
+        if (!index_ref4) return NULL;
+        HirExpr *element_val3 = hir_tensor_index(b, (uint32_t)local, container_type, element,
+                                                 index_ref4, line, col);
+        if (!element_val3) return NULL;
+        if (!hir_emit_assign(b, (uint32_t)acc_local, element_val3)) return NULL;
+        HirTerm jump_after2;
+        memset(&jump_after2, 0, sizeof(jump_after2));
+        jump_after2.kind = HIR_TERM_JUMP;
+        jump_after2.target = after_id;
+        if (!hir_set_term(b, cmp_true_id, jump_after2) || !hir_add_edge(b, cmp_true_id, after_id))
+            return NULL;
+
+        b->current = after_id;
+    } else {
+        HirExpr *acc_ref = hir_local_ref(b, (uint32_t)acc_local, b->module->type_f32, line, col);
+        if (!acc_ref) { hir_expr_free(element_val); return NULL; }
+        HirExpr *sum = hir_tensor_binop(b, SSA_OP_ADD, acc_ref, element_val,
+                                        b->module->type_f32, line, col);
+        if (!sum) return NULL;
+        if (!hir_emit_assign(b, (uint32_t)acc_local, sum)) return NULL;
+    }
+
+    if (!hir_tensor_loop_close(b, line, col, index_local, latch_id, header_id, exit_id))
+        return NULL;
+
+    HirExpr *result = hir_local_ref(b, (uint32_t)acc_local, b->module->type_f32, line, col);
+    if (!result) return NULL;
+    if (is_mean) {
+        /* count accumulates alongside acc during the loop above would need
+           another local; simpler and just as correct: divide by len(buf)
+           computed fresh here, coerced via a synthetic f32 local set from
+           the same loop trip count. Empty buffers already produced acc==0,
+           and division by the i64 length needs an explicit i64->f32 local
+           since the language has no scalar cast operator; build one via a
+           throwaway loop-free conversion through a f32 accumulator seeded
+           at 0 and incremented once per element in a second, tiny loop. */
+        HirExpr *len_arg2 = hir_local_ref(b, (uint32_t)local, container_type, line, col);
+        if (!len_arg2) { hir_expr_free(result); return NULL; }
+        HirExpr *count_limit = hir_expr_alloc(b, line, col);
+        if (!count_limit) { hir_expr_free(len_arg2); hir_expr_free(result); return NULL; }
+        count_limit->kind = HIR_EXPR_LEN;
+        count_limit->type = b->module->type_i64;
+        count_limit->args = calloc(1, sizeof(HirExpr *));
+        if (!count_limit->args) { hir_expr_free(len_arg2); hir_expr_free(count_limit); hir_expr_free(result); return NULL; }
+        count_limit->args[0] = len_arg2;
+        count_limit->arg_count = 1;
+
+        int count_local = hir_add_local(b, "@tensor_count", false, b->module->type_f32, line, col);
+        if (count_local < 0) { hir_expr_free(count_limit); hir_expr_free(result); return NULL; }
+        HirExpr *count_init = hir_expr_alloc(b, line, col);
+        if (!count_init) { hir_expr_free(count_limit); hir_expr_free(result); return NULL; }
+        count_init->kind = HIR_EXPR_CONST;
+        count_init->type = b->module->type_f32;
+        count_init->const_value = bir_scalar_f32(count_init->type, 0.0f);
+        if (!hir_emit_assign(b, (uint32_t)count_local, count_init)) { hir_expr_free(count_limit); hir_expr_free(result); return NULL; }
+
+        int count_index_local; HirBlockRef count_latch, count_exit;
+        if (!hir_tensor_loop_open(b, line, col, count_limit, &count_index_local,
+                                  &count_latch, &count_exit)) { hir_expr_free(result); return NULL; }
+        HirBlockRef count_body = b->current;
+        HirBlockRef count_header = b->fn->blocks[count_body].preds[0];
+
+        HirExpr *count_ref = hir_local_ref(b, (uint32_t)count_local, b->module->type_f32, line, col);
+        HirExpr *one_f = hir_expr_alloc(b, line, col);
+        if (!count_ref || !one_f) { hir_expr_free(count_ref); hir_expr_free(one_f); hir_expr_free(result); return NULL; }
+        one_f->kind = HIR_EXPR_CONST;
+        one_f->type = b->module->type_f32;
+        one_f->const_value = bir_scalar_f32(one_f->type, 1.0f);
+        HirExpr *count_plus = hir_tensor_binop(b, SSA_OP_ADD, count_ref, one_f,
+                                               b->module->type_f32, line, col);
+        if (!count_plus) { hir_expr_free(result); return NULL; }
+        if (!hir_emit_assign(b, (uint32_t)count_local, count_plus)) { hir_expr_free(result); return NULL; }
+
+        if (!hir_tensor_loop_close(b, line, col, count_index_local, count_latch,
+                                   count_header, count_exit)) { hir_expr_free(result); return NULL; }
+
+        HirExpr *count_final = hir_local_ref(b, (uint32_t)count_local, b->module->type_f32, line, col);
+        if (!count_final) { hir_expr_free(result); return NULL; }
+
+        /* count==0 (empty buffer): 0.0/0.0 is NaN, not the 0.0 the direct
+           backend's mean_f32 returns for an empty vector. Guard it. */
+        HirExpr *zero_i2 = hir_expr_alloc(b, line, col);
+        if (!zero_i2) { hir_expr_free(result); hir_expr_free(count_final); return NULL; }
+        zero_i2->kind = HIR_EXPR_CONST;
+        zero_i2->type = b->module->type_i64;
+        zero_i2->const_value = bir_scalar_i64(zero_i2->type, 0);
+        HirExpr *len_arg3 = hir_local_ref(b, (uint32_t)local, container_type, line, col);
+        if (!len_arg3) { hir_expr_free(result); hir_expr_free(count_final); hir_expr_free(zero_i2); return NULL; }
+        HirExpr *len_check = hir_expr_alloc(b, line, col);
+        if (!len_check) { hir_expr_free(result); hir_expr_free(count_final); hir_expr_free(zero_i2); hir_expr_free(len_arg3); return NULL; }
+        len_check->kind = HIR_EXPR_LEN;
+        len_check->type = b->module->type_i64;
+        len_check->args = calloc(1, sizeof(HirExpr *));
+        if (!len_check->args) { hir_expr_free(result); hir_expr_free(count_final); hir_expr_free(zero_i2); hir_expr_free(len_check); return NULL; }
+        len_check->args[0] = len_arg3;
+        len_check->arg_count = 1;
+        HirExpr *is_empty = hir_tensor_binop(b, SSA_OP_EQ, len_check, zero_i2,
+                                             b->module->type_bool, line, col);
+        if (!is_empty) { hir_expr_free(result); hir_expr_free(count_final); return NULL; }
+
+        int mean_local = hir_add_local(b, "@tensor_mean", false, b->module->type_f32, line, col);
+        if (mean_local < 0) { hir_expr_free(is_empty); hir_expr_free(result); hir_expr_free(count_final); return NULL; }
+
+        HirBlock *mean_zero = hir_new_block(b, "tensor_mean_zero", line, col);
+        HirBlock *mean_div = hir_new_block(b, "tensor_mean_div", line, col);
+        HirBlock *mean_after = hir_new_block(b, "tensor_mean_after", line, col);
+        if (!mean_zero || !mean_div || !mean_after) { hir_expr_free(is_empty); hir_expr_free(result); hir_expr_free(count_final); return NULL; }
+        HirBlockRef mean_zero_id = mean_zero->id, mean_div_id = mean_div->id, mean_after_id = mean_after->id;
+
+        HirTerm mean_branch;
+        memset(&mean_branch, 0, sizeof(mean_branch));
+        mean_branch.kind = HIR_TERM_BRANCH;
+        mean_branch.cond = is_empty;
+        mean_branch.target = mean_zero_id;
+        mean_branch.target2 = mean_div_id;
+        if (!hir_set_term(b, b->current, mean_branch) ||
+            !hir_add_edge(b, b->current, mean_zero_id) ||
+            !hir_add_edge(b, b->current, mean_div_id)) {
+            hir_expr_free(result); hir_expr_free(count_final);
+            return NULL;
+        }
+
+        b->current = mean_zero_id;
+        HirExpr *zero_f = hir_expr_alloc(b, line, col);
+        if (!zero_f) { hir_expr_free(result); hir_expr_free(count_final); return NULL; }
+        zero_f->kind = HIR_EXPR_CONST;
+        zero_f->type = b->module->type_f32;
+        zero_f->const_value = bir_scalar_f32(zero_f->type, 0.0f);
+        if (!hir_emit_assign(b, (uint32_t)mean_local, zero_f)) { hir_expr_free(result); hir_expr_free(count_final); return NULL; }
+        HirTerm to_after1;
+        memset(&to_after1, 0, sizeof(to_after1));
+        to_after1.kind = HIR_TERM_JUMP;
+        to_after1.target = mean_after_id;
+        if (!hir_set_term(b, mean_zero_id, to_after1) || !hir_add_edge(b, mean_zero_id, mean_after_id)) {
+            hir_expr_free(result); hir_expr_free(count_final);
+            return NULL;
+        }
+
+        b->current = mean_div_id;
+        HirExpr *div = hir_tensor_binop(b, SSA_OP_DIV, result, count_final,
+                                        b->module->type_f32, line, col);
+        if (!div) return NULL;
+        if (!hir_emit_assign(b, (uint32_t)mean_local, div)) return NULL;
+        HirTerm to_after2;
+        memset(&to_after2, 0, sizeof(to_after2));
+        to_after2.kind = HIR_TERM_JUMP;
+        to_after2.target = mean_after_id;
+        if (!hir_set_term(b, mean_div_id, to_after2) || !hir_add_edge(b, mean_div_id, mean_after_id))
+            return NULL;
+
+        b->current = mean_after_id;
+        result = hir_local_ref(b, (uint32_t)mean_local, b->module->type_f32, line, col);
+        if (!result) return NULL;
+    }
+    return result;
+}
+
+/* matmul_f32(a, b, c, M, N, K): naive triple-nested-loop scalar GEMM. */
+static HirExpr *hir_build_matmul_f32(HirBuilder *b, ASTNode *node) {
+    int line = node->source_line, col = node->source_col;
+    if (node->child_count != 6) {
+        bir_fail(b, line, col, "matmul_f32 requires (A, B, C: []f32, M, N, K: integer)");
+        return NULL;
+    }
+    const CobraType *a_elem = NULL, *b_elem = NULL, *c_elem = NULL;
+    int a_local = hir_tensor_require_buffer(b, node, 0, &a_elem);
+    int b_local = hir_tensor_require_buffer(b, node, 1, &b_elem);
+    int c_local = hir_tensor_require_buffer(b, node, 2, &c_elem);
+    if (a_local < 0 || b_local < 0 || c_local < 0) return NULL;
+    const CobraType *a_type = b->fn->locals[a_local].type;
+    const CobraType *b_type = b->fn->locals[b_local].type;
+    const CobraType *c_type = b->fn->locals[c_local].type;
+
+    HirExpr *m_expr = NULL, *n_expr = NULL, *k_expr = NULL;
+    if (!hir_build_expr(b, node->children[3], &m_expr)) return NULL;
+    if (!hir_build_expr(b, node->children[4], &n_expr)) return NULL;
+    if (!hir_build_expr(b, node->children[5], &k_expr)) return NULL;
+    m_expr = hir_coerce_int_const(b, m_expr, b->module->type_i64);
+    n_expr = hir_coerce_int_const(b, n_expr, b->module->type_i64);
+    k_expr = hir_coerce_int_const(b, k_expr, b->module->type_i64);
+    if (!m_expr || !n_expr || !k_expr ||
+        !bir_types_equal(m_expr->type, b->module->type_i64) ||
+        !bir_types_equal(n_expr->type, b->module->type_i64) ||
+        !bir_types_equal(k_expr->type, b->module->type_i64)) {
+        hir_expr_free(m_expr); hir_expr_free(n_expr); hir_expr_free(k_expr);
+        bir_fail(b, line, col, "matmul_f32 requires (A, B, C: []f32, M, N, K: integer)");
+        return NULL;
+    }
+    /* M/N/K are hoisted into locals once so the nested loops can each
+       reference them by value without re-evaluating (or re-parsing) the
+       caller's expression three times. */
+    int m_local = hir_add_local(b, "@tensor_M", false, b->module->type_i64, line, col);
+    int n_local = hir_add_local(b, "@tensor_N", false, b->module->type_i64, line, col);
+    int k_local = hir_add_local(b, "@tensor_K", false, b->module->type_i64, line, col);
+    if (m_local < 0 || n_local < 0 || k_local < 0) {
+        hir_expr_free(m_expr); hir_expr_free(n_expr); hir_expr_free(k_expr);
+        return NULL;
+    }
+    if (!hir_emit_assign(b, (uint32_t)m_local, m_expr)) return NULL;
+    if (!hir_emit_assign(b, (uint32_t)n_local, n_expr)) return NULL;
+    if (!hir_emit_assign(b, (uint32_t)k_local, k_expr)) return NULL;
+
+    /* i loop over M */
+    HirExpr *m_limit = hir_local_ref(b, (uint32_t)m_local, b->module->type_i64, line, col);
+    if (!m_limit) return NULL;
+    int i_local; HirBlockRef i_latch, i_exit;
+    if (!hir_tensor_loop_open(b, line, col, m_limit, &i_local, &i_latch, &i_exit))
+        return NULL;
+    HirBlockRef i_body = b->current;
+    HirBlockRef i_header = b->fn->blocks[i_body].preds[0];
+
+    /* j loop over N */
+    HirExpr *n_limit = hir_local_ref(b, (uint32_t)n_local, b->module->type_i64, line, col);
+    if (!n_limit) return NULL;
+    int j_local; HirBlockRef j_latch, j_exit;
+    if (!hir_tensor_loop_open(b, line, col, n_limit, &j_local, &j_latch, &j_exit))
+        return NULL;
+    HirBlockRef j_body = b->current;
+    HirBlockRef j_header = b->fn->blocks[j_body].preds[0];
+
+    /* acc = 0.0 */
+    int acc_local = hir_add_local(b, "@tensor_mm_acc", false, b->module->type_f32, line, col);
+    if (acc_local < 0) return NULL;
+    HirExpr *acc_init = hir_expr_alloc(b, line, col);
+    if (!acc_init) return NULL;
+    acc_init->kind = HIR_EXPR_CONST;
+    acc_init->type = b->module->type_f32;
+    acc_init->const_value = bir_scalar_f32(acc_init->type, 0.0f);
+    if (!hir_emit_assign(b, (uint32_t)acc_local, acc_init)) return NULL;
+
+    /* k loop over K: acc += a[i*K+k] * b[k*N+j] */
+    HirExpr *k_limit = hir_local_ref(b, (uint32_t)k_local, b->module->type_i64, line, col);
+    if (!k_limit) return NULL;
+    int k_idx_local; HirBlockRef k_latch, k_exit;
+    if (!hir_tensor_loop_open(b, line, col, k_limit, &k_idx_local, &k_latch, &k_exit))
+        return NULL;
+    HirBlockRef k_body = b->current;
+    HirBlockRef k_header = b->fn->blocks[k_body].preds[0];
+
+    HirExpr *i_ref = hir_local_ref(b, (uint32_t)i_local, b->module->type_i64, line, col);
+    HirExpr *k_ref1 = hir_local_ref(b, (uint32_t)k_local, b->module->type_i64, line, col);
+    if (!i_ref || !k_ref1) { hir_expr_free(i_ref); hir_expr_free(k_ref1); return NULL; }
+    HirExpr *i_times_k = hir_tensor_binop(b, SSA_OP_MUL, i_ref, k_ref1,
+                                          b->module->type_i64, line, col);
+    if (!i_times_k) return NULL;
+    HirExpr *k_idx_ref1 = hir_local_ref(b, (uint32_t)k_idx_local, b->module->type_i64, line, col);
+    if (!k_idx_ref1) { hir_expr_free(i_times_k); return NULL; }
+    HirExpr *a_index = hir_tensor_binop(b, SSA_OP_ADD, i_times_k, k_idx_ref1,
+                                        b->module->type_i64, line, col);
+    if (!a_index) return NULL;
+    HirExpr *a_val = hir_tensor_index(b, (uint32_t)a_local, a_type, a_elem, a_index, line, col);
+    if (!a_val) return NULL;
+
+    HirExpr *k_idx_ref2 = hir_local_ref(b, (uint32_t)k_idx_local, b->module->type_i64, line, col);
+    HirExpr *n_ref = hir_local_ref(b, (uint32_t)n_local, b->module->type_i64, line, col);
+    if (!k_idx_ref2 || !n_ref) { hir_expr_free(k_idx_ref2); hir_expr_free(n_ref); hir_expr_free(a_val); return NULL; }
+    HirExpr *k_times_n = hir_tensor_binop(b, SSA_OP_MUL, k_idx_ref2, n_ref,
+                                          b->module->type_i64, line, col);
+    if (!k_times_n) { hir_expr_free(a_val); return NULL; }
+    HirExpr *j_ref1 = hir_local_ref(b, (uint32_t)j_local, b->module->type_i64, line, col);
+    if (!j_ref1) { hir_expr_free(k_times_n); hir_expr_free(a_val); return NULL; }
+    HirExpr *b_index = hir_tensor_binop(b, SSA_OP_ADD, k_times_n, j_ref1,
+                                        b->module->type_i64, line, col);
+    if (!b_index) { hir_expr_free(a_val); return NULL; }
+    HirExpr *b_val = hir_tensor_index(b, (uint32_t)b_local, b_type, b_elem, b_index, line, col);
+    if (!b_val) { hir_expr_free(a_val); return NULL; }
+
+    HirExpr *prod = hir_tensor_binop(b, SSA_OP_MUL, a_val, b_val, b->module->type_f32, line, col);
+    if (!prod) return NULL;
+    HirExpr *acc_ref = hir_local_ref(b, (uint32_t)acc_local, b->module->type_f32, line, col);
+    if (!acc_ref) { hir_expr_free(prod); return NULL; }
+    HirExpr *new_acc = hir_tensor_binop(b, SSA_OP_ADD, acc_ref, prod, b->module->type_f32, line, col);
+    if (!new_acc) return NULL;
+    if (!hir_emit_assign(b, (uint32_t)acc_local, new_acc)) return NULL;
+
+    if (!hir_tensor_loop_close(b, line, col, k_idx_local, k_latch, k_header, k_exit))
+        return NULL;
+
+    /* c[i*N+j] = acc */
+    HirExpr *i_ref2 = hir_local_ref(b, (uint32_t)i_local, b->module->type_i64, line, col);
+    HirExpr *n_ref2 = hir_local_ref(b, (uint32_t)n_local, b->module->type_i64, line, col);
+    if (!i_ref2 || !n_ref2) { hir_expr_free(i_ref2); hir_expr_free(n_ref2); return NULL; }
+    HirExpr *i_times_n = hir_tensor_binop(b, SSA_OP_MUL, i_ref2, n_ref2,
+                                          b->module->type_i64, line, col);
+    if (!i_times_n) return NULL;
+    HirExpr *j_ref2 = hir_local_ref(b, (uint32_t)j_local, b->module->type_i64, line, col);
+    if (!j_ref2) { hir_expr_free(i_times_n); return NULL; }
+    HirExpr *c_index = hir_tensor_binop(b, SSA_OP_ADD, i_times_n, j_ref2,
+                                        b->module->type_i64, line, col);
+    if (!c_index) return NULL;
+    HirExpr *acc_final = hir_local_ref(b, (uint32_t)acc_local, b->module->type_f32, line, col);
+    if (!acc_final) { hir_expr_free(c_index); return NULL; }
+    if (!hir_tensor_index_store(b, (uint32_t)c_local, c_type, c_elem, c_index, acc_final, line, col))
+        return NULL;
+
+    if (!hir_tensor_loop_close(b, line, col, j_local, j_latch, j_header, j_exit))
+        return NULL;
+    if (!hir_tensor_loop_close(b, line, col, i_local, i_latch, i_header, i_exit))
+        return NULL;
+
+    /* Void result: reuse the i64-zero-const shape (the discarding
+       HIR_STMT_EXPR statement path doesn't care about the value), but keep
+       expr->type as void so the builtin still type-checks as non-value
+       everywhere else (matching a real void HIR_EXPR_CALL). bir_add_const
+       lowers strictly off const_value's own type, so const_value must carry
+       a real scalar type even though expr->type is void. */
+    HirExpr *result = hir_expr_alloc(b, line, col);
+    if (!result) return NULL;
+    result->kind = HIR_EXPR_CONST;
+    result->type = b->module->type_void;
+    result->const_value = bir_scalar_i64(b->module->type_i64, 0);
+    return result;
+}
+
+static HirExpr *hir_build_tensor_builtin(HirBuilder *b, ASTNode *node) {
+    if (strcmp(node->name, "fill_f32") == 0) return hir_build_fill_f32(b, node);
+    if (strcmp(node->name, "sum_f32") == 0) return hir_build_reduce_f32(b, node, "sum");
+    if (strcmp(node->name, "mean_f32") == 0) return hir_build_reduce_f32(b, node, "mean");
+    if (strcmp(node->name, "max_f32") == 0) return hir_build_reduce_f32(b, node, "max");
+    if (strcmp(node->name, "matmul_f32") == 0) return hir_build_matmul_f32(b, node);
+    return NULL;
+}
 
 /* Build a fresh owned u8 string from two readonly string-compatible values.
    The SSA pass performs the allocation and byte-copy operation. */
@@ -1009,6 +1716,18 @@ static HirExpr *hir_coerce_int_const(HirBuilder *b, HirExpr *value,
                 value->type = target;
                 value->const_value = bir_scalar_u64(target, (uint64_t)raw);
                 return value;
+            case COBRA_TYPE_F32:
+                /* An integer literal compared or combined with an f32 value
+                   (`sum_f32(x) == 19`) needs the same widening a float
+                   literal already gets; direct-backend parity for the
+                   tensor builtin regression tests depends on this. */
+                value->type = target;
+                value->const_value = bir_scalar_f32(target, (float)raw);
+                return value;
+            case COBRA_TYPE_F64:
+                value->type = target;
+                value->const_value = bir_scalar_f64(target, (double)raw);
+                return value;
             default:
                 return value;
         }
@@ -1051,6 +1770,14 @@ static HirExpr *hir_coerce_int_const(HirBuilder *b, HirExpr *value,
                 }
                 value->type = target;
                 value->const_value = bir_scalar_i64(target, (int64_t)raw);
+                return value;
+            case COBRA_TYPE_F32:
+                value->type = target;
+                value->const_value = bir_scalar_f32(target, (float)raw);
+                return value;
+            case COBRA_TYPE_F64:
+                value->type = target;
+                value->const_value = bir_scalar_f64(target, (double)raw);
                 return value;
             default:
                 return value;
@@ -1134,9 +1861,15 @@ static bool hir_builtin_outside_subset(const char *name) {
     static const char *const builtins[] = {
         "alloc_i64", "alloc_f32", "alloc_u8", "free", "len", "range",
         "enumerate", "set", "get", "delete", "has", "append",
-        "pop", "fill_f32", "sum_f32", "zero_f32", "matmul_f32", "dense_f32",
+        "pop", "zero_f32", "dense_f32",
         "print", NULL
     };
+    /* fill_f32/sum_f32/mean_f32/max_f32/matmul_f32 aren't compiler
+       intrinsics here - the isolated backend has no hand-rolled AVX2
+       codegen path for them, so lib/tensor_bir.cb supplies plain scalar
+       Cobra definitions that get loaded into its prelude (see
+       use_isolated_backend in src/main.c) and resolve through the normal
+       function-call path below instead of hitting this rejection. */
     for (size_t i = 0; builtins[i]; i++) {
         if (strcmp(name, builtins[i]) == 0) return true;
     }
@@ -2337,6 +3070,11 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                 if (!expr) return false;
                 break;
             }
+            if (bir_is_tensor_builtin(node->name)) {
+                expr = hir_build_tensor_builtin(b, node);
+                if (!expr) return false;
+                break;
+            }
             if (hir_builtin_outside_subset(node->name)) {
                 bir_fail(b, node->source_line, node->source_col,
                          "builtin '%s' is outside the backend-IR subset", node->name);
@@ -2348,8 +3086,19 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
             snprintf(expr->callee, sizeof(expr->callee), "%s", node->name);
             const BirFunctionInfo *callee = bir_find_function(b->module, node->name);
             if (!callee) {
+                /* Worded to match the "outside the backend-IR subset" gap
+                   classification in bir_build_program: a callee this pass
+                   never registered is almost always a function whose own
+                   body uses a construct this backend doesn't lower yet (see
+                   the skip-if-unreachable-and-a-gap path there), not a
+                   genuine undefined-name typo - the frontend already
+                   type-checked that separately. Reachable callers still
+                   hard-fail regardless of wording, since reachable[i] short
+                   -circuits the skip check before is_unsupported_gap is
+                   even consulted. */
                 bir_fail(b, node->source_line, node->source_col,
-                         "call to unknown function '%s'", node->name);
+                         "call to unknown function '%s' is outside the backend-IR subset",
+                         node->name);
                 hir_expr_free(expr);
                 return false;
             }

@@ -2433,6 +2433,15 @@ static bool check_ownership_flow(VerifyCtx *ctx) {
     for (size_t f = 0; f < ctx->module->function_count; f++) {
         const BirFunctionInfo *info = &ctx->module->functions[f];
         if (info->entry == SSA_BLOCK_NONE || info->entry >= blocks) continue;
+        /* A function nothing reachable from main ever calls still gets fully
+           built and structurally verified elsewhere, but an ownership/borrow
+           bug in its body (dead code the compiled binary never runs) must
+           not hard-fail every build that happens to define it - same
+           rationale as the narrower reachable_from_main check on the
+           still-live-at-return case below, generalized to the whole
+           per-function ownership dataflow pass instead of just that one
+           terminator check. */
+        if (!info->reachable_from_main) continue;
         ownership_state_init(&in[info->entry]);
         ownership_seed_function_params(ctx->module, info, &in[info->entry]);
         for (size_t iteration = 0; iteration < blocks * 2 + 2; iteration++) {
