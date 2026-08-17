@@ -620,6 +620,8 @@ static void emit_sum_constructor(CodeGen *cg, ASTNode *node, const char *dest_re
                                  const char *error_name);
 
 static int struct_storage_size(CodeGen *cg, const char *type_name);
+static bool expression_is_float_codegen(CodeGen *cg, ASTNode *node);
+static int field_offset_for(CodeGen *cg, const char *struct_name, const char *field_name);
 
 static void emit_tensor_return(CodeGen *cg, ASTNode *value) {
     if (!value) {
@@ -668,6 +670,34 @@ static void emit_struct_return(CodeGen *cg, ASTNode *value) {
     fprintf(cg->out, "    mov rsi, rax\n    mov rdi, QWORD PTR [rbp-240]\n");
     emit_copy_memory(cg, "rsi", "rdi",
                      struct_storage_size(cg, cg->current_return_type_name));
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-240]\n");
+}
+
+/* A tuple literal return value has no addressable storage of its own (see
+   AST_TUPLE) - each element expression is evaluated and written straight
+   into the caller's sret buffer at its field's offset, the same way
+   emit_list_return writes fields individually rather than memcpy'ing a
+   contiguous block. */
+static void emit_tuple_return(CodeGen *cg, ASTNode *tuple) {
+    if (!cg->current_return_type_name[0]) {
+        fprintf(stderr, "CodeGen Error: tuple return requires a typed value\n");
+        exit(EXIT_FAILURE);
+    }
+    int dest_slot = reserve(cg, 8);
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-240]\n    mov QWORD PTR [rbp-%d], rax\n", dest_slot);
+    for (size_t i = 0; i < tuple->child_count; i++) {
+        char field_name[16];
+        snprintf(field_name, sizeof(field_name), "_%zu", i);
+        int offset = field_offset_for(cg, cg->current_return_type_name, field_name);
+        emit_expr(cg, tuple->children[i]);
+        if (expression_is_float_codegen(cg, tuple->children[i])) {
+            fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n    movss DWORD PTR [rdx + %d], xmm0\n",
+                    dest_slot, offset);
+        } else {
+            fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rdx + %d], rax\n",
+                    dest_slot, offset);
+        }
+    }
     fprintf(cg->out, "    mov rax, QWORD PTR [rbp-240]\n");
 }
 
@@ -4839,7 +4869,8 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             if (cg->current_return_type == COBRA_TYPE_TENSOR_F32) {
                 if (has_result) emit_tensor_return(cg, n->children[0]);
             } else if (cg->current_return_type == COBRA_TYPE_STRUCT) {
-                if (has_result) emit_struct_return(cg, n->children[0]);
+                if (has_result && n->children[0]->type == AST_TUPLE) emit_tuple_return(cg, n->children[0]);
+                else if (has_result) emit_struct_return(cg, n->children[0]);
             } else if (cg->current_return_type == COBRA_TYPE_LIST) {
                 if (has_result) emit_list_return(cg, n->children[0]);
             } else if (cg->current_return_type == COBRA_TYPE_DICT) {

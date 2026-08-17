@@ -1,0 +1,8 @@
+def pair() -> (i64, i64): {
+    return (1, 2)
+}
+
+def test_tuple_destructure_arity_mismatch() -> i64: {
+    let (a, b, c) = pair()
+    return a + b + c
+}

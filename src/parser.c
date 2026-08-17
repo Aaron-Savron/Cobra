@@ -164,10 +164,117 @@ static CobraTypeKind parse_sum_component(Parser *parser, const char *context,
     return type;
 }
 
+/* Tuples currently support scalar elements only (see ROADMAP.md phase 14):
+   value-owned aggregates raise the same ownership questions as list[T]'s
+   owned-field work in progress elsewhere, so they stay out of scope here. */
+static bool is_tuple_element_kind(CobraTypeKind kind) {
+    switch (kind) {
+        case COBRA_TYPE_I32: case COBRA_TYPE_I64: case COBRA_TYPE_U8:
+        case COBRA_TYPE_U32: case COBRA_TYPE_U64: case COBRA_TYPE_F32:
+        case COBRA_TYPE_F64: case COBRA_TYPE_BOOL:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Deterministic name for a scalar tuple shape, e.g. "__tuple_i64_f32". Two
+   tuple types with the same element kinds in the same order always produce
+   the same name, so cobra_type_equal (name-based for COBRA_TYPE_STRUCT) and
+   the synthetic-struct-decl cache below both treat them as one type. */
+static void tuple_struct_name(char *out, size_t out_size,
+                              const CobraTypeKind *elem_kinds, size_t count) {
+    size_t used = snprintf(out, out_size, "__tuple");
+    for (size_t i = 0; i < count && used < out_size; i++) {
+        used += snprintf(out + used, out_size - used, "_%s", cobra_type_kind_name(elem_kinds[i]));
+    }
+}
+
+/* Registers (once per distinct shape) a synthetic AST_STRUCT_DECL with
+   positional fields "_0".."_N-1" so the rest of the compiler - layout,
+   sret-style struct return, field access - treats a tuple as an ordinary
+   struct without any dedicated tuple machinery in type.c/ir.c/codegen.c. */
+static void parser_ensure_tuple_struct(Parser *parser, const char *tuple_name,
+                                       const CobraType *const *elem_types,
+                                       const CobraTypeKind *elem_kinds, size_t count) {
+    if (!parser->root) return;
+    for (size_t i = 0; i < parser->root->child_count; i++) {
+        if (parser->root->children[i]->type == AST_STRUCT_DECL &&
+            !strcmp(parser->root->children[i]->name, tuple_name)) return;
+    }
+    ASTNode *decl = parser_create_node(parser, AST_STRUCT_DECL, tuple_name);
+    decl->declared_type = COBRA_TYPE_STRUCT;
+    decl->canonical_type = parser_component_type(parser, COBRA_TYPE_STRUCT, tuple_name);
+    for (size_t i = 0; i < count; i++) {
+        char field_name[16];
+        snprintf(field_name, sizeof(field_name), "_%zu", i);
+        ASTNode *field = parser_create_node(parser, AST_PARAM, field_name);
+        field->declared_type = elem_kinds[i];
+        field->canonical_type = elem_types[i];
+        ast_add_child(decl, field);
+    }
+    ast_add_child(parser->root, decl);
+}
+
+/* A `let (a, b) = ...` destructure desugars to several sibling statements
+   (see parse_statement), but parse_statement can only return one node. It
+   marks that bundle with this sentinel name on an AST_PROGRAM wrapper;
+   every statement-list loop must splice the wrapper's children in place of
+   itself rather than append it as one nested statement - nesting it would
+   read fine at parse time but IR validation scopes an AST_PROGRAM
+   encountered as a plain statement like an if/while body, so locals
+   declared inside it would not be visible to the statements that follow. */
+#define TUPLE_DESTRUCTURE_SPLICE_MARKER "__tuple_destructure__"
+
 static CobraTypeKind parse_type_into(Parser *parser, const char *context,
                                      ASTNode *owner, int qualifier) {
     bool slice = false;
     bool tensor = false;
+    if (match(parser, TOKEN_LPAREN)) {
+        /* Tuple type: (T1, T2, ...). At least two elements - a single
+           parenthesized type isn't meaningful and stays reserved for a
+           possible future grouping use. */
+        advance_token(parser);
+        const CobraType *elem_types[8];
+        CobraTypeKind elem_kinds[8];
+        size_t elem_count = 0;
+        for (;;) {
+            if (elem_count >= 8) {
+                fprintf(stderr, "%s:%d:%d: error: tuple types support at most 8 elements\n",
+                        parser->source_file, parser->current_token.line, parser->current_token.col);
+                exit(1);
+            }
+            ASTNode elem_owner;
+            memset(&elem_owner, 0, sizeof(elem_owner));
+            CobraTypeKind elem_kind = parse_type_into(parser, "tuple element", &elem_owner, 0);
+            if (!is_tuple_element_kind(elem_kind)) {
+                fprintf(stderr, "%s:%d:%d: error: tuple elements must be scalar values\n",
+                        parser->source_file, parser->current_token.line, parser->current_token.col);
+                exit(1);
+            }
+            elem_types[elem_count] = elem_owner.canonical_type
+                ? elem_owner.canonical_type
+                : parser_component_type(parser, elem_kind, NULL);
+            elem_kinds[elem_count] = elem_kind;
+            elem_count++;
+            if (match(parser, TOKEN_COMMA)) { advance_token(parser); continue; }
+            break;
+        }
+        expect(parser, TOKEN_RPAREN, "Expected ')' after tuple type");
+        if (elem_count < 2) {
+            fprintf(stderr, "%s:%d:%d: error: a tuple type requires at least two elements\n",
+                    parser->source_file, parser->current_token.line, parser->current_token.col);
+            exit(1);
+        }
+        char name[COBRA_MAX_IDENT_LEN];
+        tuple_struct_name(name, sizeof(name), elem_kinds, elem_count);
+        parser_ensure_tuple_struct(parser, name, elem_types, elem_kinds, elem_count);
+        if (owner) {
+            owner->declared_type = COBRA_TYPE_STRUCT;
+            owner->canonical_type = parser_component_type(parser, COBRA_TYPE_STRUCT, name);
+        }
+        return COBRA_TYPE_STRUCT;
+    }
     if (match(parser, TOKEN_IDENTIFIER) &&
         (!strcmp(parser->current_token.text, "Option") ||
          !strcmp(parser->current_token.text, "Result"))) {
@@ -957,8 +1064,22 @@ static ASTNode *parse_primary(Parser *parser) {
     }
 
     if (match(parser, TOKEN_LPAREN)) {
+        Token paren_token = parser->current_token;
         advance_token(parser);
         ASTNode *expr = parse_expression(parser);
+        if (match(parser, TOKEN_COMMA)) {
+            /* (a, b, ...): a tuple literal, not a grouping paren. Only
+               `return (...)` and a direct `let (a, b) = (x, y)` destructure
+               give this node anywhere to go; see the comment on AST_TUPLE. */
+            ASTNode *tuple = parser_create_node_at(parser, AST_TUPLE, NULL, paren_token);
+            ast_add_child(tuple, expr);
+            while (match(parser, TOKEN_COMMA)) {
+                advance_token(parser);
+                ast_add_child(tuple, parse_expression(parser));
+            }
+            expect(parser, TOKEN_RPAREN, "Expected ')' after tuple literal");
+            return tuple;
+        }
         expect(parser, TOKEN_RPAREN, "Expected ')' after expression");
         return expr;
     }
@@ -1342,6 +1463,114 @@ static ASTNode *parse_statement(Parser *parser) {
     if (match(parser, TOKEN_LET) || match(parser, TOKEN_VAR) || match(parser, TOKEN_CONST)) {
         bool is_const = match(parser, TOKEN_CONST);
         advance_token(parser);
+
+        if (match(parser, TOKEN_LPAREN)) {
+            /* let (a, b, ...) = expr - flat tuple destructure. No nested
+               patterns, no wildcard `_`: this is intentionally scoped to
+               binding every element of a tuple-typed expression to a fresh
+               local name (see ROADMAP.md phase 14). */
+            Token let_token = parser->current_token;
+            advance_token(parser);
+            char names[8][COBRA_MAX_IDENT_LEN];
+            size_t name_count = 0;
+            while (!match(parser, TOKEN_RPAREN)) {
+                if (name_count >= 8 || !match(parser, TOKEN_IDENTIFIER)) {
+                    fprintf(stderr, "%s:%d:%d: error: expected a name in tuple destructure\n",
+                            parser->source_file, parser->current_token.line, parser->current_token.col);
+                    exit(1);
+                }
+                copy_token_text(parser, names[name_count++], COBRA_MAX_IDENT_LEN, "destructure name");
+                advance_token(parser);
+                if (match(parser, TOKEN_COMMA)) advance_token(parser);
+                else if (!match(parser, TOKEN_RPAREN)) {
+                    fprintf(stderr, "%s:%d:%d: error: expected ',' or ')' in tuple destructure\n",
+                            parser->source_file, parser->current_token.line, parser->current_token.col);
+                    exit(1);
+                }
+            }
+            expect(parser, TOKEN_RPAREN, "Expected ')' after tuple destructure names");
+            if (name_count < 2) {
+                fprintf(stderr, "%s:%d:%d: error: tuple destructure requires at least two names\n",
+                        parser->source_file, parser->current_token.line, parser->current_token.col);
+                exit(1);
+            }
+            expect(parser, TOKEN_ASSIGN, "Expected '=' in tuple destructure");
+            ASTNode *rhs = parse_expression(parser);
+
+            ASTNode *block = parser_create_node_at(parser, AST_PROGRAM, TUPLE_DESTRUCTURE_SPLICE_MARKER, let_token);
+            if (rhs->type == AST_TUPLE) {
+                /* Direct tuple literal RHS: no shared value to evaluate once,
+                   so this is pure sugar over N independent `let`s - the type
+                   system never needs to see a tuple type at all here. */
+                if (rhs->child_count != name_count) {
+                    fprintf(stderr, "%s:%d:%d: error: tuple destructure expects %zu values, found %zu\n",
+                            parser->source_file, let_token.line, let_token.col,
+                            name_count, rhs->child_count);
+                    exit(1);
+                }
+                for (size_t i = 0; i < name_count; i++) {
+                    ASTNode *decl = parser_create_node_at(parser, AST_VAR_DECL, names[i], let_token);
+                    decl->is_const = is_const;
+                    decl->declared_type = COBRA_TYPE_UNTYPED;
+                    ast_add_child(decl, rhs->children[i]);
+                    rhs->children[i] = NULL;
+                    ast_add_child(block, decl);
+                }
+                ast_free(rhs);
+            } else if (rhs->type == AST_FUNC_CALL) {
+                /* Destructuring a call result requires knowing its tuple
+                   struct shape up front, so this form only supports calling
+                   a function already declared earlier in the source - the
+                   same forward-reference limitation ordinary struct-typed
+                   `let` bindings have today. */
+                ASTNode *callee = NULL;
+                if (parser->root) {
+                    for (size_t i = 0; i < parser->root->child_count; i++) {
+                        ASTNode *cand = parser->root->children[i];
+                        if (cand->type == AST_FUNCTION && !strcmp(cand->name, rhs->name)) { callee = cand; break; }
+                    }
+                }
+                if (!callee || callee->declared_type != COBRA_TYPE_STRUCT || !callee->canonical_type) {
+                    fprintf(stderr, "%s:%d:%d: error: tuple destructure requires a call to a previously declared tuple-returning function\n",
+                            parser->source_file, let_token.line, let_token.col);
+                    exit(1);
+                }
+                const char *tuple_name = cobra_type_node_name(callee);
+                ASTNode *found_decl = NULL;
+                for (size_t i = 0; parser->root && i < parser->root->child_count; i++) {
+                    ASTNode *cand = parser->root->children[i];
+                    if (cand->type == AST_STRUCT_DECL && !strcmp(cand->name, tuple_name)) { found_decl = cand; break; }
+                }
+                if (!found_decl || found_decl->child_count != name_count) {
+                    fprintf(stderr, "%s:%d:%d: error: tuple destructure expects %zu values, callee returns a different arity\n",
+                            parser->source_file, let_token.line, let_token.col, name_count);
+                    exit(1);
+                }
+                char temp_name[COBRA_MAX_IDENT_LEN];
+                snprintf(temp_name, sizeof(temp_name), "__tuple_tmp_%d_%d", let_token.line, let_token.col);
+                ASTNode *temp_decl = parser_create_node_at(parser, AST_VAR_DECL, temp_name, let_token);
+                temp_decl->declared_type = COBRA_TYPE_STRUCT;
+                temp_decl->canonical_type = callee->canonical_type;
+                ast_add_child(temp_decl, rhs);
+                ast_add_child(block, temp_decl);
+                for (size_t i = 0; i < name_count; i++) {
+                    ASTNode *access = parser_create_node_at(parser, AST_MEMBER_ACCESS, temp_name, let_token);
+                    snprintf(access->secondary_name, sizeof(access->secondary_name), "_%zu", i);
+                    ast_add_child(access, parser_create_node_at(parser, AST_VAR_REF, temp_name, let_token));
+                    ASTNode *decl = parser_create_node_at(parser, AST_VAR_DECL, names[i], let_token);
+                    decl->is_const = is_const;
+                    decl->declared_type = COBRA_TYPE_UNTYPED;
+                    ast_add_child(decl, access);
+                    ast_add_child(block, decl);
+                }
+            } else {
+                fprintf(stderr, "%s:%d:%d: error: tuple destructure requires a tuple literal or a tuple-returning function call\n",
+                        parser->source_file, let_token.line, let_token.col);
+                exit(1);
+            }
+            return block;
+        }
+
         char var_name[COBRA_MAX_IDENT_LEN];
         Token variable_token = parser->current_token;
         copy_token_text(parser, var_name, sizeof(var_name), "variable name");
@@ -1534,18 +1763,31 @@ static ASTNode *parse_statement(Parser *parser) {
     return parse_expression(parser);
 }
 
+static void parser_append_statement(ASTNode *block, ASTNode *stmt) {
+    if (!stmt) return;
+    if (stmt->type == AST_PROGRAM && !strcmp(stmt->name, TUPLE_DESTRUCTURE_SPLICE_MARKER)) {
+        for (size_t i = 0; i < stmt->child_count; i++) ast_add_child(block, stmt->children[i]);
+        stmt->children = NULL;
+        stmt->child_count = 0;
+        stmt->child_capacity = 0;
+        ast_free(stmt);
+        return;
+    }
+    ast_add_child(block, stmt);
+}
+
 static ASTNode *parse_block(Parser *parser) {
     ASTNode *block = parser_create_node(parser, AST_PROGRAM, "Block");
 
     if (match(parser, TOKEN_LBRACE)) {
         advance_token(parser);
         while (!match(parser, TOKEN_RBRACE) && !match(parser, TOKEN_EOF)) {
-            ast_add_child(block, parse_statement(parser));
+            parser_append_statement(block, parse_statement(parser));
         }
         expect(parser, TOKEN_RBRACE, "Expected '}' after block");
     } else {
         // Single statement or indented line
-        ast_add_child(block, parse_statement(parser));
+        parser_append_statement(block, parse_statement(parser));
     }
 
     return block;
@@ -1891,12 +2133,12 @@ static ASTNode *parse_function_signature_and_body(Parser *parser, ASTNode *fn_no
     if (match(parser, TOKEN_LBRACE)) {
         advance_token(parser);
         while (!match(parser, TOKEN_RBRACE) && !match(parser, TOKEN_EOF)) {
-            ast_add_child(fn_node, parse_statement(parser));
+            parser_append_statement(fn_node, parse_statement(parser));
         }
         expect(parser, TOKEN_RBRACE, "Expected '}' at end of function block");
     } else {
         while (!match(parser, TOKEN_EOF) && !match(parser, TOKEN_DEF)) {
-            ast_add_child(fn_node, parse_statement(parser));
+            parser_append_statement(fn_node, parse_statement(parser));
         }
     }
 

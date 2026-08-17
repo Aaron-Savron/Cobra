@@ -1,0 +1,35 @@
+def divmod(a: i64, b: i64) -> (i64, i64): {
+    return (a / b, a % b)
+}
+
+def stats3(a: i64, b: i64, c: i64) -> (i64, i64, i64): {
+    return (a + b + c, a * b * c, a - b - c)
+}
+
+def test_tuple_literal_destructure(): {
+    let (x, y) = (10, 20)
+    assert(x == 10)
+    assert(y == 20)
+    return 0
+}
+
+def test_tuple_returning_call_destructure(): {
+    let (q, r) = divmod(17, 5)
+    assert(q == 3)
+    assert(r == 2)
+    return 0
+}
+
+def test_tuple_arity_three(): {
+    let (total, product, diff) = stats3(2, 3, 4)
+    assert(total == 9)
+    assert(product == 24)
+    assert(diff == -5)
+    return 0
+}
+
+def test_tuple_literal_direct_arity_three(): {
+    let (a, b, c) = (1, 2, 3)
+    assert(a + b + c == 6)
+    return 0
+}

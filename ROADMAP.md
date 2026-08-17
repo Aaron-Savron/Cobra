@@ -574,8 +574,35 @@ Finish the language contracts for:
   owning payloads (strings, owned slices, owning structs, nested sums)
   with extraction, transfer, destruction, and flow-analysis protection.
   Production codegen still rejects the syntax.
-- Tuples
-- Destructuring
+- [x] Tuples and flat destructuring, scoped to scalar elements. A tuple type
+  `(T1, T2, ...)` (2-8 scalar elements: i64/i32/u8/u32/u64/f32/f64/bool) is
+  sugar over the existing struct machinery - the parser synthesizes an
+  ordinary `AST_STRUCT_DECL` with positional fields `_0.._N-1`, deduplicated
+  by a deterministic name (`__tuple_i64_i64`, ...), so layout, sret-style
+  struct return, and field access all reuse struct codegen/IR unchanged; no
+  new `CobraType`/`ASTNodeType` case was added anywhere that owns a switch
+  the isolated backend also switches on, except one new `AST_TUPLE` node
+  (direct-backend-only, matching how `AST_TRAIT_DECL`/`AST_IMPL_DECL` were
+  added). A tuple literal `(a, b, c)` is a first-class expression only in
+  two positions: the value of `return (...)` from a tuple-typed function
+  (`emit_tuple_return` writes each element straight into the sret buffer at
+  its field offset, since the literal has no addressable storage of its
+  own), and the RHS of `let (a, b, c) = ...` destructuring. Destructuring
+  supports exactly two RHS shapes: a direct tuple literal (desugars at parse
+  time into N independent `let`s, no tuple type ever created) and a call to
+  a function already declared earlier in the source with a tuple return
+  type (desugars into a hidden struct-typed temp holding the call result
+  plus N ordinary field-access `let`s). Both desugar into a spliced sibling
+  statement list rather than a nested block, since IR validation scopes a
+  nested `AST_PROGRAM` like an if/while body and would drop the bound names
+  once the block ends. Deliberately out of scope: non-scalar tuple elements
+  (string/struct - same ownership questions as the parallel list[T] owned-
+  field work), tuple-typed parameters, a tuple value escaping through a
+  plain variable or nested pattern, and any destructuring beyond flat
+  tuple-to-names (no wildcard `_`, no nested patterns, no struct-field
+  destructuring). See `examples/164_tuples_destructuring.cb` and
+  `tests/negative/100_tuple_destructure_arity_mismatch.cb` /
+  `tests/negative/101_tuple_destructure_non_tuple.cb`.
 - [x] Plain struct methods, no trait required. `impl Type: { def method(params)
   -> ret: { body } ... }` (same body as `parse_impl_declaration` already
   parsed for `impl Trait for Type`, just without the `Trait for` prefix)

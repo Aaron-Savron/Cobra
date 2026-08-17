@@ -207,7 +207,15 @@ typedef enum {
        __impl_<Trait>_<Type>_<method>) directly into the program root by the
        parser, exactly like closure literals; this node exists purely so IR
        build can verify every trait method got a matching impl. */
-    AST_IMPL_DECL
+    AST_IMPL_DECL,
+    /* Tuple literal (a, b, c, ...). children are the element expressions, in
+       order. Only two source positions currently produce this node: a
+       `return (...)` value expression and the split-out RHS of a direct
+       `let (a, b) = (x, y)` destructure (see parse_statement); it never
+       reaches codegen as a free-standing addressable value the way a struct
+       local does. Element types are restricted to scalars (see
+       parse_type_into's tuple-type branch and parse_primary). */
+    AST_TUPLE
 } ASTNodeType;
 
 typedef enum {

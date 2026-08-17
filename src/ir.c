@@ -3993,7 +3993,35 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
         }
         case AST_RETURN: {
             ASTNode *return_value = node->child_count > 0 ? node->children[0] : NULL;
-            CobraTypeKind actual = return_value ? infer_expr(return_value, ctx) : COBRA_TYPE_VOID;
+            CobraTypeKind actual;
+            if (return_value && return_value->type == AST_TUPLE) {
+                /* A tuple literal return value never reaches infer_expr (it
+                   has no AST_TUPLE case - this node only appears here or
+                   inside a `let (a, b) = (x, y)` destructure, which the
+                   parser already splits apart before IR build). Check arity
+                   and element types directly against the declared tuple
+                   return struct instead. */
+                IRStruct *tuple_type = find_struct(ctx, ctx->return_type_name);
+                if (ctx->return_type != COBRA_TYPE_STRUCT || !tuple_type) {
+                    ir_error(ctx, node, "tuple return requires a tuple-typed function return type");
+                } else if ((size_t)tuple_type->field_count != return_value->child_count) {
+                    ir_error(ctx, node, "tuple return arity does not match the declared return type");
+                } else {
+                    for (size_t i = 0; i < return_value->child_count; i++) {
+                        CobraTypeKind elem_actual = infer_expr(return_value->children[i], ctx);
+                        CobraTypeKind elem_expect = tuple_type->fields[i].type;
+                        if (elem_actual != COBRA_TYPE_UNKNOWN && elem_actual != elem_expect &&
+                            !(is_integer(elem_actual) && is_integer(elem_expect))) {
+                            ir_error(ctx, node, "tuple element type does not match the declared return type");
+                            break;
+                        }
+                    }
+                }
+                return_value->value_type = COBRA_TYPE_STRUCT;
+                actual = COBRA_TYPE_STRUCT;
+            } else {
+                actual = return_value ? infer_expr(return_value, ctx) : COBRA_TYPE_VOID;
+            }
             /* `return fallible()?` returns the original failure sum and wraps
                the successful payload in the current function's sum type. */
             if (return_value && return_value->type == AST_FUNC_CALL &&
