@@ -2145,6 +2145,7 @@ int main(int argc, char **argv) {
         CobraSourceBuffer isolated_buffer = {0};
         char *isolated_std_source = read_library_file("std.cb");
         char *isolated_mem_source = read_library_file("mem.cb");
+        char *isolated_fs_source = read_library_file("fs.cb");
         if (isolated_std_source) {
             source_buffer_append(&isolated_buffer, isolated_std_source, "lib/std.cb");
             free(isolated_std_source);
@@ -2152,6 +2153,10 @@ int main(int argc, char **argv) {
         if (isolated_mem_source) {
             source_buffer_append(&isolated_buffer, isolated_mem_source, "lib/mem.cb");
             free(isolated_mem_source);
+        }
+        if (isolated_fs_source) {
+            source_buffer_append(&isolated_buffer, isolated_fs_source, "lib/fs.cb");
+            free(isolated_fs_source);
         }
         CobraModulePaths isolated_module_paths = {0};
         if (!load_cobra_module(source_path, &project_config, &isolated_module_paths,
