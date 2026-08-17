@@ -1069,25 +1069,56 @@ static SsaValueRef ssa_eval_expr(SsaPass *p, size_t block, HirExpr *expr) {
             return bir_inst_result(arena, len, expr->source_line, expr->source_col);
         }
         case HIR_EXPR_BORROW: {
-            SsaValueRef source = ssa_eval_expr(p, block, expr->args[0]);
-            if (source == SSA_VALUE_NONE) return SSA_VALUE_NONE;
             const CobraType *element = expr->aggregate_type;
             const CobraType *pointer_type = bir_pointer_type(p->module, element);
-            SsaInstRef view_ptr = bir_add_view_ptr(arena, pointer_type, element,
-                                                   source, expr->source_line,
-                                                   expr->source_col);
-            if (view_ptr == SSA_INST_NONE ||
-                !bir_block_add_inst(arena, p->base + block, view_ptr))
-                return SSA_VALUE_NONE;
-            SsaValueRef base = bir_inst_result(arena, view_ptr,
-                                               expr->source_line, expr->source_col);
-            SsaInstRef len = bir_add_view_len(arena, p->module->type_i64,
-                                              arena->values[source].type, source,
-                                              expr->source_line, expr->source_col);
-            if (len == SSA_INST_NONE ||
-                !bir_block_add_inst(arena, p->base + block, len)) return SSA_VALUE_NONE;
-            SsaValueRef length = bir_inst_result(arena, len,
-                                                 expr->source_line, expr->source_col);
+            SsaValueRef base, length;
+            /* A fixed array has no runtime slice descriptor to read a
+               pointer/length pair out of - it's an inline stack aggregate,
+               so the view is built directly from its address and its
+               compile-time-known length instead of going through
+               VIEW_PTR/VIEW_LEN (which expect an existing slice/view value). */
+            if (expr->args[0]->type && expr->args[0]->type->kind == COBRA_TYPE_ARRAY) {
+                SsaValueRef array_ptr = ssa_eval_lvalue_ptr(p, block, expr->args[0]);
+                if (array_ptr == SSA_VALUE_NONE) return SSA_VALUE_NONE;
+                /* array_ptr's pointee type is the array type itself; VIEW_MAKE
+                   needs a pointer to the element type, so retype it through
+                   the array-index-address instruction at index 0 (a no-op
+                   address computation that just reinterprets the pointer,
+                   carrying the frame provenance forward). */
+                SsaValueRef zero = bir_add_const(arena,
+                    bir_scalar_i64(p->module->type_i64, 0),
+                    expr->source_line, expr->source_col);
+                SsaInstRef element_addr = bir_add_array_index_addr(
+                    arena, pointer_type, expr->args[0]->type, element,
+                    array_ptr, zero, expr->source_line, expr->source_col);
+                if (element_addr == SSA_INST_NONE ||
+                    !bir_block_add_inst(arena, p->base + block, element_addr))
+                    return SSA_VALUE_NONE;
+                base = bir_inst_result(arena, element_addr,
+                                       expr->source_line, expr->source_col);
+                length = bir_add_const(arena,
+                    bir_scalar_i64(p->module->type_i64,
+                                   (int64_t)expr->args[0]->type->array_length),
+                    expr->source_line, expr->source_col);
+            } else {
+                SsaValueRef source = ssa_eval_expr(p, block, expr->args[0]);
+                if (source == SSA_VALUE_NONE) return SSA_VALUE_NONE;
+                SsaInstRef view_ptr = bir_add_view_ptr(arena, pointer_type, element,
+                                                       source, expr->source_line,
+                                                       expr->source_col);
+                if (view_ptr == SSA_INST_NONE ||
+                    !bir_block_add_inst(arena, p->base + block, view_ptr))
+                    return SSA_VALUE_NONE;
+                base = bir_inst_result(arena, view_ptr,
+                                       expr->source_line, expr->source_col);
+                SsaInstRef len = bir_add_view_len(arena, p->module->type_i64,
+                                                  arena->values[source].type, source,
+                                                  expr->source_line, expr->source_col);
+                if (len == SSA_INST_NONE ||
+                    !bir_block_add_inst(arena, p->base + block, len)) return SSA_VALUE_NONE;
+                length = bir_inst_result(arena, len,
+                                         expr->source_line, expr->source_col);
+            }
             SsaInstRef make = bir_add_view_make(arena, expr->type, element, base,
                                                 length, expr->source_line,
                                                 expr->source_col);

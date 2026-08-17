@@ -811,7 +811,9 @@ bool bir_call_arg_type_compatible(const CobraType *actual,
                                   const CobraType *expected) {
     if (actual && expected &&
         (actual == expected || cobra_type_equal(actual, expected))) return true;
-    if (!bir_is_owned_slice_type(actual) || !bir_is_borrowed_view_type(expected))
+    if (!bir_is_borrowed_view_type(expected))
+        return false;
+    if (!bir_is_owned_slice_type(actual) && (!actual || actual->kind != COBRA_TYPE_ARRAY))
         return false;
     const CobraType *actual_element = cobra_type_element(actual);
     const CobraType *expected_element = cobra_type_element(expected);
