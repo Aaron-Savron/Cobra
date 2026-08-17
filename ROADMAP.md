@@ -30,9 +30,16 @@ Cobra currently has:
 - SSA verification and evaluation tests
 - A scalar SSA verifier that checks function-owned block ranges, unreachable
   block contents, signatures, effects, dominance, and use ordering
-- 72 positive suites and 86 negative diagnostics
+- 133 example programs (108 with `test_` suites) and 101 negative diagnostics
 
-The backend IR is currently isolated from production codegen and supports
+The backend IR is linked into the production `cobra` binary and selectable
+with `cobra build|run <file> --backend=native` (see Phase 15 item 28 below
+for the current state of that integration); the direct emitter
+(`--backend=direct` or no flag) remains the default. Historically (through
+most of Phases 1-13 below) it was fully isolated from production codegen;
+that section is preserved as-written for the implementation history it
+records, not as a description of the current wiring. Independent of the
+production-wiring question, the backend IR supports
 `i64`, `i32`, `u8`, `u32`, `u64`, `bool`, `f32`, and `f64` scalars, with
 byte-width `u8` arithmetic and memory semantics. Its evaluator stores values and call
 frames as typed scalar payloads and provides typed frame-local pointer memory.
@@ -677,9 +684,20 @@ Finish the language contracts for:
   src/codegen.c). `let x: dyn Trait = some_func(...)` is a plain scalar
   move, since a dyn-returning call already hands back a fully-built block
   pointer. Not yet supported: `list[dyn Trait]` elements, generic trait
-  bounds (`def f[T: Shape](x: T)`), default trait methods, supertraits, and
-  multiple impls of the same trait for the same type (last registration
-  wins silently - not yet diagnosed).
+  bounds (`def f[T: Shape](x: T)`), and multiple impls of the same trait
+  for the same type (last registration wins silently - not yet diagnosed).
+- [x] Default trait methods and supertraits. A trait method signature may
+  include a default body (`def name(...) -> ret: { body }` inside the
+  `trait` block); any impl that doesn't override it gets a synthesized
+  `__impl_<Trait>_<Type>_<method>` cloned from the default at parse time
+  with the receiver prepended, registered exactly like a hand-written impl
+  method so no other pass needs to know a default was involved (a default
+  body cannot reference a receiver, since the trait signature never names
+  one). A trait may declare a supertrait (`trait Drawable: Shape: { ... }`);
+  a type implementing the subtrait must also satisfy every supertrait
+  method, checked via `find_impl_method` against any impl block for that
+  type, recursively through a bounded-depth chain
+  (examples/158_trait_default_methods.cb, examples/159_trait_supertraits.cb).
 - [x] Static vtables for dyn Trait dispatch. The dispatch block is now a
   fixed 2 words (`data_ptr`, `vtable_ptr`) instead of `method_count + 1`
   words filled in with per-call mov instructions - the method-pointer
@@ -1020,11 +1038,16 @@ arbitrary non-scalar ownership-bearing aggregate emission remains deferred.
     system assembler) or `--backend=native-object` (direct ELF object
     emission). The default remains the production direct emitter
     (`--backend=direct` or no flag), fully unaffected. `--backend=native*`
-    now parses `lib/std.cb` and `lib/mem.cb` as its prelude (the other
-    library modules - nn/fs/cpu/net/http - are not yet included; adding them
-    naively pulls in their own unregistered internal cross-calls and
-    regresses everything, so they need to be added deliberately, module by
-    module, not as a blanket prelude change); a function that fails to lower
+    now parses `lib/std.cb`, `lib/mem.cb`, `lib/fs.cb`, `lib/cpu.cb`,
+    `lib/time.cb`, and `lib/net.cb` as its prelude, added one module at a
+    time with regression verification between each (`lib/nn.cb` and
+    `lib/http.cb` are not yet included: nn.cb needs AVX2 tensor-kernel
+    builtins - `dense_f32`/`relu_f32` and friends - that have no backend_ir
+    lowering at all yet, and http.cb hits a distinct borrowed-view
+    type-inference gap; blanket-adding every module at once was tried twice
+    early on and regressed everything both times, since a module can call
+    its own unregistered internal builtins, so modules are added
+    deliberately and individually, not as a batch); a function that fails to lower
     is skipped rather than aborting the whole build, as long as nothing
     reachable from `main` actually calls it and the failure is a genuine
     "construct not supported yet" gap rather than a real semantic error.
@@ -1066,12 +1089,23 @@ arbitrary non-scalar ownership-bearing aggregate emission remains deferred.
     actually freed) exactly as before - only the specific transient
     call-argument borrow is released, never a named view local's borrow.
 
-    Net effect: def-main examples building under `--backend=native` went
-    from 15/41 to 20/41 in one session (some remaining failures are
-    unrelated gaps, e.g. a real argument-type mismatch in
-    `examples/10_stdlib.cb`). Expanding language coverage (the remaining
-    library modules) is now the main blocker to this being a generally
-    usable backend rather than a subset one.
+    Net effect across the whole `--backend=native` effort this session:
+    def-main examples building under `--backend=native` went from 0/41
+    (every build silently failed the same way, masked by a since-fixed test
+    -harness bug that made `cobra test --backend=native` quietly run the
+    direct backend instead) to 26/41. Remaining known gaps: a full tensor
+    type (`tensor[N,M]f32`) and its AVX2 kernels (blocks 6 files, and is
+    genuinely new-feature-sized work, not a lowering gap - backend_ir has no
+    tensor type representation anywhere yet); `lib/http.cb`'s
+    borrowed-view-inference gap (2 files); a `v256` SIMD parameter gap that
+    predates this effort and exists in both backends, not just this one (1
+    file); a real runtime FFI/PLT-linking segfault, found and documented but
+    not chased (1 file); this backend's flat function-scoped locals (no
+    block/lexical scoping, unlike the direct backend) blocking a couple of
+    remaining stdlib-heavy examples; and inline `asm` blocks, which are a
+    deliberate, permanent non-goal (2 files). Expanding language coverage
+    (the tensor system above all) is now the main blocker to this being a
+    generally usable backend rather than a subset one.
 
 The main rule is:
 
