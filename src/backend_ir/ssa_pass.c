@@ -1994,6 +1994,21 @@ static bool emit_block(SsaPass *p, size_t block, HirBlock *hb) {
             if (hb->term.ret_expr) {
                 bool aggregate_return = hb->term.ret_expr->type &&
                     ssa_is_aggregate_value_type(hb->term.ret_expr->type);
+                if (aggregate_return && hb->term.ret_expr->kind == HIR_EXPR_CALL) {
+                    /* An aggregate-returning call in tail position (e.g.
+                       `return fs_open(path, flags)?` desugared to a plain
+                       call) writes straight into the caller's sret storage,
+                       same as the assignment/member-store paths below. */
+                    if (p->return_storage == SSA_VALUE_NONE) {
+                        ssa_fail(p, hb->source_line, hb->source_col,
+                                 "aggregate return has no caller-provided storage");
+                        return false;
+                    }
+                    if (!ssa_emit_aggregate_call(p, block, hb->term.ret_expr,
+                                                 p->return_storage)) return false;
+                    return bir_set_return(arena, ref, SSA_VALUE_NONE,
+                                          hb->source_line, hb->source_col);
+                }
                 if (aggregate_return &&
                     (hb->term.ret_expr->kind == HIR_EXPR_SUM_MAKE ||
                      hb->term.ret_expr->kind == HIR_EXPR_ARRAY_LITERAL)) {

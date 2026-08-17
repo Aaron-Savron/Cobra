@@ -3416,6 +3416,143 @@ static bool hir_emit_simple(HirBuilder *b, HirStmtKind kind, HirExpr *expr) {
     return hir_block_add_stmt(b, b->current, stmt);
 }
 
+/* Postfix `?` on a call (`CALL(...)?`) in statement position: return, let,
+   or plain assignment. The direct backend desugars this with a raw asm jump
+   to a shared propagation label; the isolated backend has no such label, so
+   it lowers to actual control flow instead - a temp holds the Option/Result,
+   an is_ok/is_some branch either returns the failing tag straight back to
+   the caller (same shape as a bare `return err(...)`/`return none()`) or
+   falls through with the unwrapped payload as the expression's value. Only
+   valid when the callee's sum type exactly matches the current function's
+   declared return type, mirroring the direct backend's same_sum/same_value/
+   same_error check in ir.c's infer_expr. */
+static bool hir_build_try_propagate(HirBuilder *b, ASTNode *call_node,
+                                    HirExpr **out_value) {
+    HirExpr *raw = NULL;
+    if (!hir_build_expr(b, call_node, &raw)) return false;
+    if (!raw->type || !bir_is_sum_type(raw->type)) {
+        bir_fail(b, call_node->source_line, call_node->source_col,
+                 "postfix '?' requires an Option or Result value");
+        hir_expr_free(raw);
+        return false;
+    }
+    if (!bir_types_equal(raw->type, b->fn->return_type)) {
+        bir_fail(b, call_node->source_line, call_node->source_col,
+                 "postfix '?' requires the callee and current function to use the same sum type");
+        hir_expr_free(raw);
+        return false;
+    }
+    bool is_option = raw->type->kind == COBRA_TYPE_OPTION;
+
+    char temp_name[64];
+    snprintf(temp_name, sizeof(temp_name), "__try_%zu", b->fn->local_count);
+    int temp = hir_add_local(b, temp_name, false, raw->type,
+                             call_node->source_line, call_node->source_col);
+    if (temp < 0) { hir_expr_free(raw); return false; }
+    if (!hir_emit_assign(b, (uint32_t)temp, raw)) return false;
+
+    HirExpr *cond_ref = hir_expr_alloc(b, call_node->source_line, call_node->source_col);
+    if (!cond_ref) return false;
+    cond_ref->kind = HIR_EXPR_LOCAL;
+    cond_ref->local = (uint32_t)temp;
+    cond_ref->type = b->fn->locals[temp].type;
+    HirExpr *cond = hir_expr_alloc(b, call_node->source_line, call_node->source_col);
+    if (!cond) { hir_expr_free(cond_ref); return false; }
+    cond->kind = HIR_EXPR_SUM_ACCESS;
+    cond->args = calloc(1, sizeof(HirExpr *));
+    if (!cond->args) { hir_expr_free(cond_ref); hir_expr_free(cond); return false; }
+    cond->args[0] = cond_ref;
+    cond->arg_count = 1;
+    cond->aggregate_type = b->fn->locals[temp].type;
+    cond->sum_expected_tag = 1;
+    cond->sum_selector = 0; /* tag: is_some/is_ok */
+    cond->type = b->module->type_bool;
+
+    HirBlock *err_block = hir_new_block(b, "try_err", call_node->source_line, call_node->source_col);
+    if (!err_block) return false;
+    HirBlockRef err_id = err_block->id;
+    HirBlock *ok_block = hir_new_block(b, "try_ok", call_node->source_line, call_node->source_col);
+    if (!ok_block) return false;
+    HirBlockRef ok_id = ok_block->id;
+
+    HirBlockRef pre = b->current;
+    HirTerm branch;
+    memset(&branch, 0, sizeof(branch));
+    branch.kind = HIR_TERM_BRANCH;
+    branch.cond = cond;
+    branch.target = ok_id;
+    branch.target2 = err_id;
+    if (!hir_set_term(b, pre, branch)) return false;
+    if (!hir_add_edge(b, pre, ok_id) || !hir_add_edge(b, pre, err_id)) return false;
+
+    /* err_block: propagate the failing tag straight back to the caller. */
+    HirExpr *err_payload = NULL;
+    if (!is_option) {
+        HirExpr *err_ref = hir_expr_alloc(b, call_node->source_line, call_node->source_col);
+        if (!err_ref) return false;
+        err_ref->kind = HIR_EXPR_LOCAL;
+        err_ref->local = (uint32_t)temp;
+        err_ref->type = b->fn->locals[temp].type;
+        err_payload = hir_expr_alloc(b, call_node->source_line, call_node->source_col);
+        if (!err_payload) { hir_expr_free(err_ref); return false; }
+        err_payload->kind = HIR_EXPR_SUM_ACCESS;
+        err_payload->args = calloc(1, sizeof(HirExpr *));
+        if (!err_payload->args) { hir_expr_free(err_ref); hir_expr_free(err_payload); return false; }
+        err_payload->args[0] = err_ref;
+        err_payload->arg_count = 1;
+        err_payload->aggregate_type = b->fn->locals[temp].type;
+        err_payload->sum_expected_tag = 1;
+        err_payload->sum_selector = 2; /* error component */
+        err_payload->sum_checked = true;
+        err_payload->type = raw->type->generic_args[1];
+    }
+    HirExpr *err_value = hir_expr_alloc(b, call_node->source_line, call_node->source_col);
+    if (!err_value) { hir_expr_free(err_payload); return false; }
+    err_value->kind = HIR_EXPR_SUM_MAKE;
+    err_value->sum_variant = is_option ? 0 : 3;
+    if (err_payload) {
+        err_value->args = calloc(1, sizeof(HirExpr *));
+        if (!err_value->args) { hir_expr_free(err_payload); hir_expr_free(err_value); return false; }
+        err_value->args[0] = err_payload;
+        err_value->arg_count = 1;
+    }
+    if (!hir_complete_sum_type(b, err_value, b->fn->return_type)) {
+        hir_expr_free(err_value);
+        return false;
+    }
+    HirTerm ret_term;
+    memset(&ret_term, 0, sizeof(ret_term));
+    ret_term.kind = HIR_TERM_RETURN;
+    ret_term.ret_expr = err_value;
+    b->current = err_id;
+    if (!hir_set_term(b, err_id, ret_term)) return false;
+
+    /* ok_block: the unwrapped payload becomes the expression's value, and
+       the caller's normal statement lowering (return/let/assign) continues
+       from here. */
+    HirExpr *ok_ref = hir_expr_alloc(b, call_node->source_line, call_node->source_col);
+    if (!ok_ref) return false;
+    ok_ref->kind = HIR_EXPR_LOCAL;
+    ok_ref->local = (uint32_t)temp;
+    ok_ref->type = b->fn->locals[temp].type;
+    HirExpr *ok_payload = hir_expr_alloc(b, call_node->source_line, call_node->source_col);
+    if (!ok_payload) { hir_expr_free(ok_ref); return false; }
+    ok_payload->kind = HIR_EXPR_SUM_ACCESS;
+    ok_payload->args = calloc(1, sizeof(HirExpr *));
+    if (!ok_payload->args) { hir_expr_free(ok_ref); hir_expr_free(ok_payload); return false; }
+    ok_payload->args[0] = ok_ref;
+    ok_payload->arg_count = 1;
+    ok_payload->aggregate_type = b->fn->locals[temp].type;
+    ok_payload->sum_expected_tag = 1;
+    ok_payload->sum_selector = 1; /* ok/some payload */
+    ok_payload->sum_checked = true;
+    ok_payload->type = raw->type->generic_args[0];
+
+    b->current = ok_id;
+    *out_value = ok_payload;
+    return true;
+}
+
 static bool hir_build_if(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_block) {
     if (stmt->child_count < 2) {
         bir_fail(b, stmt->source_line, stmt->source_col,
@@ -4671,7 +4808,10 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                     return false;
                 }
                 HirExpr *value = NULL;
-                if (!hir_build_expr(b, stmt->children[0], &value)) return false;
+                if (stmt->children[0]->type == AST_FUNC_CALL &&
+                    stmt->children[0]->propagate_error) {
+                    if (!hir_build_try_propagate(b, stmt->children[0], &value)) return false;
+                } else if (!hir_build_expr(b, stmt->children[0], &value)) return false;
                 if (!declared ||
                     (stmt->type == AST_VAR_DECL &&
                      stmt->declared_type == COBRA_TYPE_UNTYPED &&
@@ -4749,6 +4889,19 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                              "return inside a with region body is outside the backend-IR subset");
                     return false;
                 }
+                /* `return CALL(...)?` in tail position: since postfix '?'
+                   only type-checks when the callee's sum type exactly
+                   matches this function's own declared return type (see
+                   hir_build_try_propagate's same-sum check, mirrored here by
+                   simply requiring them equal), forwarding the callee's raw
+                   Option/Result value unchanged is semantically identical to
+                   unwrap-then-rewrap: a failing tag returns as-is, and a
+                   successful tag's payload is already wrapped the same way
+                   the caller would wrap it. No branch is needed here (unlike
+                   the let/assign form, which really does need the unwrapped
+                   scalar) - propagate_error is simply ignored below, the
+                   same as the direct backend's tail-position shortcut in
+                   ir.c's AST_RETURN case. */
                 HirExpr *value = NULL;
                 if (stmt->child_count > 0 &&
                     !hir_build_expr(b, stmt->children[0], &value)) {
@@ -5107,6 +5260,21 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                 /* Expression statement: evaluate the call for effect. */
                 HirExpr *value = NULL;
                 if (!hir_build_expr(b, stmt, &value)) return false;
+                if (value->type && hir_is_aggregate_value_type(value->type) &&
+                    value->kind == HIR_EXPR_CALL) {
+                    /* A discarded aggregate-returning call (fs_close(fd) used
+                       only for its side effect) still needs an sret
+                       destination; hoist into a throwaway temp local so the
+                       call can lower like any other aggregate assignment. */
+                    char temp_name[64];
+                    snprintf(temp_name, sizeof(temp_name), "__discard_%zu",
+                             b->fn->local_count);
+                    int temp = hir_add_local(b, temp_name, false, value->type,
+                                             stmt->source_line, stmt->source_col);
+                    if (temp < 0) { hir_expr_free(value); return false; }
+                    if (!hir_emit_assign(b, (uint32_t)temp, value)) return false;
+                    break;
+                }
                 if (!hir_emit_simple(b, HIR_STMT_EXPR, value)) return false;
                 break;
             }
