@@ -1019,21 +1019,41 @@ arbitrary non-scalar ownership-bearing aggregate emission remains deferred.
     `cobra build|run <file> --backend=native` (text emission through the
     system assembler) or `--backend=native-object` (direct ELF object
     emission). The default remains the production direct emitter
-    (`--backend=direct` or no flag), fully unaffected. Because the isolated
-    backend does not yet parse the standard library, `--backend=native*`
-    reparses only the user's own module (imports included, library prelude
-    excluded); programs that reach outside the supported subset - including
-    any standard-library call - are rejected with a diagnostic at compile
-    time rather than silently mishandled. `--backend=native*` also skips the
-    legacy direct-backend validation pass (`cobra_ir_build`) that `build`/
-    `run` otherwise apply before codegen: the isolated pipeline performs its
-    own complete, independent verification, and the two validators disagree
-    in places (for example, freeing an owned slice received as a function
-    parameter is valid to the isolated backend but rejected by the legacy
-    validator), so gating on the legacy pass would reject isolated-backend
-    programs the isolated backend can correctly compile and verify itself.
-    Expanding language coverage (the
-    standard library above all) is the main blocker to this being a
+    (`--backend=direct` or no flag), fully unaffected. `--backend=native*`
+    now parses `lib/std.cb` and `lib/mem.cb` as its prelude (the other
+    library modules - nn/fs/cpu/net/http - are not yet included; adding them
+    naively pulls in their own unregistered internal cross-calls and
+    regresses everything, so they need to be added deliberately, module by
+    module, not as a blanket prelude change); a function that fails to lower
+    is skipped rather than aborting the whole build, as long as nothing
+    reachable from `main` actually calls it and the failure is a genuine
+    "construct not supported yet" gap rather than a real semantic error.
+    `--backend=native*` also skips the legacy direct-backend validation pass
+    (`cobra_ir_build`) that `build`/`run` otherwise apply before codegen: the
+    isolated pipeline performs its own complete, independent verification,
+    and the two validators disagree in places (for example, freeing an owned
+    slice received as a function parameter is valid to the isolated backend
+    but rejected by the legacy validator), so gating on the legacy pass
+    would reject isolated-backend programs the isolated backend can
+    correctly compile and verify itself.
+
+    A known, deliberately undone gap: a plain `[]T` function parameter is
+    never freed by the direct backend either (its static auto-free pass only
+    ever runs over provably-non-escaping locals, never over received
+    parameters), so it is borrowed-mutable in practice regardless of the
+    missing `out` qualifier. Mapping it that way in the isolated backend
+    (instead of to owned-slice storage) is the correct fix, but the isolated
+    backend has no scope-exit or call-exit borrow release: once a value is
+    borrowed into a view, the verifier considers that view "active" for the
+    rest of the function, so any read or write to the original buffer after
+    a call that borrowed it into a plain `[]T` parameter is rejected as a
+    write-while-borrowed conflict. Fixing this needs real borrow-lifetime
+    tracking (releasing a transient call-argument borrow once the call
+    returns, as opposed to a `let`-bound view local which is meant to live
+    for the rest of the function) - a distinctly-scoped feature, not
+    something to bolt on as a side effect of the parameter-typing fix.
+    Expanding language coverage (the remaining library modules and this
+    borrow-lifetime gap above all) is the main blocker to this being a
     generally usable backend rather than a subset one.
 
 The main rule is:
