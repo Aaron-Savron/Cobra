@@ -4034,6 +4034,12 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                 if (inner_terminated) block_terminated = true;
                 break;
             }
+            case AST_INSPECT_STMT:
+                /* The `x?` quick inspector has no codegen case in the direct
+                   backend either (codegen.c's emit_statement falls through
+                   its own default to a silent no-op); match that instead of
+                   rejecting a construct the production backend also drops. */
+                break;
             default:
                 bir_fail(b, stmt->source_line, stmt->source_col,
                          "statement form is outside the backend-IR subset");
