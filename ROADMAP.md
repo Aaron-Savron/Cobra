@@ -1037,24 +1037,41 @@ arbitrary non-scalar ownership-bearing aggregate emission remains deferred.
     would reject isolated-backend programs the isolated backend can
     correctly compile and verify itself.
 
-    A known, deliberately undone gap: a plain `[]T` function parameter is
-    never freed by the direct backend either (its static auto-free pass only
-    ever runs over provably-non-escaping locals, never over received
-    parameters), so it is borrowed-mutable in practice regardless of the
-    missing `out` qualifier. Mapping it that way in the isolated backend
-    (instead of to owned-slice storage) is the correct fix, but the isolated
-    backend has no scope-exit or call-exit borrow release: once a value is
-    borrowed into a view, the verifier considers that view "active" for the
-    rest of the function, so any read or write to the original buffer after
-    a call that borrowed it into a plain `[]T` parameter is rejected as a
-    write-while-borrowed conflict. Fixing this needs real borrow-lifetime
-    tracking (releasing a transient call-argument borrow once the call
-    returns, as opposed to a `let`-bound view local which is meant to live
-    for the rest of the function) - a distinctly-scoped feature, not
-    something to bolt on as a side effect of the parameter-typing fix.
-    Expanding language coverage (the remaining library modules and this
-    borrow-lifetime gap above all) is the main blocker to this being a
-    generally usable backend rather than a subset one.
+    A plain `[]T` function parameter is never freed by the direct backend
+    either (its static auto-free pass only ever runs over provably-non
+    -escaping locals, never over received parameters), so it is
+    borrowed-mutable in practice regardless of the missing `out` qualifier.
+    `bir_import_ast_type` now maps a bare `[]T` *parameter* specifically
+    (`node->type == AST_PARAM`) to `bir_writable_view_type` instead of owned
+    -slice storage, matching that real direct-backend semantics; declarations
+    and other non-parameter positions are unaffected.
+
+    This needed real borrow-lifetime tracking to be sound: previously, once
+    a value was borrowed into a view, the verifier considered that view
+    "active" for the rest of the function, so any read/write to the
+    original buffer after a call that borrowed it into a plain `[]T`
+    parameter was rejected as a write-while-borrowed conflict. The fix adds
+    a `transient_borrow` flag on `HirExpr`/`SsaInst` (`HIR_EXPR_BORROW` set
+    only at the call-argument alias site in hir.c's `AST_FUNC_CALL` case,
+    distinct from the pre-existing `let`-bound-view-local and return-value
+    borrow sites, which stay live for the rest of the function as before).
+    `flow_simulate_block` in verify.c releases a transient borrow's
+    readonly/writable count immediately after the `SSA_OP_CALL` that
+    consumed it, by walking each call operand's `def_inst` and checking for
+    a flagged `SSA_OP_VIEW_MAKE`; `eval_call` in eval.c mirrors the same
+    release for the interpreter's independent borrow-count model. Both
+    still reject a genuine overlapping borrow (e.g. passing the same
+    allocation as both a writable and a readonly argument to one call) and
+    a genuine use-after-free (reading/writing/freeing an allocation that was
+    actually freed) exactly as before - only the specific transient
+    call-argument borrow is released, never a named view local's borrow.
+
+    Net effect: def-main examples building under `--backend=native` went
+    from 15/41 to 20/41 in one session (some remaining failures are
+    unrelated gaps, e.g. a real argument-type mismatch in
+    `examples/10_stdlib.cb`). Expanding language coverage (the remaining
+    library modules) is now the main blocker to this being a generally
+    usable backend rather than a subset one.
 
 The main rule is:
 

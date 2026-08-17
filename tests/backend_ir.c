@@ -2749,19 +2749,47 @@ static void test_source_owned_slice_rejections(void) {
         }
     }
 
-    /* An owned slice parameter receives ownership and must consume it before
-       returning. The caller cannot use the moved value afterward. */
-    unit_expected("owned slice parameter transfer",
-        "def take(s: []i64) -> i64: {\n"
-        "  value = s[0]\n"
-        "  free(s)\n"
-        "  return value\n"
+    /* A bare `[]i64` parameter is borrowed-mutable, matching the direct
+       backend (which never frees a received parameter either): the callee
+       can read and write through it but not free it, and the caller's own
+       allocation stays live and usable across the call. */
+    unit_expected("plain slice parameter is borrowed, not owned",
+        "def bump_and_read(s: []i64) -> i64: {\n"
+        "  s[0] = s[0] + 1\n"
+        "  return s[0]\n"
         "}\n"
         "def main() -> i64: {\n"
         "  s = alloc_i64(1)\n"
-        "  s[0] = 41\n"
-        "  return take(s) + 1\n"
-        "}\n", 42);
+        "  s[0] = 40\n"
+        "  r = bump_and_read(s)\n"
+        "  r = r + s[0]\n"
+        "  free(s)\n"
+        "  return r\n"
+        "}\n", 82);
+
+    /* Freeing a plain `[]i64` parameter inside the callee is rejected: it
+       is a borrowed view of the caller's allocation, not an owned value the
+       callee received transfer of. */
+    {
+        ASTNode *program = parse_program(
+            "def take(s: []i64) -> i64: {\n"
+            "  value = s[0]\n"
+            "  free(s)\n"
+            "  return value\n"
+            "}\n"
+            "def main() -> i64: {\n"
+            "  s = alloc_i64(1)\n"
+            "  s[0] = 41\n"
+            "  return take(s) + 1\n"
+            "}\n");
+        CHECK(program != NULL);
+        if (program) {
+            BackendIrModule module;
+            CHECK(!bir_build_program(&module, program));
+            bir_module_free(&module);
+            ast_free(program);
+        }
+    }
 
     /* A callee-created owned slice transfers into caller storage on return. */
     unit_expected("owned slice return transfer",
@@ -2777,22 +2805,35 @@ static void test_source_owned_slice_rejections(void) {
         "  return value + 2\n"
         "}\n", 42);
 
-    /* Returning an owned parameter transfers it back to the caller without
-       invalidating its backing allocation. */
-    unit_expected("owned slice parameter return",
-        "def identity(s: []i64) -> []i64: {\n"
-        "  return s\n"
-        "}\n"
-        "def main() -> i64: {\n"
-        "  s = alloc_i64(1)\n"
-        "  s[0] = 40\n"
-        "  out = identity(s)\n"
-        "  value = out[0]\n"
-        "  free(out)\n"
-        "  return value + 2\n"
-        "}\n", 42);
+    /* A bare `[]i64` parameter is a borrowed view internally, so returning
+       it unchanged as an owned `[]i64` result is a type mismatch (view vs.
+       owned) - matching the direct backend, which also has no notion of
+       moving a received parameter back out as an owned return. */
+    {
+        ASTNode *program = parse_program(
+            "def identity(s: []i64) -> []i64: {\n"
+            "  return s\n"
+            "}\n"
+            "def main() -> i64: {\n"
+            "  s = alloc_i64(1)\n"
+            "  s[0] = 40\n"
+            "  out = identity(s)\n"
+            "  value = out[0]\n"
+            "  free(out)\n"
+            "  return value + 2\n"
+            "}\n");
+        CHECK(program != NULL);
+        if (program) {
+            BackendIrModule module;
+            CHECK(!bir_build_program(&module, program));
+            bir_module_free(&module);
+            ast_free(program);
+        }
+    }
 
-    /* A moved owned slice cannot be read or freed by the caller. */
+    /* A bare `[]i64` parameter is a borrowed view, so freeing it inside the
+       callee is rejected at build time regardless of whether the caller
+       reads the allocation afterward. */
     {
         ASTNode *program = parse_program(
             "def take(s: []i64) -> i64: {\n"
@@ -2806,10 +2847,9 @@ static void test_source_owned_slice_rejections(void) {
             "}\n");
         CHECK(program != NULL);
         if (program) {
-            memset(err, 0, sizeof(err));
-            CHECK(!pipeline_run(program, "main", &result, err, sizeof(err)));
-            CHECK(strstr(err, "after destruction") != NULL ||
-                  strstr(err, "moved") != NULL || strstr(err, "ownership") != NULL);
+            BackendIrModule module;
+            CHECK(!bir_build_program(&module, program));
+            bir_module_free(&module);
             ast_free(program);
         }
     }
@@ -6947,21 +6987,22 @@ static void test_source_callee_saved_registers(void) {
 static void test_source_object_emitter_coverage(void) {
     /* Exercises every v1 object-emitter lane in one program: scalar calls,
        flat scalar-field structs, f32 arithmetic and comparison, heap-backed
-       readonly-view allocation/indexing/bounds, and moving ownership of an
-       owned slice across a call boundary (the callee frees its own
-       parameter). bir_x86_64_emit_object writes real machine code straight
-       to an ELF64 object, unlike the text emitters above, so there is no
-       assembly string to inspect here - the Makefile links the resulting
-       .o directly and runs it. */
+       readonly-view allocation/indexing/bounds, and a bare `[]i64` parameter
+       (borrowed-mutable, matching the direct backend - the callee mutates
+       the caller's own allocation through a transient view borrow, released
+       once the call returns, and the caller frees it itself afterward).
+       bir_x86_64_emit_object writes real machine code straight to an ELF64
+       object, unlike the text emitters above, so there is no assembly
+       string to inspect here - the Makefile links the resulting .o
+       directly and runs it. */
     const char *source_text =
         "def add(a: i64, b: i64) -> i64: { return a + b }\n"
         "struct Point: { x: i64, y: i64 }\n"
         "def sum_point(p: Point) -> i64: { return p.x + p.y }\n"
         "def scale(x: f32, factor: f32) -> f32: { return x * factor }\n"
-        "def take_owned(s: []i64) -> i64: {\n"
-        "  let value: i64 = s[0]\n"
-        "  free(s)\n"
-        "  return value\n"
+        "def bump_view(s: []i64) -> i64: {\n"
+        "  s[0] = s[0] + 1\n"
+        "  return s[0]\n"
         "}\n"
         "def object_main() -> i64: {\n"
         "  let sum: i64 = add(3, 4)\n"
@@ -6973,8 +7014,9 @@ static void test_source_object_emitter_coverage(void) {
         "  let fi: i64 = 0\n"
         "  if f > 4.9: { fi = 1 }\n"
         "  let s: []i64 = alloc_i64(1)\n"
-        "  s[0] = 41\n"
-        "  let owned: i64 = take_owned(s)\n"
+        "  s[0] = 40\n"
+        "  let owned: i64 = bump_view(s)\n"
+        "  free(s)\n"
         "  return sum + sp + fi + owned\n"
         "}\n";
     ASTNode *program = parse_program(source_text);
@@ -7274,13 +7316,14 @@ static void test_x86_native_owned_slices(void) {
         "}\n"
         "def take_owned(s: []i64) -> i64: {\n"
         "  value = s[0]\n"
-        "  free(s)\n"
         "  return value\n"
         "}\n"
         "def call_owned() -> i64: {\n"
         "  s = alloc_i64(1)\n"
         "  s[0] = 41\n"
-        "  return take_owned(s) + 1\n"
+        "  result = take_owned(s) + 1\n"
+        "  free(s)\n"
+        "  return result\n"
         "}\n"
         "def make_owned() -> []i64: {\n"
         "  s = alloc_i64(1)\n"
@@ -7293,15 +7336,15 @@ static void test_x86_native_owned_slices(void) {
         "  free(s)\n"
         "  return value + 2\n"
         "}\n"
-        "def identity_owned(s: []i64) -> []i64: {\n"
+        "def identity_owned(s: readonly []i64) -> readonly []i64: {\n"
         "  return s\n"
         "}\n"
         "def roundtrip_owned() -> i64: {\n"
         "  s = alloc_i64(1)\n"
         "  s[0] = 40\n"
-        "  out = identity_owned(s)\n"
+        "  let out: readonly []i64 = identity_owned(s)\n"
         "  value = out[0]\n"
-        "  free(out)\n"
+        "  free(s)\n"
         "  return value + 2\n"
         "}\n"
         "def make_option() -> Option[string] {\n"

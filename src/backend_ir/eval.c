@@ -939,6 +939,27 @@ static bool eval_call(SsaEval *ev, const SsaInst *inst, SsaBlockRef *next_block,
     for (size_t o = 0; o < arg_count; o++) {
         args[o] = eval_value(ev, ev->module->arena.operands[inst->operand_start + o]);
     }
+    /* A borrow built solely for this call's argument (transient_borrow on
+       its defining view_make, see hir.c's call-argument HIR_EXPR_BORROW
+       wrap) is released here, mirroring verify.c's static flow check - it
+       lives for exactly this call, not for the rest of the function like a
+       let-bound view local. */
+    for (size_t o = 0; o < arg_count; o++) {
+        SsaValueRef ref = ev->module->arena.operands[inst->operand_start + o];
+        if (ref >= ev->module->arena.value_count) continue;
+        const SsaValue *val = &ev->module->arena.values[ref];
+        if (val->def_inst == SSA_INST_NONE || val->def_inst >= ev->module->arena.inst_count)
+            continue;
+        const SsaInst *def = &ev->module->arena.insts[val->def_inst];
+        if (def->op != SSA_OP_VIEW_MAKE || !def->transient_borrow) continue;
+        uint32_t allocation = val->allocation_id;
+        if (allocation == 0 || allocation > BIR_MAX_STACK_SLOTS) continue;
+        if (val->pointer_contract == BIR_POINTER_CONTRACT_BORROW_WRITE) {
+            if (ev->writable_borrows[allocation] > 0) ev->writable_borrows[allocation]--;
+        } else if (val->pointer_contract == BIR_POINTER_CONTRACT_BORROW_READONLY) {
+            if (ev->readonly_borrows[allocation] > 0) ev->readonly_borrows[allocation]--;
+        }
+    }
     uint32_t moved_allocations[BIR_MAX_PARAMS];
     size_t moved_count = 0;
     uint32_t sum_storage_allocations[BIR_MAX_PARAMS];

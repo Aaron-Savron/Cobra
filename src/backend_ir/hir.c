@@ -522,10 +522,20 @@ static const CobraType *bir_import_ast_type(BackendIrModule *module,
                 ? bir_writable_view_type(module, backend_element)
                 : bir_view_type(module, backend_element);
         }
-        /* Plain mutable slices (qualifier 0) are owned slice storage. */
+        /* A plain mutable slice *parameter* is borrowed-mutable in practice:
+           the direct backend never frees a received parameter (its
+           auto-free pass only ever runs over provably-non-escaping locals),
+           so the callee neither owns nor is expected to free it. Map it to
+           a writable view, matching the direct backend's real semantics,
+           with callers required to alias an owned slice into the view at
+           the call boundary (see the call-argument HIR_EXPR_BORROW wrap in
+           hir_build_expr's AST_FUNC_CALL case). */
         if (source->ownership == COBRA_OWNERSHIP_VALUE &&
-            source->mutability == COBRA_MUTABILITY_DEFAULT)
+            source->mutability == COBRA_MUTABILITY_DEFAULT) {
+            if (node->type == AST_PARAM)
+                return bir_writable_view_type(module, backend_element);
             return bir_owned_slice_type(module, backend_element);
+        }
         return NULL;
     }
     if (kind == COBRA_TYPE_STRING) {
@@ -3320,6 +3330,39 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                     if (expr->args[i]->type && expr->args[i]->type->kind == COBRA_TYPE_U8 &&
                         callee->param_types[i] && callee->param_types[i]->kind == COBRA_TYPE_I64) {
                         expr->args[i]->type = callee->param_types[i];
+                    }
+                    /* An owned slice value satisfies a borrowed-view
+                       parameter (a plain `[]T`) via a transient alias, the
+                       same conversion used for a let-declared view local or
+                       a borrowed return - but scoped to just this one call
+                       argument, so the verifier releases it right after the
+                       call returns instead of treating it as live for the
+                       rest of the function. */
+                    if (expr->args[i]->type && callee->param_types[i] &&
+                        bir_is_borrowed_view_type(callee->param_types[i]) &&
+                        !bir_types_equal(expr->args[i]->type, callee->param_types[i]) &&
+                        bir_call_arg_type_compatible(expr->args[i]->type,
+                                                     callee->param_types[i])) {
+                        HirExpr *borrow = hir_expr_alloc(b, expr->args[i]->source_line,
+                                                         expr->args[i]->source_col);
+                        if (!borrow) {
+                            hir_expr_free(expr);
+                            return false;
+                        }
+                        borrow->kind = HIR_EXPR_BORROW;
+                        borrow->type = callee->param_types[i];
+                        borrow->aggregate_type = cobra_type_element(callee->param_types[i]);
+                        borrow->transient_borrow = true;
+                        borrow->args = calloc(1, sizeof(HirExpr *));
+                        if (!borrow->args) {
+                            hir_expr_free(expr->args[i]);
+                            hir_expr_free(borrow);
+                            hir_expr_free(expr);
+                            return false;
+                        }
+                        borrow->args[0] = expr->args[i];
+                        borrow->arg_count = 1;
+                        expr->args[i] = borrow;
                     }
                     if (!bir_call_arg_type_compatible(expr->args[i]->type,
                                                       callee->param_types[i])) {

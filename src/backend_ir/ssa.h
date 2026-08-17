@@ -337,6 +337,9 @@ typedef struct {
     uint32_t payload_allocation_id;       /* owning sum payload identity         */
     const CobraType *aggregate_type;      /* owning field or aggregate contract  */
     SsaValueRef view_source;              /* source view for native bounds checks */
+    bool transient_borrow;                /* view_make: release right after the
+                                              call argument it was built for,
+                                              instead of living to function end */
     char callee[BIR_MAX_CALLEE_NAME]; /* for SSA_OP_CALL               */
     char dict_key[COBRA_MAX_TOKEN_TEXT]; /* for SSA_OP_DICT_* literal key    */
     int source_line;
@@ -435,6 +438,11 @@ struct HirExpr {
     char callee[BIR_MAX_CALLEE_NAME]; /* for CALL                      */
     HirExpr **args;
     size_t arg_count;
+    /* for BORROW: true when this alias lives only for the duration of a
+       single call argument, not a let-bound view local or a return - lets
+       the SSA lowering mark the resulting view_make releasable right after
+       the call that consumes it. */
+    bool transient_borrow;
     int source_line;
     int source_col;
 };

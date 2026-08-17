@@ -2012,6 +2012,40 @@ static bool flow_simulate_block(VerifyCtx *ctx, SsaBlockRef block,
                     }
                 }
             }
+            /* A borrow built solely to satisfy this call's argument (see
+               HIR_EXPR_BORROW's transient_borrow flag, set only for the
+               call-argument alias, never for a let-bound view local or a
+               return) lives for exactly the duration of this call. Release
+               it now so the caller's original allocation is usable again
+               right after the call returns, instead of staying "borrowed"
+               for the rest of the function like a real named view local. */
+            for (size_t o = 0; o < inst->operand_count; o++) {
+                const SsaValue *arg = &arena->values[
+                    arena->operands[inst->operand_start + o]];
+                if (arg->def_inst == SSA_INST_NONE ||
+                    arg->def_inst >= arena->inst_count) continue;
+                const SsaInst *def = &arena->insts[arg->def_inst];
+                if (def->op != SSA_OP_VIEW_MAKE || !def->transient_borrow) continue;
+                uint32_t allocation = arg->allocation_id;
+                if (allocation == 0 || allocation > BIR_MAX_STACK_SLOTS) continue;
+                if (arg->pointer_contract == BIR_POINTER_CONTRACT_BORROW_WRITE) {
+                    if (state->writable_borrows[allocation] == 0 ||
+                        !flow_borrow_count_valid(state->writable_borrows[allocation])) {
+                        verr(ctx, "block b%u releases a transient borrow that was never active on allocation %u",
+                             block, allocation);
+                        return false;
+                    }
+                    state->writable_borrows[allocation]--;
+                } else if (arg->pointer_contract == BIR_POINTER_CONTRACT_BORROW_READONLY) {
+                    if (state->readonly_borrows[allocation] == 0 ||
+                        !flow_borrow_count_valid(state->readonly_borrows[allocation])) {
+                        verr(ctx, "block b%u releases a transient borrow that was never active on allocation %u",
+                             block, allocation);
+                        return false;
+                    }
+                    state->readonly_borrows[allocation]--;
+                }
+            }
         }
         if (inst->op == SSA_OP_STACK_SLOT) {
             if (inst->allocation_id == 0 || inst->allocation_id > BIR_MAX_STACK_SLOTS) {

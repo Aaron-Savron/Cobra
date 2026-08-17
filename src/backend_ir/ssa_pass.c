@@ -1093,6 +1093,7 @@ static SsaValueRef ssa_eval_expr(SsaPass *p, size_t block, HirExpr *expr) {
                                                 expr->source_col);
             if (make == SSA_INST_NONE ||
                 !bir_block_add_inst(arena, p->base + block, make)) return SSA_VALUE_NONE;
+            if (expr->transient_borrow) arena->insts[make].transient_borrow = true;
             return bir_inst_result(arena, make, expr->source_line, expr->source_col);
         }
         case HIR_EXPR_MEMBER: {
