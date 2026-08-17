@@ -4532,6 +4532,95 @@ fail:
     return false;
 }
 
+/* Collects every AST_FUNC_CALL callee name reachable under `node` into
+   `names`, growing it as needed. Used to compute which top-level functions
+   a program actually needs, so a function that fails to lower (an
+   unsupported construct) only aborts the build when something reachable
+   from main actually calls it. */
+static void collect_called_names(ASTNode *node, char names[][COBRA_MAX_IDENT_LEN], size_t *count, size_t cap) {
+    if (!node) return;
+    if (node->type == AST_FUNC_CALL && node->name[0]) {
+        bool seen = false;
+        for (size_t i = 0; i < *count; i++) {
+            if (strcmp(names[i], node->name) == 0) { seen = true; break; }
+        }
+        if (!seen && *count < cap) {
+            snprintf(names[*count], COBRA_MAX_IDENT_LEN, "%s", node->name);
+            (*count)++;
+        }
+    }
+    for (size_t i = 0; i < node->child_count; i++) collect_called_names(node->children[i], names, count, cap);
+}
+
+/* Marks `reachable[i]` true for every top-level function in `root` that is
+   transitively called from "main" (or is main itself). BFS over static
+   call names; a name that doesn't resolve to a declared top-level function
+   (an FFI/prelude builtin, for instance) is simply not walked further. */
+static void mark_reachable_functions(ASTNode *root, size_t original_count, bool *reachable) {
+    char worklist[512][COBRA_MAX_IDENT_LEN];
+    size_t worklist_count = 0;
+    for (size_t i = 0; i < original_count; i++) {
+        ASTNode *decl = root->children[i];
+        if (decl->type == AST_FUNCTION && strcmp(decl->name, "main") == 0 &&
+            worklist_count < 512) {
+            snprintf(worklist[worklist_count], COBRA_MAX_IDENT_LEN, "%s", decl->name);
+            worklist_count++;
+        }
+    }
+    if (worklist_count == 0) {
+        /* No "main" in this compilation unit (a library module, or a unit
+           test that lowers a function directly without an entry point).
+           There is no safe notion of "unreachable" here, so treat every
+           top-level function as reachable and preserve the old
+           fail-on-any-error behavior. */
+        for (size_t i = 0; i < original_count; i++) {
+            if (root->children[i]->type == AST_FUNCTION) reachable[i] = true;
+        }
+        return;
+    }
+    for (size_t w = 0; w < worklist_count; w++) {
+        for (size_t i = 0; i < original_count; i++) {
+            ASTNode *decl = root->children[i];
+            if (decl->type != AST_FUNCTION || strcmp(decl->name, worklist[w]) != 0) continue;
+            if (reachable[i]) break;
+            reachable[i] = true;
+            char called[512][COBRA_MAX_IDENT_LEN];
+            size_t called_count = 0;
+            collect_called_names(decl, called, &called_count, 512);
+            for (size_t c = 0; c < called_count; c++) {
+                bool already_queued = false;
+                for (size_t q = 0; q < worklist_count; q++) {
+                    if (strcmp(worklist[q], called[c]) == 0) { already_queued = true; break; }
+                }
+                if (!already_queued && worklist_count < 512) {
+                    snprintf(worklist[worklist_count], COBRA_MAX_IDENT_LEN, "%s", called[c]);
+                    worklist_count++;
+                }
+            }
+            break;
+        }
+    }
+}
+
+/* Removes a function's placeholder BirFunctionInfo entry (added by the
+   unconditional bir_declare_function predeclaration pass) from the
+   module's function table. Used when a function's body fails to lower and
+   is being skipped as unreachable: without this, the placeholder's
+   SSA_BLOCK_NONE/zero block range stays in module->functions and a later
+   pass that walks every declared function trips over it. Safe because
+   bir_find_function resolves by name, not index, and nothing reachable
+   from main calls this function (already verified by the caller). */
+static void remove_declared_function(BackendIrModule *module, const char *name) {
+    for (size_t i = 0; i < module->function_count; i++) {
+        if (strcmp(module->functions[i].name, name) != 0) continue;
+        for (size_t j = i + 1; j < module->function_count; j++) {
+            module->functions[j - 1] = module->functions[j];
+        }
+        module->function_count--;
+        return;
+    }
+}
+
 bool bir_build_program(BackendIrModule *module, ASTNode *root) {
     if (!module || !root) return false;
     module->error[0] = '\0';
@@ -4606,11 +4695,50 @@ bool bir_build_program(BackendIrModule *module, ASTNode *root) {
         }
     }
 
+    bool *reachable = (bool *)calloc(root->child_count ? root->child_count : 1, sizeof(bool));
+    if (!reachable) {
+        snprintf(module->error, sizeof(module->error), "out of memory computing reachability");
+        return false;
+    }
+    mark_reachable_functions(root, root->child_count, reachable);
+
     for (size_t i = 0; i < root->child_count; i++) {
         ASTNode *decl = root->children[i];
         if (decl->type == AST_FUNCTION) {
             if (decl->generic_param_count > 0) continue;
-            if (!bir_build_function(module, decl, NULL)) return false;
+            /* Snapshot the module's SSA arena before attempting this
+               function, so a failed-and-skipped (unreachable) function's
+               partially-lowered blocks/values/insts don't leak into later
+               passes that walk the module's global SSA pools. */
+            size_t snap_values = module->arena.value_count;
+            size_t snap_insts = module->arena.inst_count;
+            size_t snap_blocks = module->arena.block_count;
+            size_t snap_operands = module->arena.operand_used;
+            size_t snap_edges = module->arena.edge_used;
+            if (!bir_build_function(module, decl, NULL)) {
+                /* Only a "construct not supported by this backend yet"
+                   failure is eligible to be skipped; a genuine semantic
+                   error (ownership escape, type mismatch, etc.) must still
+                   fail the whole build even for unreachable functions,
+                   since it means the program itself is invalid. */
+                bool is_unsupported_gap = strstr(module->error, "outside the backend-IR subset") != NULL;
+                if (reachable[i] || !is_unsupported_gap) {
+                    free(reachable);
+                    return false;
+                }
+                /* Not reachable from main: this function's body uses a
+                   construct the isolated backend doesn't support yet, but
+                   nothing the program actually runs needs it, so omit it
+                   rather than failing the whole module. Roll back any
+                   partial SSA state the failed attempt left behind. */
+                module->arena.value_count = snap_values;
+                module->arena.inst_count = snap_insts;
+                module->arena.block_count = snap_blocks;
+                module->arena.operand_used = snap_operands;
+                module->arena.edge_used = snap_edges;
+                remove_declared_function(module, decl->name);
+                continue;
+            }
             continue;
         }
         if (decl->type == AST_STRUCT_DECL || decl->type == AST_ENUM_DECL) continue;
@@ -4618,8 +4746,11 @@ bool bir_build_program(BackendIrModule *module, ASTNode *root) {
         snprintf(module->error, sizeof(module->error),
                  "%.60s:%d:%d: top-level declaration is outside the backend-IR subset",
                  module->source_file, decl->source_line, decl->source_col);
+        free(reachable);
         return false;
     }
+
+    free(reachable);
     return true;
 }
 
