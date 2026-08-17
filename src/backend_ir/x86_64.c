@@ -1180,6 +1180,26 @@ static bool x86_emit_slice_free(X86Context *ctx, const MirInst *inst) {
     return x86_zero_view(ctx, view);
 }
 
+/* Copies %rdx bytes from %rsi to %rdi with an inline loop instead of a
+   `call memcpy@PLT`: lib/mem.cb imports memcpy from libc.so.6 for the
+   allocator, so every program object defines a local (often body-less)
+   symbol named memcpy that a bare relocation resolves to instead of the
+   real libc function. Clobbers %rax and %rcx. */
+static void x86_emit_inline_byte_copy(X86Context *ctx, const char *tag, uint32_t label) {
+    fprintf(ctx->out,
+            "    xorq %%rax, %%rax\n"
+            ".Lcobra_%s_copy_loop_%zu_%u:\n"
+            "    cmpq %%rdx, %%rax\n"
+            "    je .Lcobra_%s_copy_done_%zu_%u\n"
+            "    movb (%%rsi,%%rax), %%cl\n"
+            "    movb %%cl, (%%rdi,%%rax)\n"
+            "    incq %%rax\n"
+            "    jmp .Lcobra_%s_copy_loop_%zu_%u\n"
+            ".Lcobra_%s_copy_done_%zu_%u:\n",
+            tag, ctx->function_index, label, tag, ctx->function_index, label,
+            tag, ctx->function_index, label, tag, ctx->function_index, label);
+}
+
 static bool x86_emit_string_concat(X86Context *ctx, const MirInst *inst) {
     if (inst->operand_count != 2 || inst->result == MIR_REG_NONE ||
         inst->machine_type != MIR_TYPE_VIEW || !inst->memory_type ||
@@ -1202,16 +1222,66 @@ static bool x86_emit_string_concat(X86Context *ctx, const MirInst *inst) {
     if (!x86_emit_load_view_component(ctx, inst->result, false, "%rdi") ||
         !x86_emit_load_view_component(ctx, left, false, "%rsi") ||
         !x86_emit_load_view_component(ctx, left, true, "%rdx")) return false;
-    fprintf(ctx->out, "    imulq $%u, %%rdx\n    call memcpy@PLT\n",
-            (unsigned)inst->memory_type->size);
+    fprintf(ctx->out, "    imulq $%u, %%rdx\n", (unsigned)inst->memory_type->size);
+    x86_emit_inline_byte_copy(ctx, "string_concat_left", label);
     if (!x86_emit_load_view_component(ctx, inst->result, false, "%rdi") ||
         !x86_emit_load_view_component(ctx, left, true, "%r10") ||
         !x86_emit_load_view_component(ctx, right, false, "%rsi") ||
         !x86_emit_load_view_component(ctx, right, true, "%rdx")) return false;
-    fprintf(ctx->out, "    imulq $%u, %%r10\n    addq %%r10, %%rdi\n    imulq $%u, %%rdx\n    call memcpy@PLT\n    jmp %s\n%s:\n    ud2\n%s:\n",
-            (unsigned)inst->memory_type->size,
-            (unsigned)inst->memory_type->size, done, fail, done);
+    fprintf(ctx->out, "    imulq $%u, %%r10\n    addq %%r10, %%rdi\n    imulq $%u, %%rdx\n",
+            (unsigned)inst->memory_type->size, (unsigned)inst->memory_type->size);
+    x86_emit_inline_byte_copy(ctx, "string_concat_right", label);
+    fprintf(ctx->out, "    jmp %s\n%s:\n    ud2\n%s:\n", done, fail, done);
     return true;
+}
+
+/* Compares string bytes with an inline loop rather than calling libc
+   memcmp: lib/mem.cb imports memcmp (and memcpy) from libc.so.6 for the
+   allocator, which defines a same-named local symbol in every program's
+   object file. A bare `call memcmp@PLT` then resolves to that local
+   (frequently dead-stripped, body-less) definition instead of the real
+   libc function, so it must stay self-contained. */
+static bool x86_emit_string_eq(X86Context *ctx, const MirInst *inst) {
+    if (inst->operand_count != 2 || inst->result == MIR_REG_NONE ||
+        inst->machine_type != MIR_TYPE_BOOL || !inst->memory_type ||
+        inst->memory_type->kind != COBRA_TYPE_U8 || inst->memory_type->size == 0) return false;
+    MirReg left = ctx->module->arena.operands[inst->operand_start];
+    MirReg right = ctx->module->arena.operands[inst->operand_start + 1];
+    if (ctx->module->arena.regs[left].machine_type != MIR_TYPE_VIEW ||
+        ctx->module->arena.regs[right].machine_type != MIR_TYPE_VIEW) return false;
+    char mismatch[64], match[64], loop[64], done[64];
+    uint32_t label = ctx->view_fail_labels++;
+    snprintf(mismatch, sizeof(mismatch), ".Lcobra_string_eq_mismatch_%zu_%u", ctx->function_index, label);
+    snprintf(match, sizeof(match), ".Lcobra_string_eq_match_%zu_%u", ctx->function_index, label);
+    snprintf(loop, sizeof(loop), ".Lcobra_string_eq_loop_%zu_%u", ctx->function_index, label);
+    snprintf(done, sizeof(done), ".Lcobra_string_eq_done_%zu_%u", ctx->function_index, label);
+    if (!x86_emit_load_view_component(ctx, left, true, "%r10") ||
+        !x86_emit_load_view_component(ctx, right, true, "%r11")) return false;
+    fprintf(ctx->out, "    cmpq %%r11, %%r10\n    jne %s\n", mismatch);
+    if (!x86_emit_load_view_component(ctx, left, false, "%r8") ||
+        !x86_emit_load_view_component(ctx, right, false, "%r9")) return false;
+    fprintf(ctx->out,
+            "    xorq %%rax, %%rax\n"
+            "%s:\n"
+            "    cmpq %%r10, %%rax\n"
+            "    je %s\n"
+            "    movq %%rax, %%rcx\n"
+            "    imulq $%u, %%rcx\n"
+            "    movzbl (%%r8,%%rcx), %%edx\n"
+            "    movzbl (%%r9,%%rcx), %%esi\n"
+            "    cmpl %%esi, %%edx\n"
+            "    jne %s\n"
+            "    incq %%rax\n"
+            "    jmp %s\n"
+            "%s:\n"
+            "    movq $1, %%r10\n"
+            "    jmp %s\n"
+            "%s:\n"
+            "    movq $0, %%r10\n"
+            "%s:\n",
+            loop, match, (unsigned)inst->memory_type->size, mismatch, loop,
+            match, done, mismatch, done);
+    return x86_emit_store_integer(ctx, inst->result, "%r10", "%r10d");
 }
 
 static bool x86_emit_region_cleanup(X86Context *ctx, uint32_t region_id) {
@@ -1504,6 +1574,7 @@ static bool x86_emit_instruction(X86Context *ctx, const MirInst *inst) {
         case MIR_OP_DICT_LEN: return x86_emit_dict_len(ctx, inst);
         case MIR_OP_DICT_FREE: return x86_emit_dict_free(ctx, inst);
         case MIR_OP_STRING_CONCAT: return x86_emit_string_concat(ctx, inst);
+        case MIR_OP_STRING_EQ: return x86_emit_string_eq(ctx, inst);
         case MIR_OP_SUM_CHECK: return x86_emit_sum_check(ctx, inst);
         case MIR_OP_PRINT_I64: return x86_emit_print_i64(ctx, inst);
         case MIR_OP_PRINT_STRING: return x86_emit_print_string(ctx, inst);

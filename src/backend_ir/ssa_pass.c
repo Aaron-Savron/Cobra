@@ -1188,6 +1188,39 @@ static SsaValueRef ssa_eval_expr(SsaPass *p, size_t block, HirExpr *expr) {
             return bir_inst_result(arena, concat, expr->source_line,
                                    expr->source_col);
         }
+        case HIR_EXPR_STR_EQ: {
+            if (expr->arg_count != 2 ||
+                !ssa_is_string_value_type(expr->args[0]->type) ||
+                !ssa_is_string_value_type(expr->args[1]->type)) {
+                ssa_fail(p, expr->source_line, expr->source_col,
+                         "invalid string equality operands");
+                return SSA_VALUE_NONE;
+            }
+            SsaValueRef left = ssa_eval_expr(p, block, expr->args[0]);
+            SsaValueRef right = ssa_eval_expr(p, block, expr->args[1]);
+            if (left == SSA_VALUE_NONE || right == SSA_VALUE_NONE) return SSA_VALUE_NONE;
+            SsaInstRef eq = bir_add_string_eq(arena, p->module->type_bool,
+                                              p->module->type_u8, left, right,
+                                              expr->source_line, expr->source_col);
+            if (eq == SSA_INST_NONE ||
+                !bir_block_add_inst(arena, p->base + block, eq))
+                return SSA_VALUE_NONE;
+            SsaValueRef result = bir_inst_result(arena, eq, expr->source_line,
+                                                 expr->source_col);
+            if (!expr->sum_variant) return result;
+            /* != negates the byte-equality result via `result != true`,
+               since SSA_OP_NOT does not exist in this instruction set. */
+            SsaValueRef true_const = bir_add_const(arena,
+                bir_scalar_bool(p->module->type_bool, true),
+                expr->source_line, expr->source_col);
+            const SsaValueRef ne_operands[2] = {result, true_const};
+            SsaInstRef ne = bir_add_inst(arena, SSA_OP_NE, p->module->type_bool,
+                                         ne_operands, 2, expr->source_line,
+                                         expr->source_col);
+            if (ne == SSA_INST_NONE || !bir_block_add_inst(arena, p->base + block, ne))
+                return SSA_VALUE_NONE;
+            return bir_inst_result(arena, ne, expr->source_line, expr->source_col);
+        }
         case HIR_EXPR_STR_LITERAL: {
             const CobraType *view = expr->type;
             const CobraType *u8 = p->module->type_u8;

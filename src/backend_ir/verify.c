@@ -744,6 +744,11 @@ static bool check_instruction_signature(VerifyCtx *ctx, SsaBlockRef ref,
             result_type = inst->type;
             has_result = true;
             break;
+        case SSA_OP_STRING_EQ:
+            expected_operands = 2;
+            result_type = boolean;
+            has_result = true;
+            break;
         case SSA_OP_SUM_PAYLOAD_STORE:
             expected_operands = 2;
             break;
@@ -819,6 +824,11 @@ static bool check_instruction_signature(VerifyCtx *ctx, SsaBlockRef ref,
         bool enum_comparison = is_comparison &&
                                numeric_type &&
                                numeric_type->kind == COBRA_TYPE_ENUM;
+        /* ==/!= on bool reads the boolean as its 0/1 discriminant, matching
+           the HIR-level bool_operands allowance in hir.c. */
+        bool bool_comparison = is_comparison &&
+                               (inst->op == SSA_OP_EQ || inst->op == SSA_OP_NE) &&
+                               numeric_type == ctx->module->type_bool;
         bool numeric_ok = numeric_type == i64 ||
                           numeric_type == ctx->module->type_i32 ||
                           numeric_type == ctx->module->type_u32 ||
@@ -826,7 +836,7 @@ static bool check_instruction_signature(VerifyCtx *ctx, SsaBlockRef ref,
                           numeric_type == ctx->module->type_u8 ||
                           numeric_type == ctx->module->type_f32 ||
                           numeric_type == ctx->module->type_f64;
-        if (!numeric_ok && !enum_comparison) {
+        if (!numeric_ok && !enum_comparison && !bool_comparison) {
             verr(ctx, "numeric opcode requires an integer or float scalar operand");
             return false;
         }

@@ -253,6 +253,7 @@ typedef enum {
     SSA_OP_DICT_LEN,        /* dict -> logical entry count                    */
     SSA_OP_DICT_FREE,       /* owned dict -> none                             */
     SSA_OP_STRING_CONCAT,    /* two readonly u8 views -> owned string          */
+    SSA_OP_STRING_EQ,        /* two readonly u8 views -> bool byte equality    */
     SSA_OP_SUM_PAYLOAD_STORE,/* move an owned payload into a sum field         */
     SSA_OP_SUM_PAYLOAD_LOAD, /* move an owned payload out of a sum field       */
     SSA_OP_SUM_MOVE,         /* move an owning sum between aggregate slots     */
@@ -401,6 +402,7 @@ typedef enum {
     HIR_EXPR_SUM_ACCESS,  /* tag/payload/error read with optional tag check  */
     HIR_EXPR_STR_LITERAL, /* borrowed readonly string literal                */
     HIR_EXPR_STR_CONCAT,   /* fresh owned string from two readonly views     */
+    HIR_EXPR_STR_EQ,       /* two readonly u8 views -> bool ==/!= (sum_variant negates) */
     HIR_EXPR_BUFFER_APPEND, /* append an element and move the old buffer      */
     HIR_EXPR_BUFFER_POP,    /* pop the last element from a mutable buffer    */
     HIR_EXPR_ARRAY_LITERAL, /* fixed value array literal                     */
@@ -717,6 +719,10 @@ SsaInstRef bir_add_dict_free(SsaArena *arena, SsaValueRef dict,
 SsaInstRef bir_add_string_concat(SsaArena *arena, const CobraType *owned_type,
                                  SsaValueRef left, SsaValueRef right,
                                  int line, int col);
+SsaInstRef bir_add_string_eq(SsaArena *arena, const CobraType *bool_type,
+                             const CobraType *element_type,
+                             SsaValueRef left, SsaValueRef right,
+                             int line, int col);
 SsaInstRef bir_add_sum_payload_store(SsaArena *arena, const CobraType *sum_type,
                                      const CobraType *payload_type,
                                      SsaValueRef destination, SsaValueRef payload,

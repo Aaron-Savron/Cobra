@@ -663,6 +663,17 @@ SsaInstRef bir_add_string_concat(SsaArena *arena, const CobraType *owned_type,
     return inst;
 }
 
+SsaInstRef bir_add_string_eq(SsaArena *arena, const CobraType *bool_type,
+                             const CobraType *element_type,
+                             SsaValueRef left, SsaValueRef right,
+                             int line, int col) {
+    const SsaValueRef operands[2] = {left, right};
+    SsaInstRef inst = bir_add_inst(arena, SSA_OP_STRING_EQ, bool_type,
+                                   operands, 2, line, col);
+    if (inst != SSA_INST_NONE) arena->insts[inst].memory_type = element_type;
+    return inst;
+}
+
 SsaInstRef bir_add_sum_payload_store(SsaArena *arena, const CobraType *sum_type,
                                      const CobraType *payload_type,
                                      SsaValueRef destination, SsaValueRef payload,
@@ -1862,6 +1873,7 @@ const char *bir_opcode_name(SsaOpcode op) {
         case SSA_OP_DICT_LEN: return "dict_len";
         case SSA_OP_DICT_FREE: return "dict_free";
         case SSA_OP_STRING_CONCAT: return "string_concat";
+        case SSA_OP_STRING_EQ: return "string_eq";
         case SSA_OP_SUM_PAYLOAD_STORE: return "sum_payload_store";
         case SSA_OP_SUM_PAYLOAD_LOAD: return "sum_payload_load";
         case SSA_OP_SUM_MOVE: return "sum_move";
@@ -1921,6 +1933,7 @@ bool bir_op_has_result(SsaOpcode op) {
         case SSA_OP_DICT_POP:
         case SSA_OP_DICT_LEN:
         case SSA_OP_STRING_CONCAT:
+        case SSA_OP_STRING_EQ:
         case SSA_OP_SUM_PAYLOAD_LOAD:
         case SSA_OP_FIELD_PAYLOAD_LOAD:
         case SSA_OP_CALL:

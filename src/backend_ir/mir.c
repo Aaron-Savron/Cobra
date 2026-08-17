@@ -172,6 +172,7 @@ static MirOpcode mir_opcode_for_ssa(SsaOpcode op) {
         case SSA_OP_DICT_LEN: return MIR_OP_DICT_LEN;
         case SSA_OP_DICT_FREE: return MIR_OP_DICT_FREE;
         case SSA_OP_STRING_CONCAT: return MIR_OP_STRING_CONCAT;
+        case SSA_OP_STRING_EQ: return MIR_OP_STRING_EQ;
         case SSA_OP_SUM_CHECK: return MIR_OP_SUM_CHECK;
         case SSA_OP_PRINT_I64: return MIR_OP_PRINT_I64;
         case SSA_OP_PRINT_STRING: return MIR_OP_PRINT_STRING;
@@ -239,6 +240,7 @@ const char *mir_opcode_name(MirOpcode op) {
         case MIR_OP_DICT_LEN: return "dict_len";
         case MIR_OP_DICT_FREE: return "dict_free";
         case MIR_OP_STRING_CONCAT: return "string_concat";
+        case MIR_OP_STRING_EQ: return "string_eq";
         case MIR_OP_SUM_CHECK: return "sum_check";
         case MIR_OP_PRINT_I64: return "print_i64";
         case MIR_OP_PRINT_STRING: return "print_string";
@@ -930,13 +932,19 @@ static bool mir_check_instruction(const MirModule *module, size_t function_index
         case MIR_OP_LE:
         case MIR_OP_GT:
         case MIR_OP_GE:
-            if (inst->operand_count != 2 || inst->result == MIR_REG_NONE ||
-                inst->machine_type != MIR_TYPE_BOOL ||
-                !mir_type_is_numeric(arena->regs[arena->operands[inst->operand_start]].machine_type) ||
-                arena->regs[arena->operands[inst->operand_start]].machine_type !=
-                    arena->regs[arena->operands[inst->operand_start + 1]].machine_type) {
-                mir_set_error(err, err_size, "MIR comparison has an invalid signature");
-                return false;
+            {
+                MirMachineType operand_type =
+                    arena->regs[arena->operands[inst->operand_start]].machine_type;
+                bool operand_ok = mir_type_is_numeric(operand_type) ||
+                    ((inst->op == MIR_OP_EQ || inst->op == MIR_OP_NE) &&
+                     operand_type == MIR_TYPE_BOOL);
+                if (inst->operand_count != 2 || inst->result == MIR_REG_NONE ||
+                    inst->machine_type != MIR_TYPE_BOOL || !operand_ok ||
+                    arena->regs[arena->operands[inst->operand_start]].machine_type !=
+                        arena->regs[arena->operands[inst->operand_start + 1]].machine_type) {
+                    mir_set_error(err, err_size, "MIR comparison has an invalid signature");
+                    return false;
+                }
             }
             break;
         case MIR_OP_LOAD:
@@ -1245,6 +1253,16 @@ static bool mir_check_instruction(const MirModule *module, size_t function_index
                 arena->regs[arena->operands[inst->operand_start]].machine_type != MIR_TYPE_VIEW ||
                 arena->regs[arena->operands[inst->operand_start + 1]].machine_type != MIR_TYPE_VIEW) {
                 mir_set_error(err, err_size, "MIR string concatenation has invalid metadata");
+                return false;
+            }
+            break;
+        }
+        case MIR_OP_STRING_EQ: {
+            if (inst->operand_count != 2 || inst->result == MIR_REG_NONE ||
+                inst->machine_type != MIR_TYPE_BOOL ||
+                arena->regs[arena->operands[inst->operand_start]].machine_type != MIR_TYPE_VIEW ||
+                arena->regs[arena->operands[inst->operand_start + 1]].machine_type != MIR_TYPE_VIEW) {
+                mir_set_error(err, err_size, "MIR string equality has invalid metadata");
                 return false;
             }
             break;

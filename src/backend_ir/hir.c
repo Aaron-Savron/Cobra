@@ -1666,6 +1666,60 @@ static bool hir_try_string_concat(HirBuilder *b, ASTNode *node,
     return true;
 }
 
+/* `a == b` / `a != b` on two string views compares bytes rather than the
+   view's pointer/length pair, matching the direct backend's strcmp-style
+   string equality. Non-string operands fall through to the generic
+   numeric/enum/bool binop path above. */
+static bool hir_try_string_eq(HirBuilder *b, ASTNode *node,
+                              HirExpr **out, bool *matched) {
+    if (matched) *matched = false;
+    if (!node || node->child_count != 2) return true;
+    HirExpr *left = NULL;
+    HirExpr *right = NULL;
+    if (!hir_build_expr(b, node->children[0], &left) ||
+        !hir_build_expr(b, node->children[1], &right)) {
+        hir_expr_free(left);
+        hir_expr_free(right);
+        return false;
+    }
+    bool left_string = bir_is_string_value_type(left->type);
+    bool right_string = bir_is_string_value_type(right->type);
+    if (!left_string && !right_string) {
+        hir_expr_free(left);
+        hir_expr_free(right);
+        return true;
+    }
+    if (!left_string || !right_string) {
+        hir_expr_free(left);
+        hir_expr_free(right);
+        bir_fail(b, node->source_line, node->source_col,
+                 "string comparison requires two string values");
+        return false;
+    }
+    HirExpr *expr = hir_expr_alloc(b, node->source_line, node->source_col);
+    if (!expr) {
+        hir_expr_free(left);
+        hir_expr_free(right);
+        return false;
+    }
+    expr->kind = HIR_EXPR_STR_EQ;
+    expr->type = b->module->type_bool;
+    expr->sum_variant = strcmp(node->name, "!=") == 0 ? 1 : 0;
+    expr->args = calloc(2, sizeof(HirExpr *));
+    if (!expr->args) {
+        hir_expr_free(left);
+        hir_expr_free(right);
+        hir_expr_free(expr);
+        return false;
+    }
+    expr->args[0] = left;
+    expr->args[1] = right;
+    expr->arg_count = 2;
+    if (matched) *matched = true;
+    if (out) *out = expr;
+    return true;
+}
+
 /* Integer literals in 0..255 coerce to u8 element types; anything else is
    outside the scalar subset. Returns NULL after failing on out-of-range. */
 /* Coerce an i64-typed integer literal into a narrower integer target. The
@@ -1728,6 +1782,17 @@ static HirExpr *hir_coerce_int_const(HirBuilder *b, HirExpr *value,
                 value->type = target;
                 value->const_value = bir_scalar_f64(target, (double)raw);
                 return value;
+            case COBRA_TYPE_BOOL:
+                /* `flag == 1` / `flag == 0` reads the bool discriminant as
+                   an integer, matching the direct backend's C truthiness. */
+                if (raw != 0 && raw != 1) {
+                    bir_fail(b, value->source_line, value->source_col,
+                             "bool value must be an integer literal 0 or 1");
+                    return NULL;
+                }
+                value->type = target;
+                value->const_value = bir_scalar_bool(target, raw != 0);
+                return value;
             default:
                 return value;
         }
@@ -1778,6 +1843,15 @@ static HirExpr *hir_coerce_int_const(HirBuilder *b, HirExpr *value,
             case COBRA_TYPE_F64:
                 value->type = target;
                 value->const_value = bir_scalar_f64(target, (double)raw);
+                return value;
+            case COBRA_TYPE_BOOL:
+                if (raw > 1) {
+                    bir_fail(b, value->source_line, value->source_col,
+                             "bool value must be an integer literal 0 or 1");
+                    return NULL;
+                }
+                value->type = target;
+                value->const_value = bir_scalar_bool(target, raw != 0);
                 return value;
             default:
                 return value;
@@ -2671,6 +2745,16 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                     break;
                 }
             }
+            if ((strcmp(node->name, "==") == 0 || strcmp(node->name, "!=") == 0) &&
+                node->child_count == 2) {
+                bool matched = false;
+                HirExpr *streq = NULL;
+                if (!hir_try_string_eq(b, node, &streq, &matched)) return false;
+                if (matched) {
+                    expr = streq;
+                    break;
+                }
+            }
             SsaOpcode op = hir_map_binop(node->name);
             if (op == SSA_OP_NONE || node->child_count != 2) {
                 bir_fail(b, node->source_line, node->source_col,
@@ -2748,10 +2832,16 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
             bool enum_operands = is_comparison &&
                 expr->args[0]->type &&
                 expr->args[0]->type->kind == COBRA_TYPE_ENUM;
+            /* bool only supports ==/!= (direct backend rejects <, > etc on
+               bool at the type-check stage, so this mirrors that). */
+            bool bool_operands = is_comparison &&
+                (op == SSA_OP_EQ || op == SSA_OP_NE) &&
+                expr->args[0]->type &&
+                expr->args[0]->type->kind == COBRA_TYPE_BOOL;
             if (!expr->args[0]->type || !expr->args[1]->type ||
                 !bir_types_equal(expr->args[0]->type, expr->args[1]->type) ||
                 (!hir_is_numeric(expr->args[0]->type, b->module) &&
-                 !enum_operands)) {
+                 !enum_operands && !bool_operands)) {
                 bir_fail(b, node->source_line, node->source_col,
                          "operator '%s' requires two matching numeric scalar operands", node->name);
                 hir_expr_free(expr);
@@ -4018,9 +4108,18 @@ static bool hir_build_for_container(HirBuilder *b, ASTNode *stmt, ASTNode *body,
                                     uint32_t loop_local, uint32_t container_local,
                                     const CobraType *container_type,
                                     const CobraType *element_type,
+                                    const char *index_name,
                                     HirBlockRef *continue_block) {
     int line = stmt->source_line, col = stmt->source_col;
-    int index_local = hir_synthetic_local(b, "for_index", line, col);
+    /* `for index, value in enumerate(x):` reuses this same element-loop
+       lowering - the loop counter this function already maintains for the
+       length check and per-element load/store *is* the enumerate index, so
+       giving it the user's chosen name (instead of a hidden synthetic one)
+       is the only difference from the single-variable `for x in slice:`
+       form. */
+    int index_local = index_name
+        ? hir_add_local(b, index_name, false, b->module->type_i64, line, col)
+        : hir_synthetic_local(b, "for_index", line, col);
     if (index_local < 0) return false;
 
     HirExpr *zero = hir_expr_alloc(b, line, col);
@@ -4205,11 +4304,6 @@ static bool hir_build_for_container(HirBuilder *b, ASTNode *stmt, ASTNode *body,
 }
 
 static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_block) {
-    if (stmt->secondary_name[0]) {
-        bir_fail(b, stmt->source_line, stmt->source_col,
-                 "for index,value form is outside the backend-IR subset");
-        return false;
-    }
     if (stmt->child_count < 2) {
         bir_fail(b, stmt->source_line, stmt->source_col,
                  "for statement is missing its body");
@@ -4217,6 +4311,27 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     }
     ASTNode *target = stmt->children[0];
     ASTNode *body = stmt->children[1];
+
+    /* `for index, value in enumerate(container):` shares the single-name
+       `for x in container:` lowering below - the index is exactly the
+       counter hir_build_for_container already maintains for its length
+       check and per-element load/store, just bound to the user's name
+       instead of a hidden synthetic one. Any other two-name form (dict
+       iteration, etc.) stays outside this subset. */
+    bool is_enumerate = target->type == AST_FUNC_CALL &&
+                        strcmp(target->name, "enumerate") == 0 &&
+                        target->child_count == 1;
+    if (stmt->secondary_name[0] && !is_enumerate) {
+        bir_fail(b, stmt->source_line, stmt->source_col,
+                 "for index,value form is outside the backend-IR subset");
+        return false;
+    }
+    if (is_enumerate && !stmt->secondary_name[0]) {
+        bir_fail(b, stmt->source_line, stmt->source_col,
+                 "for x in enumerate(...) needs a second binding for the element");
+        return false;
+    }
+    ASTNode *container_ref = is_enumerate ? target->children[0] : target;
 
     /* `for x in container:` where container is a named slice/list local
        binds x to each element by value, matching the direct backend's
@@ -4231,8 +4346,8 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     int container_local = -1;
     const CobraType *container_type = NULL;
     const CobraType *element_type = NULL;
-    if (target->type == AST_VAR_REF) {
-        int cl = hir_find_local(b, target->name);
+    if (container_ref->type == AST_VAR_REF) {
+        int cl = hir_find_local(b, container_ref->name);
         if (cl >= 0) {
             const CobraType *t = b->fn->locals[cl].type;
             if (bir_is_owned_slice_type(t) || bir_is_owned_buffer_type(t) ||
@@ -4249,12 +4364,20 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
                      "for-loop over a slice or list of non-scalar elements is outside the backend-IR subset");
             return false;
         }
-        int loop_local = hir_add_local(b, stmt->name, false, element_type,
+        const char *loop_name = is_enumerate ? stmt->secondary_name : stmt->name;
+        int loop_local = hir_add_local(b, loop_name, false, element_type,
                                        stmt->source_line, stmt->source_col);
         if (loop_local < 0) return false;
         return hir_build_for_container(b, stmt, body, (uint32_t)loop_local,
                                        (uint32_t)container_local, container_type,
-                                       element_type, continue_block);
+                                       element_type,
+                                       is_enumerate ? stmt->name : NULL,
+                                       continue_block);
+    }
+    if (is_enumerate) {
+        bir_fail(b, stmt->source_line, stmt->source_col,
+                 "enumerate() source must be a named slice or list local in the backend-IR subset");
+        return false;
     }
     /* dict iteration (or any other unrecognized target shape) is diagnosed
        below once the scalar-bound type check on bound_expr fails. */
@@ -4301,10 +4424,29 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
        i = start; while i < bound { body; i = i + 1 }. */
     bool is_range = target->type == AST_FUNC_CALL &&
                     strcmp(target->name, "range") == 0;
-    if (is_range && (target->child_count < 1 || target->child_count > 2)) {
+    if (is_range && (target->child_count < 1 || target->child_count > 3)) {
         bir_fail(b, stmt->source_line, stmt->source_col,
-                 "range() requires one or two arguments");
+                 "range() requires one, two, or three arguments");
         return false;
+    }
+    /* A three-argument range(start, stop, step) needs a compile-time step
+       sign to pick the loop's comparison direction (< for a positive step,
+       > for a negative one) since this backend has no logical and/or to
+       express "(step > 0 && i < bound) || (step < 0 && i > bound)" as a
+       single runtime condition. `-N` parses straight to a negative
+       AST_INT_LITERAL (see parse_primary), so a literal step covers the
+       common case; a non-literal step is outside this subset for now. */
+    int64_t step_value = 1;
+    if (is_range && target->child_count == 3) {
+        ASTNode *step_node = target->children[2];
+        bool step_negative = step_node->type == AST_INT_LITERAL && step_node->literal_i64 < 0;
+        bool step_positive = step_node->type == AST_INT_LITERAL && step_node->literal_i64 > 0;
+        if (!step_positive && !step_negative) {
+            bir_fail(b, stmt->source_line, stmt->source_col,
+                     "range() step must be a nonzero integer literal in the backend-IR subset");
+            return false;
+        }
+        step_value = step_node->literal_i64;
     }
     int start_local = hir_synthetic_local(b, "for_start", stmt->source_line, stmt->source_col);
     int bound_local = hir_synthetic_local(b, "for_bound", stmt->source_line, stmt->source_col);
@@ -4313,7 +4455,7 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     /* Only pre-allocate the constant start; the range form builds its start
        expression directly so nothing is leaked by an overwrite. */
     HirExpr *start_expr = NULL;
-    if (is_range && target->child_count == 2) {
+    if (is_range && target->child_count >= 2) {
         if (!hir_build_expr(b, target->children[0], &start_expr)) return false;
     } else {
         start_expr = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
@@ -4324,7 +4466,8 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     }
     HirExpr *bound_expr = NULL;
     if (is_range) {
-        if (!hir_build_expr(b, target->children[target->child_count - 1], &bound_expr)) {
+        size_t bound_index = target->child_count >= 2 ? 1 : 0;
+        if (!hir_build_expr(b, target->children[bound_index], &bound_expr)) {
             return false;
         }
     } else {
@@ -4394,7 +4537,7 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     HirExpr *cond = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
     if (!cond) return false;
     cond->kind = HIR_EXPR_BINOP;
-    cond->binop = SSA_OP_LT;
+    cond->binop = step_value < 0 ? SSA_OP_GT : SSA_OP_LT;
     cond->args = calloc(2, sizeof(HirExpr *));
     if (!cond->args) return false;
     cond->args[0] = index_ref;
@@ -4433,7 +4576,8 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     if (!hir_set_term(b, b->current, to_latch) ||
         !hir_add_edge(b, b->current, latch_id)) return false;
 
-    /* latch: i = i + 1; jump header */
+    /* latch: i = i + step; jump header (step defaults to 1 for the bare
+       scalar-bound and one/two-argument range forms). */
     b->current = latch_id;
     HirExpr *one = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
     HirExpr *index_again = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
@@ -4441,7 +4585,7 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     if (!one || !index_again || !plus) return false;
     one->kind = HIR_EXPR_CONST;
     one->type = b->module->type_i64;
-    one->const_value = bir_scalar_i64(one->type, 1);
+    one->const_value = bir_scalar_i64(one->type, step_value);
     index_again->kind = HIR_EXPR_LOCAL;
     index_again->local = (uint32_t)loop_local;
     index_again->type = b->module->type_i64;

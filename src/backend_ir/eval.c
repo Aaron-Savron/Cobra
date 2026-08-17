@@ -2371,6 +2371,43 @@ bool bir_eval_function_value(const BackendIrModule *module, const char *name,
                         bir_scalar_view(inst->type, pointer, (int64_t)total);
                 break;
             }
+            case SSA_OP_STRING_EQ: {
+                BirScalarValue left = eval_value(ev, arena->operands[inst->operand_start]);
+                BirScalarValue right = eval_value(ev, arena->operands[inst->operand_start + 1]);
+                if (left.kind != BIR_SCALAR_VIEW || right.kind != BIR_SCALAR_VIEW ||
+                    left.payload.view.length < 0 || right.payload.view.length < 0) {
+                    eval_fail(ev, "invalid string equality operands");
+                    break;
+                }
+                bool equal = left.payload.view.length == right.payload.view.length;
+                if (equal && left.payload.view.length > 0) {
+                    uint8_t *left_memory = NULL;
+                    uint8_t *right_memory = NULL;
+                    BirScalarValue left_pointer_value = {0};
+                    left_pointer_value.kind = BIR_SCALAR_POINTER;
+                    left_pointer_value.payload.pointer = left.payload.view.pointer;
+                    BirScalarValue right_pointer_value = {0};
+                    right_pointer_value.kind = BIR_SCALAR_POINTER;
+                    right_pointer_value.payload.pointer = right.payload.view.pointer;
+                    if (!eval_pointer_live(ev, left_pointer_value) ||
+                        !eval_pointer_live(ev, right_pointer_value) ||
+                        !bir_pointer_contract_readable(left.payload.view.pointer.contract) ||
+                        !bir_pointer_contract_readable(right.payload.view.pointer.contract) ||
+                        !eval_resolve_memory(ev, left.payload.view.pointer, &left_memory) ||
+                        !eval_resolve_memory(ev, right.payload.view.pointer, &right_memory)) {
+                        eval_fail(ev, "invalid string equality source view");
+                        break;
+                    }
+                    size_t bytes = (size_t)left.payload.view.length;
+                    equal = memcmp(left_memory + left.payload.view.pointer.offset,
+                                   right_memory + right.payload.view.pointer.offset,
+                                   bytes) == 0;
+                }
+                if (ev->failed) break;
+                if (inst->result != SSA_VALUE_NONE && inst->result < ev->slot_count)
+                    ev->current_slots[inst->result] = bir_scalar_bool(inst->type, equal);
+                break;
+            }
             case SSA_OP_SUM_PAYLOAD_STORE: {
                 BirScalarValue destination = eval_value(ev, arena->operands[inst->operand_start]);
                 BirScalarValue payload = eval_value(ev, arena->operands[inst->operand_start + 1]);

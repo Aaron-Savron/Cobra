@@ -248,6 +248,7 @@ static bool alloc_function(MirAllocation *allocation, size_t function_index,
                 if (inst->op == MIR_OP_SLICE_ALLOC || inst->op == MIR_OP_SLICE_FREE ||
                     inst->op == MIR_OP_BUFFER_ALLOC || inst->op == MIR_OP_BUFFER_APPEND ||
                     inst->op == MIR_OP_BUFFER_FREE || inst->op == MIR_OP_STRING_CONCAT ||
+                    inst->op == MIR_OP_STRING_EQ ||
                     inst->op == MIR_OP_DICT_SET || inst->op == MIR_OP_DICT_GET ||
                     inst->op == MIR_OP_DICT_HAS || inst->op == MIR_OP_DICT_DELETE ||
                     inst->op == MIR_OP_DICT_POP || inst->op == MIR_OP_DICT_LEN ||

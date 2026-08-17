@@ -1626,6 +1626,37 @@ static bool x86obj_emit_inst(X86ObjContext *ctx, size_t function_index, const Mi
             patch_fwd(ctx, to_done);
             return true;
         }
+        case MIR_OP_STRING_EQ: {
+            if (inst->operand_count != 2 || inst->result == MIR_REG_NONE ||
+                inst->machine_type != MIR_TYPE_BOOL) return false;
+            MirReg left = ctx->module->arena.operands[inst->operand_start];
+            MirReg right = ctx->module->arena.operands[inst->operand_start + 1];
+            if (ctx->module->arena.regs[left].machine_type != MIR_TYPE_VIEW ||
+                ctx->module->arena.regs[right].machine_type != MIR_TYPE_VIEW) return false;
+            if (!x86obj_load_view_component(ctx, left, true, X86OBJ_R10) ||
+                !x86obj_load_view_component(ctx, right, true, X86OBJ_R11)) return false;
+            emit_cmp_rr(ctx, X86OBJ_R10, X86OBJ_R11);
+            size_t mismatch = emit_jcc_fwd(ctx, 0x5 /* jne */);
+            if (!x86obj_load_view_component(ctx, left, false, 7 /* rdi */) ||
+                !x86obj_load_view_component(ctx, right, false, 6 /* rsi */) ||
+                !x86obj_load_view_component(ctx, left, true, X86OBJ_RDX)) return false;
+            if (!emit_call_extern(ctx, "memcmp")) return false;
+            /* memcmp returns a 32-bit int; the SysV ABI does not guarantee
+               the upper 32 bits of rax are clean, so a plain movl zero-
+               extends before the 64-bit test below. */
+            emit_u8(ctx, 0x89);
+            emit_u8(ctx, x86obj_modrm(3, X86OBJ_RAX, X86OBJ_RAX));
+            emit_test_rr(ctx, X86OBJ_RAX);
+            emit_setcc(ctx, 0x4 /* sete */, X86OBJ_R10);
+            emit_movzx64_8(ctx, X86OBJ_R10, X86OBJ_R10);
+            if (!x86obj_store(ctx, inst->result, X86OBJ_R10)) return false;
+            size_t to_done = emit_jmp_fwd(ctx);
+            patch_fwd(ctx, mismatch);
+            emit_xor_rr(ctx, X86OBJ_R10);
+            if (!x86obj_store(ctx, inst->result, X86OBJ_R10)) return false;
+            patch_fwd(ctx, to_done);
+            return true;
+        }
         case MIR_OP_BUFFER_ALLOC: {
             if (inst->result == MIR_REG_NONE || inst->operand_count != 1 ||
                 inst->machine_type != MIR_TYPE_VIEW || !inst->memory_type ||
