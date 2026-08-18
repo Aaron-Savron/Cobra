@@ -528,9 +528,19 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
         }
         advance_token(parser);
         expect(parser, TOKEN_RBRACKET, "Expected ']' after dict key type");
+        const CobraType *struct_value = NULL;
         CobraTypeKind value = token_to_type(parser->current_token.type);
-        if (value != COBRA_TYPE_I64) {
-            fprintf(stderr, "%s:%d:%d: error: dict values currently require i64\n",
+        if (value == COBRA_TYPE_UNKNOWN && match(parser, TOKEN_IDENTIFIER)) {
+            /* Named value-owned struct value: dict[string]Point, mirroring
+               list[Point] above - struct fields are heap-copied per entry so
+               the same isolated-boundary rules apply. */
+            char value_name[COBRA_MAX_IDENT_LEN];
+            copy_token_text(parser, value_name, sizeof(value_name), "dict value");
+            struct_value = parser_component_type(parser, COBRA_TYPE_STRUCT, value_name);
+            if (!struct_value) value = COBRA_TYPE_UNKNOWN;
+        }
+        if (!struct_value && value != COBRA_TYPE_I64) {
+            fprintf(stderr, "%s:%d:%d: error: dict values currently require i64 or a named struct\n",
                     parser->source_file, parser->current_token.line, parser->current_token.col);
             exit(1);
         }
@@ -538,7 +548,7 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
         if (owner) {
             parser_set_canonical(parser, owner, COBRA_TYPE_DICT, qualifier, NULL, NULL,
                                  parser_component_type(parser, COBRA_TYPE_STRING, NULL),
-                                 parser_component_type(parser, value, NULL));
+                                 struct_value ? struct_value : parser_component_type(parser, value, NULL));
         }
         return COBRA_TYPE_DICT;
     }

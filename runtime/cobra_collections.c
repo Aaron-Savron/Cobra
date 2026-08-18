@@ -153,6 +153,26 @@ size_t cobra_dict_len(void *owner) {
     return dict ? dict->length : 0;
 }
 
+/* Struct-valued dicts (dict[string]Struct) store a heap pointer to a private
+   copy of the struct as the entry's already-8-byte int64 value slot (see
+   emit_dict_set_key's struct case in codegen.c) - the runtime itself never
+   needs to know that, it just carries the bits. Destroying such a dict has
+   to free each live entry's struct copy (and that copy's own owned fields)
+   before the dict container goes away, but the struct field layout is only
+   known to codegen, not this runtime. These two accessors expose just enough
+   of CobraDict's layout (entry array base and live capacity) for codegen to
+   walk entries itself; entry stride/offsets are a fixed ABI documented next
+   to CobraDictEntry above (24 bytes; value at +8, used flag at +16). */
+size_t cobra_dict_capacity(void *owner) {
+    CobraDict *dict = owner;
+    return dict ? dict->capacity : 0;
+}
+
+void *cobra_dict_raw_entries(void *owner) {
+    CobraDict *dict = owner;
+    return dict ? dict->entries : NULL;
+}
+
 void cobra_dict_free(void **owner, size_t *length) {
     CobraDict *dict = *owner;
     if (dict) {

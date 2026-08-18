@@ -1,0 +1,6 @@
+struct Point: { x: i64, y: i64 }
+
+def test_dict_struct_value_type_mismatch(): {
+    let pts: dict[string]Point = {}
+    pts["a"] = 5
+}

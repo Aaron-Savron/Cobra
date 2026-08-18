@@ -360,6 +360,20 @@ static const char *ast_error_name(const ASTNode *node) {
     return cobra_type_node_error_name(node);
 }
 
+/* dict[string]V's value component isn't reachable through cobra_type_node_element
+   (that's list/array/slice's notion of "element" - see cobra_type_element in
+   type.c, which has no COBRA_TYPE_DICT case), so a dict node's struct value
+   type/name need their own accessors mirroring ast_element_kind/ast_payload_name. */
+static CobraTypeKind ast_dict_value_kind(const ASTNode *node) {
+    const CobraType *type = cobra_type_node_value(node);
+    return type ? type->kind : COBRA_TYPE_UNTYPED;
+}
+
+static const char *ast_dict_value_name(const ASTNode *node) {
+    const CobraType *type = cobra_type_node_value(node);
+    return (type && type->kind == COBRA_TYPE_STRUCT) ? type->name : NULL;
+}
+
 static ASTNode *function_param_node(CodeGen *cg, const char *name, size_t wanted) {
     ASTNode *fn = find_function(cg, name);
     if (!fn) return NULL;
@@ -533,6 +547,37 @@ static void emit_list_struct_element_cleanup(CodeGen *cg, VarSymbol *s) {
             i, i, loop, loop);
 }
 
+/* Mirrors emit_list_struct_element_cleanup for dict[string]Struct: entries
+   store a heap pointer to a private struct copy (see emit_dict_set_key's
+   struct case) as their already-8-byte value slot, so cobra_dict_free alone
+   would leak every live entry's struct copy and its owned fields. The dict's
+   internal hash table isn't contiguous/index-addressable like a list buffer,
+   so this walks the raw entry array via cobra_dict_capacity/raw_entries
+   (runtime/cobra_collections.c) using CobraDictEntry's fixed layout: 24-byte
+   stride, value at +8, `used` flag at +16. */
+static void emit_dict_struct_element_cleanup(CodeGen *cg, VarSymbol *s) {
+    if (s->element_type != COBRA_TYPE_STRUCT || !s->type_name[0]) return;
+    const CobraType *canonical = (cg->root && cg->root->canonical_arena)
+        ? cobra_type_struct_layout(cg->root->canonical_arena, cg->root, s->type_name) : NULL;
+    if (!canonical) return;
+    int dict_ptr = reserve(cg, 8), cap = reserve(cg, 8), base = reserve(cg, 8), i = reserve(cg, 8);
+    int loop = cg->label_count++;
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", s->offset, dict_ptr);
+    fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    call cobra_dict_capacity@PLT\n    mov QWORD PTR [rbp-%d], rax\n", dict_ptr, cap);
+    fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    call cobra_dict_raw_entries@PLT\n    mov QWORD PTR [rbp-%d], rax\n", dict_ptr, base);
+    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], 0\n.Ldict_elem_free_%d:\n", i, loop);
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    cmp rax, QWORD PTR [rbp-%d]\n    jge .Ldict_elem_free_done_%d\n",
+            i, cap, loop);
+    fprintf(cg->out, "    mov rbx, QWORD PTR [rbp-%d]\n    imul rax, 24\n    add rbx, rax\n", base);
+    fprintf(cg->out, "    cmp BYTE PTR [rbx+16], 0\n    je .Ldict_elem_free_skip_%d\n", loop);
+    fprintf(cg->out, "    mov rbx, QWORD PTR [rbx+8]\n    cmp rbx, 0\n    je .Ldict_elem_free_skip_%d\n", loop);
+    emit_heap_struct_owned_field_frees(cg, canonical, "rbx", 0, 0);
+    fprintf(cg->out, "    mov rdi, rbx\n    call free@PLT\n");
+    fprintf(cg->out, ".Ldict_elem_free_skip_%d:\n", loop);
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    add rax, 1\n    mov QWORD PTR [rbp-%d], rax\n    jmp .Ldict_elem_free_%d\n.Ldict_elem_free_done_%d:\n",
+            i, i, loop, loop);
+}
+
 /* A list/dict reference parameter's local descriptor slots are a private
    working copy seeded from the caller's block at function entry (see the
    COBRA_TYPE_LIST/COBRA_TYPE_DICT parameter-binding branches in
@@ -570,6 +615,7 @@ static void emit_scope_cleanup(CodeGen *cg, const char *skip_name) {
                     "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free@PLT\n",
                     s->offset, s->length_offset, s->capacity_offset);
         } else if (s->kind == SYM_DICT) {
+            emit_dict_struct_element_cleanup(cg, s);
             fprintf(cg->out,
                     "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    call cobra_dict_free@PLT\n",
                     s->offset, s->length_offset);
@@ -1033,15 +1079,27 @@ static VarSymbol *ensure_list(CodeGen *cg, const char *name, CobraTypeKind eleme
     return ensure_list_named(cg, name, element_type, NULL);
 }
 
-static VarSymbol *ensure_dict(CodeGen *cg, const char *name) {
+static VarSymbol *ensure_dict_named(CodeGen *cg, const char *name, CobraTypeKind value_type,
+                                     const char *value_type_name) {
     VarSymbol *s = find_symbol(cg, name);
     if (s) return s;
     s = new_symbol(cg, name);
     s->kind = SYM_DICT;
     s->type = COBRA_TYPE_DICT;
+    /* dict[string]Struct entries store a heap pointer to a private copy of
+       the struct as the (already 8-byte) dict value slot - see
+       emit_dict_set_key's struct case - so element_type/type_name here reuse
+       exactly the fields list[Struct] uses for the same purpose. */
+    s->element_type = value_type;
+    if (value_type == COBRA_TYPE_STRUCT && value_type_name)
+        snprintf(s->type_name, sizeof(s->type_name), "%.63s", value_type_name);
     s->offset = reserve(cg, 8);
     s->length_offset = reserve(cg, 8);
     return s;
+}
+
+static VarSymbol *ensure_dict(CodeGen *cg, const char *name) {
+    return ensure_dict_named(cg, name, COBRA_TYPE_I64, NULL);
 }
 
 static int field_offset_for(CodeGen *cg, const char *struct_name,
@@ -1611,7 +1669,57 @@ static void emit_list_pop(CodeGen *cg, VarSymbol *s, ASTNode *default_expr) {
     fprintf(cg->out, ".Llist_pop_done_%d:\n", done);
 }
 
+/* Shared tail for both dict-set entry points below once the key pointer and
+   (for struct values) the new heap-owned struct pointer are already sitting
+   in known stack slots: frees any struct value being overwritten at that key
+   (dict[string]Struct only - see cobra_dict_set_i64's overwrite semantics,
+   which just clobber entry->value with no notion of ownership), then stores
+   the new value and refreshes the cached length. `key_slot` holds the key
+   pointer, `value_slot` the int64 value (a heap struct pointer for struct
+   dicts, the scalar itself otherwise). */
+static void emit_dict_set_tail(CodeGen *cg, VarSymbol *s, int key_slot, int value_slot) {
+    if (s->element_type == COBRA_TYPE_STRUCT) {
+        int old_slot = reserve(cg, 8);
+        fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    xor edx, edx\n    call cobra_dict_get_i64@PLT\n    mov QWORD PTR [rbp-%d], rax\n",
+                s->offset, key_slot, old_slot);
+        int skip = cg->label_count++;
+        fprintf(cg->out, "    cmp QWORD PTR [rbp-%d], 0\n    je .Ldict_set_overwrite_skip_%d\n", old_slot, skip);
+        const CobraType *canonical = (cg->root && cg->root->canonical_arena)
+            ? cobra_type_struct_layout(cg->root->canonical_arena, cg->root, s->type_name) : NULL;
+        fprintf(cg->out, "    mov rbx, QWORD PTR [rbp-%d]\n", old_slot);
+        if (canonical) emit_heap_struct_owned_field_frees(cg, canonical, "rbx", 0, 0);
+        fprintf(cg->out, "    mov rdi, rbx\n    call free@PLT\n");
+        fprintf(cg->out, ".Ldict_set_overwrite_skip_%d:\n", skip);
+    }
+    fprintf(cg->out, "    lea rdi, [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    mov rdx, QWORD PTR [rbp-%d]\n    call cobra_dict_set_i64@PLT\n    mov rdi, QWORD PTR [rbp-%d]\n    call cobra_dict_len@PLT\n    mov QWORD PTR [rbp-%d], rax\n",
+            s->offset, key_slot, value_slot, s->offset, s->length_offset);
+}
+
+/* Struct values are never stored by the expression's own address (see
+   emit_list_append's identical concern for list[T]): that address is a stack
+   slot the caller reuses, so each dict entry gets its own heap-owned copy,
+   exclusively referenced by that one entry's value slot. */
+static int emit_dict_struct_value_copy(CodeGen *cg, VarSymbol *s, ASTNode *value) {
+    int struct_size = struct_storage_size(cg, s->type_name);
+    int src_slot = reserve(cg, 8), new_slot = reserve(cg, 8);
+    emit_expr(cg, value);
+    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", src_slot);
+    fprintf(cg->out, "    mov rdi, %d\n    call malloc@PLT\n", struct_size);
+    fprintf(cg->out, "    mov rdi, rax\n    mov rsi, QWORD PTR [rbp-%d]\n", src_slot);
+    emit_copy_memory(cg, "rsi", "rdi", struct_size);
+    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rdi\n", new_slot);
+    return new_slot;
+}
+
 static void emit_dict_set_key(CodeGen *cg, VarSymbol *s, const char *key, ASTNode *value) {
+    if (s->element_type == COBRA_TYPE_STRUCT) {
+        int new_slot = emit_dict_struct_value_copy(cg, s, value);
+        int key_slot = reserve(cg, 8);
+        emit_string_literal(cg, key);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", key_slot);
+        emit_dict_set_tail(cg, s, key_slot, new_slot);
+        return;
+    }
     int temp = reserve(cg, 8);
     emit_expr(cg, value);
     fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n    lea rdi, [rbp-%d]\n", temp, s->offset);
@@ -1620,6 +1728,14 @@ static void emit_dict_set_key(CodeGen *cg, VarSymbol *s, const char *key, ASTNod
 }
 
 static void emit_dict_set(CodeGen *cg, VarSymbol *s, ASTNode *key, ASTNode *value) {
+    if (s->element_type == COBRA_TYPE_STRUCT) {
+        int key_slot = reserve(cg, 8);
+        emit_expr(cg, key);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", key_slot);
+        int new_slot = emit_dict_struct_value_copy(cg, s, value);
+        emit_dict_set_tail(cg, s, key_slot, new_slot);
+        return;
+    }
     int key_temp = reserve(cg, 8), value_temp = reserve(cg, 8);
     emit_expr(cg, key);
     fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", key_temp);
@@ -3374,6 +3490,52 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
         }
         VarSymbol *s = find_symbol(cg, n->children[0]->name);
         if (!s || s->kind != SYM_DICT) { fprintf(stderr, "CodeGen Error: lookup target is not a dict\n"); exit(EXIT_FAILURE); }
+        /* get()/pop() reading a struct value already work through the generic
+           path below unchanged: get returns a borrowed view (the stored heap
+           pointer, or the caller's own default-expression address on a miss -
+           neither implies a new owner) exactly like a plain d["k"] read.
+           delete() and pop() removing a struct value do not: cobra_dict_delete
+           and cobra_dict_pop just drop the raw int64 bits, which for a struct
+           dict is a heap pointer - dropping it without freeing (delete) or
+           without transferring its owned fields out first (pop, which must
+           still free the entry's own block once the caller has its own copy,
+           mirroring emit_list_pop's struct case) leaks. Handle both specially,
+           then return before the generic scalar path. */
+        if (s->element_type == COBRA_TYPE_STRUCT &&
+            (!strcmp(n->name, "delete") || !strcmp(n->name, "pop"))) {
+            int struct_size = struct_storage_size(cg, s->type_name);
+            const CobraType *canonical = (cg->root && cg->root->canonical_arena)
+                ? cobra_type_struct_layout(cg->root->canonical_arena, cg->root, s->type_name) : NULL;
+            int key_slot = reserve(cg, 8), ptr_slot = reserve(cg, 8);
+            emit_expr(cg, n->children[1]);
+            fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", key_slot);
+            fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    xor edx, edx\n    call cobra_dict_get_i64@PLT\n    mov QWORD PTR [rbp-%d], rax\n",
+                    s->offset, key_slot, ptr_slot);
+            int missing = cg->label_count++, done = cg->label_count++;
+            fprintf(cg->out, "    cmp QWORD PTR [rbp-%d], 0\n    je .Ldict_op_missing_%d\n", ptr_slot, missing);
+            if (!strcmp(n->name, "pop")) {
+                int scratch = reserve(cg, struct_size);
+                fprintf(cg->out, "    mov rsi, QWORD PTR [rbp-%d]\n    lea rdi, [rbp-%d]\n", ptr_slot, scratch);
+                emit_copy_memory(cg, "rsi", "rdi", struct_size);
+                fprintf(cg->out, "    lea rdi, [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    call cobra_dict_delete@PLT\n", s->offset, key_slot);
+                fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    call free@PLT\n", ptr_slot);
+                fprintf(cg->out, "    lea rax, [rbp-%d]\n    jmp .Ldict_op_done_%d\n", scratch, done);
+                fprintf(cg->out, ".Ldict_op_missing_%d:\n", missing);
+                emit_expr(cg, n->children[2]);
+                fprintf(cg->out, "    mov rsi, rax\n    lea rdi, [rbp-%d]\n", scratch);
+                emit_copy_memory(cg, "rsi", "rdi", struct_size);
+                fprintf(cg->out, "    lea rax, [rbp-%d]\n", scratch);
+                fprintf(cg->out, ".Ldict_op_done_%d:\n", done);
+            } else {
+                fprintf(cg->out, "    mov rbx, QWORD PTR [rbp-%d]\n", ptr_slot);
+                if (canonical) emit_heap_struct_owned_field_frees(cg, canonical, "rbx", 0, 0);
+                fprintf(cg->out, "    mov rdi, rbx\n    call free@PLT\n");
+                fprintf(cg->out, "    lea rdi, [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    call cobra_dict_delete@PLT\n    jmp .Ldict_op_done_%d\n", s->offset, key_slot, done);
+                fprintf(cg->out, ".Ldict_op_missing_%d:\n", missing);
+                fprintf(cg->out, ".Ldict_op_done_%d:\n", done);
+            }
+            return;
+        }
         /* ABI split: set/delete/pop take the owner pointer (void **) because they
            may rehash; get/has take the dict pointer itself (void *). */
         if (!strcmp(n->name, "get") || !strcmp(n->name, "has"))
@@ -3424,6 +3586,7 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
             }
 
             if (s && s->kind == SYM_DICT) {
+                emit_dict_struct_element_cleanup(cg, s);
                 fprintf(cg->out, "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    call cobra_dict_free@PLT\n", s->offset, s->length_offset);
                 s->owned = false;
                 return;
@@ -4526,6 +4689,19 @@ static void autofree_scan_disqualify(const ASTNode *n, AutofreeCandidate *cands,
             }
         }
     }
+    /* `dict_of_struct["k"] = candidate` (or `pts[i] = candidate` for a
+       list[Struct]) heap-copies the struct's bytes into the collection's own
+       entry, but that copy is shallow - any owned field pointer inside
+       (e.g. a string) is the same address the candidate still holds. Scope
+       exit auto-freeing the candidate would then free memory the collection
+       entry still references, so this must disqualify exactly like passing
+       the candidate to append()/set() as a call argument does above. */
+    if (n->type == AST_INDEX_ASSIGN && n->child_count > 0 &&
+        n->children[n->child_count - 1]->type == AST_VAR_REF) {
+        const char *value_name = n->children[n->child_count - 1]->name;
+        for (int k = 0; k < count; k++)
+            if (!disq[k] && !strcmp(value_name, cands[k].name)) disq[k] = true;
+    }
     for (size_t i = 0; i < n->child_count; i++) autofree_scan_disqualify(n->children[i], cands, disq, count);
 }
 
@@ -4615,6 +4791,7 @@ static void emit_loop_owned_cleanup(CodeGen *cg, ASTNode *body) {
                     s->offset, s->length_offset, s->capacity_offset);
             s->owned = false;
         } else if (s->kind == SYM_DICT) {
+            emit_dict_struct_element_cleanup(cg, s);
             fprintf(cg->out,
                     "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    call cobra_dict_free@PLT\n",
                     s->offset, s->length_offset);
@@ -4715,7 +4892,7 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
                 return;
             }
             if (v->type == AST_DICT_LITERAL) {
-                VarSymbol *s = ensure_dict(cg, n->name);
+                VarSymbol *s = ensure_dict_named(cg, n->name, ast_dict_value_kind(n), ast_dict_value_name(n));
                 s->owned = true;
                 fprintf(cg->out, "    mov QWORD PTR [rbp-%d], 0\n    mov QWORD PTR [rbp-%d], 0\n", s->offset, s->length_offset);
                 for (size_t i = 0; i < v->child_count; i++) {
@@ -4807,7 +4984,7 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
                 return;
             }
             if (n->declared_type == COBRA_TYPE_DICT && v->type == AST_FUNC_CALL) {
-                VarSymbol *s = ensure_dict(cg, n->name);
+                VarSymbol *s = ensure_dict_named(cg, n->name, ast_dict_value_kind(n), ast_dict_value_name(n));
                 s->owned = true;
                 emit_call(cg, v);
                 fprintf(cg->out,
@@ -5262,7 +5439,7 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
             fprintf(cg->out, "    mov rcx, QWORD PTR [rax+8]\n    mov QWORD PTR [rbp-%d], rcx\n", s->length_offset);
             fprintf(cg->out, "    mov rcx, QWORD PTR [rax+16]\n    mov QWORD PTR [rbp-%d], rcx\n", s->offset);
         } else if (parameter_type == COBRA_TYPE_DICT) {
-            VarSymbol *s = ensure_dict(cg, p->name);
+            VarSymbol *s = ensure_dict_named(cg, p->name, ast_dict_value_kind(p), ast_dict_value_name(p));
             s->list_dict_ref = true;
             s->ref_ptr_offset = reserve(cg, 8);
             if (gpr < 6) {

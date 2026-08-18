@@ -347,6 +347,15 @@ static bool add_local(IRContext *ctx, const char *name, CobraTypeKind type, cons
         local->key_type = local_key ? local_key->kind : COBRA_TYPE_UNTYPED;
         local->collection_value_type = local_error ? local_error->kind :
                                        (local_value ? local_value->kind : COBRA_TYPE_UNTYPED);
+        /* canonical_type_name() doesn't cover COBRA_TYPE_DICT (cobra_type_element
+           has no dict case - "element" means list/array/slice element, not dict
+           value), so a dict[string]Struct local's type_name would otherwise stay
+           empty. Fill it from the value component directly, mirroring how a
+           struct-element list gets its type_name from cobra_type_element. */
+        if (local->type == COBRA_TYPE_DICT && local_value && local_value->kind == COBRA_TYPE_STRUCT &&
+            local_value->name[0]) {
+            snprintf(local->type_name, sizeof(local->type_name), "%.63s", local_value->name);
+        }
         local->shape_rank = shape_source->shape_rank;
         for (int i = 0; i < local->shape_rank; i++) {
             snprintf(local->shape_dims[i], sizeof(local->shape_dims[i]), "%.63s", shape_source->shape_dims[i]);
@@ -1979,8 +1988,8 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
             for (size_t i = 0; i < node->child_count; i++) {
                 if (node->children[i]->child_count == 1) {
                     CobraTypeKind value = infer_expr(node->children[i]->children[0], ctx);
-                    if (value != COBRA_TYPE_I64 && value != COBRA_TYPE_UNKNOWN)
-                        ir_error(ctx, node, "dict values currently require i64");
+                    if (value != COBRA_TYPE_I64 && value != COBRA_TYPE_STRUCT && value != COBRA_TYPE_UNKNOWN)
+                        ir_error(ctx, node, "dict values currently require i64 or a named struct");
                 }
             }
             node->canonical_type = cobra_type_make(ctx->canonical_arena, COBRA_TYPE_DICT, NULL,
@@ -2277,9 +2286,14 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                 IRLocal *indexed_local = find_local_entry(ctx, node->name);
                 indexed_element = indexed_local ? indexed_local->element_type : COBRA_TYPE_UNTYPED;
             }
-            node->value_type = (base_type == COBRA_TYPE_DICT) ? COBRA_TYPE_I64 :
-                               (is_f32_buffer_type(base_type) || indexed_element == COBRA_TYPE_F32 ? COBRA_TYPE_F32 :
-                                (indexed_element != COBRA_TYPE_UNTYPED ? indexed_element : COBRA_TYPE_I64));
+            if (base_type == COBRA_TYPE_DICT) {
+                IRLocal *dict_read_local = find_local_entry(ctx, node->name);
+                node->value_type = dict_read_local && dict_read_local->collection_value_type != COBRA_TYPE_UNTYPED ?
+                    dict_read_local->collection_value_type : COBRA_TYPE_I64;
+            } else {
+                node->value_type = is_f32_buffer_type(base_type) || indexed_element == COBRA_TYPE_F32 ? COBRA_TYPE_F32 :
+                                   (indexed_element != COBRA_TYPE_UNTYPED ? indexed_element : COBRA_TYPE_I64);
+            }
             return node->value_type;
         }
         case AST_INDEX_ASSIGN: {
@@ -2346,8 +2360,12 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                 /* Integer literals and variables coerce to f32 on assignment,
                    matching the mixed-numeric semantics of arithmetic. */
                 if (base_type == COBRA_TYPE_DICT) {
-                    if (value_type != COBRA_TYPE_I64 && value_type != COBRA_TYPE_UNKNOWN)
-                        ir_error(ctx, node, "dict values currently require i64");
+                    IRLocal *dict_expr_local = find_local_entry(ctx, node->name);
+                    CobraTypeKind dict_value = dict_expr_local && dict_expr_local->collection_value_type != COBRA_TYPE_UNTYPED ?
+                        dict_expr_local->collection_value_type : COBRA_TYPE_I64;
+                    if (value_type != dict_value && value_type != COBRA_TYPE_UNKNOWN &&
+                        !(is_integer(dict_value) && is_integer(value_type)))
+                        ir_error(ctx, node, "dict assignment does not match its declared value type");
                 } else if (base_type == COBRA_TYPE_LIST) {
                     if (value_type != COBRA_TYPE_I64 && value_type != COBRA_TYPE_F32 && value_type != COBRA_TYPE_UNKNOWN)
                         ir_error(ctx, node, "list assignment requires a scalar value");
@@ -2740,11 +2758,18 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                     CobraTypeKind key = infer_expr(node->children[1], ctx);
                     if (key != COBRA_TYPE_STRING && key != COBRA_TYPE_UNKNOWN) ir_error(ctx, node, "dict key must be a string");
                 }
+                IRLocal *dict_local = node->child_count > 0 && node->children[0]->type == AST_VAR_REF ?
+                    find_local_entry(ctx, node->children[0]->name) : NULL;
+                CobraTypeKind dict_value = dict_local && dict_local->collection_value_type != COBRA_TYPE_UNTYPED ?
+                    dict_local->collection_value_type : COBRA_TYPE_I64;
                 if (!strcmp(node->name, "set") && node->child_count > 2) {
                     CobraTypeKind value = infer_expr(node->children[2], ctx);
-                    if (value != COBRA_TYPE_I64 && value != COBRA_TYPE_UNKNOWN) ir_error(ctx, node, "dict value must be i64");
+                    if (value != dict_value && value != COBRA_TYPE_UNKNOWN &&
+                        !(is_integer(dict_value) && is_integer(value)))
+                        ir_error(ctx, node, "dict value does not match its declared value type");
                 }
-                node->value_type = (!strcmp(node->name, "set") || !strcmp(node->name, "delete")) ? COBRA_TYPE_VOID : COBRA_TYPE_I64;
+                node->value_type = (!strcmp(node->name, "set") || !strcmp(node->name, "delete")) ? COBRA_TYPE_VOID :
+                                   (!strcmp(node->name, "has") ? COBRA_TYPE_I64 : dict_value);
                 return node->value_type;
             }
             if (is_string_from_bytes_builtin(node->name)) {
@@ -3940,8 +3965,14 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
             }
             CobraTypeKind assigned = infer_expr(node->children[node->child_count - 1], ctx);
             if (base_type == COBRA_TYPE_DICT) {
-                if (assigned != COBRA_TYPE_I64 && assigned != COBRA_TYPE_UNKNOWN)
-                    ir_error(ctx, node, "dict values currently require i64");            } else if (base_type == COBRA_TYPE_ARRAY) {
+                IRLocal *dict_write_local = find_local_entry(ctx, node->name);
+                CobraTypeKind dict_value = dict_write_local && dict_write_local->collection_value_type != COBRA_TYPE_UNTYPED ?
+                    dict_write_local->collection_value_type : COBRA_TYPE_I64;
+                bool compatible = assigned == COBRA_TYPE_UNKNOWN || assigned == dict_value ||
+                    (is_integer(dict_value) && is_integer(assigned));
+                if (!compatible)
+                    ir_error(ctx, node, "dict assignment does not match its declared value type");
+            } else if (base_type == COBRA_TYPE_ARRAY) {
                 IRLocal *array = find_local_entry(ctx, node->name);
                 CobraTypeKind element = array ? array->element_type : COBRA_TYPE_UNTYPED;
                 bool compatible = assigned == COBRA_TYPE_UNKNOWN || element == COBRA_TYPE_UNTYPED ||

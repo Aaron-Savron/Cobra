@@ -1,0 +1,113 @@
+# dict[string]V where V is a struct, mirroring how list[T] got struct
+# elements this session (see 163_list_owned_field_struct.cb). Values are
+# scalar-field and owned-field (string) structs. Keys stay string-only -
+# widening dict's key type is a separate, larger undertaking (see
+# ROADMAP.md phase 14).
+#
+# Ownership: emit_dict_set_key/emit_dict_set heap-copy the struct into a
+# private block per entry, exactly like emit_list_append does for list[T] -
+# the dict's int64 value slot just holds that block's address. Overwriting
+# an existing key frees the old block's owned fields (and the block itself)
+# before the new one is stored. get()/plain d["k"] reads are a borrowed
+# view of the stored block - no ownership changes hands. pop() copies the
+# struct's bytes out to a scratch area, frees the entry's block, and
+# removes the entry, transferring ownership of any owned fields to the
+# caller (mirrors list's pop from 165_list_pop.cb). Destroying the dict
+# (scope exit, explicit free, or loop-scoped reuse) walks every live entry
+# and frees its struct value before freeing the dict itself.
+
+struct Counter: { label: string, count: i64 }
+
+def build(n: i64) -> dict[string]Counter: {
+    let counters: dict[string]Counter = {}
+    let i: i64 = 0
+    while i < n: {
+        let c: Counter
+        c.label = "item-" + "x"
+        c.count = i
+        set(counters, "k" + "0", c)
+        i = i + 1
+    }
+    return counters
+}
+
+def test_insert_and_read(): {
+    let counters: dict[string]Counter = {}
+    let a: Counter
+    a.label = "alpha-" + "x"
+    a.count = 1
+    counters["a"] = a
+    let b: Counter
+    b.label = "beta-" + "x"
+    b.count = 2
+    set(counters, "b", b)
+    assert(len(counters) == 2)
+    let ra: Counter = counters["a"]
+    assert(ra.label == "alpha-x")
+    assert(ra.count == 1)
+    let rb: Counter = get(counters, "b", a)
+    assert(rb.label == "beta-x")
+    assert(rb.count == 2)
+    assert(has(counters, "a"))
+    assert(has(counters, "missing") == 0)
+}
+
+def test_overwrite_existing_key(): {
+    let counters: dict[string]Counter = {}
+    let round: i64 = 0
+    while round < 300: {
+        let c: Counter
+        c.label = "round-" + "x"
+        c.count = round
+        counters["k"] = c
+        round = round + 1
+    }
+    assert(len(counters) == 1)
+    let last: Counter = counters["k"]
+    assert(last.count == 299)
+}
+
+def test_pop_struct_value(): {
+    let counters: dict[string]Counter = {}
+    let a: Counter
+    a.label = "popped-" + "x"
+    a.count = 42
+    counters["a"] = a
+    let fallback: Counter
+    fallback.label = "fallback-" + "x"
+    fallback.count = -1
+    let popped: Counter = pop(counters, "a", fallback)
+    assert(popped.label == "popped-x")
+    assert(popped.count == 42)
+    assert(has(counters, "a") == 0)
+    assert(len(counters) == 0)
+    let missed: Counter = pop(counters, "a", fallback)
+    assert(missed.label == "fallback-x")
+    assert(missed.count == -1)
+}
+
+def test_delete_struct_value(): {
+    let counters: dict[string]Counter = {}
+    let a: Counter
+    a.label = "gone-" + "x"
+    a.count = 7
+    counters["a"] = a
+    delete(counters, "a")
+    assert(has(counters, "a") == 0)
+    assert(len(counters) == 0)
+}
+
+def test_build_and_destroy_repeated(): {
+    let round: i64 = 0
+    while round < 100: {
+        let counters: dict[string]Counter = build(5)
+        assert(len(counters) == 1)
+        round = round + 1
+    }
+}
+
+def test_explicit_free(): {
+    let counters: dict[string]Counter = build(10)
+    assert(len(counters) == 1)
+    free(counters)
+}

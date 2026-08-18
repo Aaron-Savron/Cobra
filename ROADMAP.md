@@ -560,7 +560,21 @@ Finish the language contracts for:
   owned-buffer calls, returns, append, pop, destruction, and ownership checks
 - [ ] Owned generic values
 - Non-scalar generic collections (list[T] for all-scalar-field struct T works for append/index/iteration; list[T] for a struct T with owned fields - owned strings, owned slices, or nested owning structs - now also works for append, index-read, index-write, iteration, and destruction: each append/index-write gives the element its own heap-owned copy, and destroying the list (scope exit, explicit `free`, or loop-scoped reuse) walks every live element and frees its owned fields before freeing the element and the buffer. No new move-tracking was added - a source local passed to append is simply left un-autofreed by the existing conservative autofree analysis, matching the codebase's existing leak-not-double-free convention for owned struct fields. `pop(list, default)` is now implemented for list[T] too, mirroring dict's pop convention: an empty list yields the caller-supplied default rather than a runtime abort or Option. Scalar and f32 elements pop by value; struct elements (scalar-field or owned-field) are copied out of their heap-owned element block into the caller's destination before that block is freed, transferring ownership of any owned fields without double-freeing them. Only named list locals are supported as the pop target so far - struct-field lists (`s.items`) are not yet wired into pop's codegen path)
-- Generic dictionaries
+- Generic dictionaries (`dict[string]V` now also accepts a named struct as V,
+  scalar-field or owned-field, mirroring list[T]'s struct support: literal
+  declaration, `d["k"] = v`/`set`, plain `d["k"]`/`get` reads (a borrowed view
+  of the stored entry, no ownership change), `pop`, `delete`, and destruction
+  (scope exit, explicit `free`, or loop-scoped reuse) all work. Each entry's
+  value is a private heap-owned copy of the struct (its already-8-byte int64
+  value slot just holds the pointer - no runtime hash-table changes needed);
+  overwriting an existing key frees the old value's owned fields first, `pop`
+  transfers ownership of the popped value's owned fields to the caller, and
+  destruction walks every live entry via two new runtime accessors
+  (`cobra_dict_capacity`/`cobra_dict_raw_entries`) freeing each value before
+  freeing the dict itself. Key type is still string-only - widening it is a
+  separate, larger undertaking left out of scope here. Iteration over a dict's
+  entries (`for k, v in dict:` or similar) does not exist for dicts at all yet,
+  independent of this work, and remains open)
 - [x] Scalar mutable generic slices through `out []T` writable views, including
   indexed stores, calls, borrowed returns, provenance, and borrow-contract checks
 - [ ] Non-scalar mutable generic slices
