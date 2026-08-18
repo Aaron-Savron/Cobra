@@ -1,0 +1,6 @@
+import "modules/cross_alias_a.cb" as a
+import "modules/cross_alias_b.cb" as b
+
+def invalid_cross_module_call() -> i64: {
+    return a.b_only()
+}

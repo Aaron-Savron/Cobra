@@ -1,5 +1,6 @@
 #include "../include/cobra.h"
 #include <limits.h>
+#include <unistd.h>
 
 #define COBRA_IR_TYPE_RECURSION_LIMIT 128
 
@@ -1702,6 +1703,51 @@ static bool is_source_module_alias(IRContext *ctx, const char *alias) {
     return false;
 }
 
+/* Every source file's imports land as siblings in the same merged
+   ctx->root (all modules get concatenated into one parse), so
+   is_source_module_alias only proves *some* file imported something
+   under this alias, not that the *caller's own* file did, and it says
+   nothing about which module the alias actually points to. A qualified
+   call like `base.other_fn()` must resolve `base` against the import
+   declared in the caller's own file and confirm the callee was really
+   defined in that specific module, or two aliases pointing at
+   different sibling modules become interchangeable back doors around
+   both file-scoping and `private`. Returns false (permissive) if the
+   import path can't be resolved on disk, since project-manifest
+   dependency resolution isn't reproducible here; the strict check is a
+   best-effort narrowing, not the sole gate. */
+static bool resolve_relative_to_file(const char *importer_file, const char *requested,
+                                     char resolved[PATH_MAX]) {
+    if (requested[0] == '/') return realpath(requested, resolved) != NULL;
+    char directory[PATH_MAX];
+    snprintf(directory, sizeof(directory), "%s", importer_file);
+    char *slash = strrchr(directory, '/');
+    if (slash) *slash = '\0';
+    else snprintf(directory, sizeof(directory), ".");
+    char candidate[PATH_MAX];
+    if (snprintf(candidate, sizeof(candidate), "%s/%s", directory, requested) >= (int)sizeof(candidate)) return false;
+    return realpath(candidate, resolved) != NULL;
+}
+
+static bool alias_resolves_to_module(IRContext *ctx, const char *caller_file, const char *alias,
+                                     const char *callee_file) {
+    if (!ctx->root || !alias || !*alias || !caller_file[0] || !callee_file[0]) return true;
+    char callee_canonical[PATH_MAX];
+    if (!realpath(callee_file, callee_canonical)) return true;
+    bool found_any_match = false;
+    for (size_t i = 0; i < ctx->root->child_count; i++) {
+        ASTNode *decl = ctx->root->children[i];
+        if (decl->type != AST_IMPORT_DECL || !decl->source_import) continue;
+        if (strcmp(decl->module_alias, alias) != 0) continue;
+        if (strcmp(decl->source_file, caller_file) != 0) continue;
+        char target[PATH_MAX];
+        if (!resolve_relative_to_file(decl->source_file, decl->name, target)) return true;
+        found_any_match = true;
+        if (strcmp(target, callee_canonical) == 0) return true;
+    }
+    return !found_any_match;
+}
+
 /* Static trait-method dispatch: x.method(args) parses to an AST_FUNC_CALL
    with qualifier="x" (see the qualified-call parse path shared with
    alias.function(...) module calls). If "x" is not a module alias, check
@@ -2552,6 +2598,14 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                     snprintf(message, sizeof(message), "module alias '%s' has no function '%s'",
                              node->qualifier, node->name);
                     ir_error(ctx, node, message);
+                } else {
+                    ASTNode *target = find_function(ctx, node->name);
+                    if (!alias_resolves_to_module(ctx, node->source_file, node->qualifier, target->source_file)) {
+                        char message[180];
+                        snprintf(message, sizeof(message), "module alias '%s' has no function '%s'",
+                                 node->qualifier, node->name);
+                        ir_error(ctx, node, message);
+                    }
                 }
             }
             if (is_string_free_builtin(node->name)) {

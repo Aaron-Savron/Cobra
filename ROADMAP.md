@@ -871,8 +871,41 @@ Finish the language contracts for:
   struct field/nested destructuring patterns in match arms - deliberately
   the same flat-destructuring boundary chosen for `let (a, b) = ...`
   tuple binding, not attempted here.
-- Package visibility
-- Stable module rules
+- [x] Package visibility - `pub`/`private` on top-level `def` (parser.c
+  is_public/has_visibility), enforced by function_visible_from in ir.c:
+  a private function is only callable from statements in its own
+  source file, whether the call is qualified (`alias.fn()`) or bare
+  (`fn()`); verified in both directions
+  (examples/92_module_visibility.cb,
+  tests/negative/92_private_module_access.cb). Scope is deliberately
+  narrow: only function declarations carry a visibility modifier -
+  structs, traits, and top-level consts have none and are always
+  visible wherever their name is in scope. Not attempted here:
+  per-field struct visibility or a re-export mechanism (an importer
+  cannot forward a symbol under its own name for a third file to pick
+  up); every file that wants a symbol must import the module that
+  actually declares it.
+- [x] Stable module rules - source imports resolve to a canonical
+  on-disk path (main.c load_cobra_module/resolve_module_path), so a
+  diamond import of the same file from two paths is deduplicated
+  (examples/40_module_diamond.cb) and a real cycle is rejected
+  (tests/negative/39_module_cycle_root.cb). Aliases are scoped to the
+  importing file, must be unique within it
+  (tests/negative/42_duplicate_module_alias.cb), and referencing an
+  undeclared alias is rejected
+  (tests/negative/41_unknown_module_alias.cb). Two modules independently
+  defining the same top-level function name is a hard "duplicate
+  function in composed program" error rather than silently picking one
+  (tests/negative/40_duplicate_module_root.cb) - there is no
+  overload/shadowing resolution to get wrong. Fixed this pass: a
+  qualified call `alias.fn()` used to accept *any* function that
+  existed anywhere in the merged program as long as `alias` was some
+  valid module alias in the caller's file, regardless of which module
+  `fn` actually lived in - so given `import a.cb as a` and `import
+  b.cb as b`, `a.some_fn_only_defined_in_b()` compiled. ir.c now
+  resolves the alias's import path relative to the caller's file and
+  requires the callee's source file to match before accepting the call
+  (tests/negative/149_module_alias_cross_binding.cb).
 
 Every feature needs a defined type rule, ownership rule, lifetime rule, ABI rule, interpreter rule, backend rule, diagnostic rule, and test matrix.
 

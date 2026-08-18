@@ -1,0 +1,3 @@
+pub def a_only() -> i64: {
+    return 1
+}
