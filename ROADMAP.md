@@ -583,9 +583,20 @@ Finish the language contracts for:
   loop machinery `for x in list:` uses - a dict's entries aren't contiguous
   or index-addressable the way a list's buffer is. The dict can still be
   freed normally after iterating)
-- [x] Scalar mutable generic slices through `out []T` writable views, including
-  indexed stores, calls, borrowed returns, provenance, and borrow-contract checks
-- [ ] Non-scalar mutable generic slices
+- [x] (isolated backend / `--backend=native` only, see `tests/backend_ir.c`'s
+  `test_source_generic_writable_slices`) Scalar mutable generic slices through
+  `out []T` writable views, including indexed stores, calls, borrowed returns,
+  provenance, and borrow-contract checks. The direct/production backend
+  (`src/ir.c`) explicitly rejects this today with "generic collection
+  parameters are reserved for the backend-v2 path" - this checklist line was
+  previously unqualified and read as if it covered the production backend,
+  which it never did; corrected after an investigation confirmed there is no
+  scalar `out []T` generic-parameter binding, provenance checking, or codegen
+  anywhere in the direct backend to extend. Building it there is a real,
+  separate, from-scratch undertaking, not a small extension.
+- [ ] Non-scalar mutable generic slices (direct backend). Blocked on the item
+  above: this needs scalar `out []T` generic-parameter support in the direct
+  backend to exist first.
 - [x] Lifetime-aware generic returns for scalar `readonly []T` and `out []T`
   specializations, with one source view parameter, call-boundary provenance,
   and frame or region escape rejection
