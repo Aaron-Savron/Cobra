@@ -1343,6 +1343,38 @@ arbitrary non-scalar ownership-bearing aggregate emission remains deferred.
     (the tensor system above all) is now the main blocker to this being a
     generally usable backend rather than a subset one.
 
+- [x] backend_ir: `impl` blocks (plain struct methods, trait static dispatch,
+    default trait methods, supertraits). Previously every top-level `impl`
+    was rejected outright ("top-level declaration is outside the backend-IR
+    subset"). The shared parser already does almost all of the work before
+    either backend sees it: `parse_impl_declaration` registers every impl
+    method directly into the parser root as an ordinary top-level
+    `AST_FUNCTION` named `__impl_<Trait>_<Type>_<method>` (empty-trait
+    sentinel for plain, traitless impls), and `synthesize_trait_defaults`
+    clones default trait method bodies into synthesized impl methods the
+    same way, so default methods and supertrait conformance were already
+    fully desugared upstream by the time backend_ir's HIR builder runs -
+    nothing impl-specific needed to be taught to it for those. What backend_ir
+    needed: (1) stop rejecting the bookkeeping `AST_IMPL_DECL`/`AST_TRAIT_DECL`
+    top-level nodes (their methods are picked up separately as ordinary
+    functions by the existing per-function loop); (2) rewrite `x.method(args)`
+    to a direct call on the mangled function at HIR-build time
+    (`hir_rewrite_impl_call` in `src/backend_ir/hir.c`), mirroring
+    `find_impl_method` in `src/ir.c` exactly (same mangled-name lookup over
+    the `AST_IMPL_DECL` marker children, same receiver-prepend rewrite) so
+    every downstream case (ABI validation, argument lowering, aggregate
+    -return hoisting) sees an ordinary call to a mangled top-level function
+    and needs no impl-specific awareness anywhere else. Verified plain
+    struct methods, trait static dispatch, default trait methods (used and
+    overridden), and supertrait conformance all match the direct backend's
+    output bit-for-bit on throwaway programs. Dynamic dispatch (`dyn Trait`
+    as a parameter/local/return type, its 2-word dispatch-block
+    representation, static vtables, and indirect-call codegen) and
+    `list[dyn Trait]` are not yet supported by backend_ir - both still hit
+    the same top-level-declaration or type-resolution gaps as before this
+    change and are unattempted future work, not a partially-working or
+    unsound implementation of either.
+
 The main rule is:
 
 > Do not optimize or add targets until the IR can represent the values, memory, calls, and ownership rules that the language actually supports.
