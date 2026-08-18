@@ -1731,6 +1731,409 @@ static bool run_native_tests(ASTNode *program, const char *source_path) {
     return passed;
 }
 
+/* Builds the same isolated-backend prelude + module composition the
+   `--backend=native` build path uses (see the use_isolated_backend branch in
+   main()), but as a reusable helper so the native test runner below can
+   parse the program once and reuse it both for a whole-program compile
+   attempt and, on failure, per-function isolation compiles. Caller owns the
+   returned ASTNode* (ast_free) and *out_buffer (free(out_buffer->data)). */
+static ASTNode *build_isolated_test_program(const char *source_path,
+                                            const CobraProjectConfig *project_config,
+                                            CobraSourceBuffer *out_buffer) {
+    memset(out_buffer, 0, sizeof(*out_buffer));
+    char *std_source = read_library_file("std.cb");
+    char *mem_source = read_library_file("mem.cb");
+    char *fs_source = read_library_file("fs.cb");
+    char *cpu_source = read_library_file("cpu.cb");
+    char *time_source = read_library_file("time.cb");
+    char *net_source = read_library_file("net.cb");
+    if (std_source) { source_buffer_append(out_buffer, std_source, "lib/std.cb"); free(std_source); }
+    if (mem_source) { source_buffer_append(out_buffer, mem_source, "lib/mem.cb"); free(mem_source); }
+    if (fs_source) { source_buffer_append(out_buffer, fs_source, "lib/fs.cb"); free(fs_source); }
+    if (cpu_source) { source_buffer_append(out_buffer, cpu_source, "lib/cpu.cb"); free(cpu_source); }
+    if (time_source) { source_buffer_append(out_buffer, time_source, "lib/time.cb"); free(time_source); }
+    if (net_source) { source_buffer_append(out_buffer, net_source, "lib/net.cb"); free(net_source); }
+
+    CobraModulePaths module_paths = {0};
+    if (!load_cobra_module(source_path, project_config, &module_paths, out_buffer)) {
+        return NULL;
+    }
+    Parser parser;
+    parser_init(&parser, out_buffer->data);
+    ASTNode *isolated_program = parser_parse_program(&parser);
+    if (!annotate_source_locations(isolated_program, out_buffer)) {
+        ast_free(isolated_program);
+        return NULL;
+    }
+    return isolated_program;
+}
+
+typedef enum { BIR_TEST_PASS, BIR_TEST_FAIL, BIR_TEST_SKIP } BirTestOutcome;
+
+/* bir_build_program's reachability pass (mark_reachable_functions in
+   hir.c) only prunes an unsupported-construct failure as "safe to skip"
+   when the failing function is NOT reachable from a top-level function
+   literally named "main"; when no such "main" exists it conservatively
+   treats every top-level function as reachable, so a single unsupported
+   construct anywhere in the six prelude libraries (std/mem/fs/cpu/time/net)
+   fails the entire compile even for a test that never touches it. Rather
+   than drop `def main`, this synthesizes a replacement `main` that calls
+   exactly the test function(s) being attempted, parsed as ordinary Cobra
+   source and spliced into a filtered top-level view (which also drops the
+   user's own `main`, since two "main" declarations would collide). This
+   makes reachability precise per attempt: prelude code the test(s) don't
+   use is pruned instead of failing the build, while a genuinely unsupported
+   construct inside a reachable test still fails that attempt (never
+   silently produces a binary missing the symbol we're about to call). */
+static ASTNode *bir_make_synthetic_main(const char *const *test_names, size_t count) {
+    size_t cap = 64;
+    for (size_t i = 0; i < count; i++) cap += strlen(test_names[i]) + 16;
+    char *src = malloc(cap);
+    if (!src) return NULL;
+    size_t len = 0;
+    len += (size_t)snprintf(src + len, cap - len, "def main(): {\n");
+    for (size_t i = 0; i < count; i++) {
+        len += (size_t)snprintf(src + len, cap - len, "    %s()\n", test_names[i]);
+    }
+    snprintf(src + len, cap - len, "    return 0\n}\n");
+    Parser parser;
+    parser_init(&parser, src);
+    ASTNode *synthetic_program = parser_parse_program(&parser);
+    free(src);
+    /* Leaked intentionally: this only ever runs inside a short-lived forked
+       child (see bir_try_compile_forked) that _exit()s right after, so the
+       process address space is reclaimed immediately either way. */
+    return (synthetic_program && synthetic_program->child_count > 0)
+        ? synthetic_program->children[0] : NULL;
+}
+
+/* Builds a shallow, non-owning filtered view of base's top-level children
+   for one compile attempt: drops the user's own `def main` (replaced by a
+   synthesized one, see bir_make_synthetic_main) and, when only_test_name is
+   non-NULL, every other test_ function too, so compiling the view can't be
+   broken by an unrelated test. *out_filtered aliases base's nodes; only its
+   ->children array is freshly allocated and must be freed by the caller.
+   Returns false (and leaves *out_filtered untouched) if the synthetic main
+   itself fails to build. */
+static bool bir_filter_program_view(ASTNode *base, ASTNode *out_filtered,
+                                    const char *const *test_names, size_t test_count,
+                                    const char *only_test_name) {
+    ASTNode *synthetic_main;
+    if (only_test_name) {
+        synthetic_main = bir_make_synthetic_main(&only_test_name, 1);
+    } else {
+        synthetic_main = bir_make_synthetic_main(test_names, test_count);
+    }
+    if (!synthetic_main) return false;
+
+    *out_filtered = *base;
+    ASTNode **kept = malloc(sizeof(ASTNode *) * (base->child_count + 1));
+    size_t kept_count = 0;
+    for (size_t i = 0; i < base->child_count; i++) {
+        ASTNode *child = base->children[i];
+        if (child->type == AST_FUNCTION && strcmp(child->name, "main") == 0) continue;
+        if (only_test_name && child->type == AST_FUNCTION &&
+            strncmp(child->name, "test_", 5) == 0 &&
+            strcmp(child->name, only_test_name) != 0) {
+            continue;
+        }
+        kept[kept_count++] = child;
+    }
+    kept[kept_count++] = synthetic_main;
+    out_filtered->children = kept;
+    out_filtered->child_count = kept_count;
+    return true;
+}
+
+/* Runs one already-linked test binary the same way the direct backend's
+   generated runner does: fork, poll with WNOHANG up to 5s, SIGKILL on
+   timeout. Returns PASS/FAIL (never SKIP; the binary already compiled). */
+static BirTestOutcome bir_run_test_binary(const char *binary_path) {
+    char run_path[512];
+    if (!make_local_exec_path(binary_path, run_path, sizeof(run_path))) return BIR_TEST_FAIL;
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        const char *argv[] = {run_path, NULL};
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+    if (pid < 0) return BIR_TEST_FAIL;
+    int status = 0;
+    int waited = 0;
+    bool finished = false;
+    while (waited < 500) {
+        pid_t done = waitpid(pid, &status, WNOHANG);
+        if (done == pid) { finished = true; break; }
+        if (done < 0) break;
+        usleep(10000);
+        waited++;
+    }
+    if (!finished) {
+        kill(pid, SIGKILL);
+        waitpid(pid, &status, 0);
+        return BIR_TEST_FAIL;
+    }
+    return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? BIR_TEST_PASS : BIR_TEST_FAIL;
+}
+
+/* Runs bir_backend_compile_program in a forked child. backend_ir was never
+   previously invoked more than once per process (every prior caller was a
+   one-shot `cobra build`/`cobra test` CLI invocation); calling it repeatedly
+   in this runner's loop uncovered that some HIR/SSA state does not reset
+   cleanly across calls in the same process (observed as heap corruption
+   inside bir_add_const on a later call after an earlier one). Forking gives
+   every attempt a pristine copy-on-write snapshot of this process's memory,
+   so one compiler crash or corruption can only take down that attempt's
+   child, never the measurement run. */
+static bool bir_try_compile_forked(ASTNode *view, const char *source_path,
+                                   const char *asm_path, char *errbuf, size_t errbuf_size) {
+    if (errbuf && errbuf_size) errbuf[0] = '\0';
+    char err_path[160];
+    snprintf(err_path, sizeof(err_path), "%s.err", asm_path);
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char err[512] = {0};
+        bool ok = bir_backend_compile_program(view, source_path, asm_path, err, sizeof(err));
+        if (!ok) {
+            FILE *f = fopen(err_path, "w");
+            if (f) { fputs(err, f); fclose(f); }
+        }
+        _exit(ok ? 0 : 1);
+    }
+    if (pid < 0) {
+        if (errbuf && errbuf_size) snprintf(errbuf, errbuf_size, "could not fork to compile");
+        return false;
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    bool ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (!ok && errbuf && errbuf_size) {
+        FILE *f = fopen(err_path, "r");
+        if (f) {
+            size_t n = fread(errbuf, 1, errbuf_size - 1, f);
+            errbuf[n] = '\0';
+            fclose(f);
+        } else if (WIFSIGNALED(status)) {
+            snprintf(errbuf, errbuf_size, "isolated backend compiler crashed (signal %d)", WTERMSIG(status));
+        } else {
+            snprintf(errbuf, errbuf_size, "isolated backend compile failed");
+        }
+    }
+    remove(err_path);
+    return ok;
+}
+
+/* Links asm_path (plus a synthesized runner_c calling `entry`) into
+   binary_path, reusing the same runtime-detection the direct test runner
+   uses (see run_native_tests above). `program` is the direct-backend-parsed
+   AST (with the full stdlib prelude) used only to decide which runtime .o's
+   to link; it is not compiled itself. */
+static bool bir_link_test_binary(const char *asm_path, const char *runner_c_path,
+                                 const char *binary_path, ASTNode *program) {
+    const char *runtime = ast_contains_parallel(program) ? parallel_runtime_path() : NULL;
+    const char *collections_runtime = ast_contains_collections(program) ? collections_runtime_path() : NULL;
+    const char *stackguard_runtime = stackguard_runtime_path();
+    const char *build_argv[300];
+    int build_argc = 0;
+    build_argv[build_argc++] = "gcc";
+    build_argv[build_argc++] = "-no-pie";
+    build_argv[build_argc++] = asm_path;
+    build_argv[build_argc++] = runner_c_path;
+    if (runtime) { build_argv[build_argc++] = runtime; build_argv[build_argc++] = "-pthread"; }
+    if (collections_runtime) build_argv[build_argc++] = collections_runtime;
+    if (stackguard_runtime) build_argv[build_argc++] = stackguard_runtime;
+    build_argc = append_import_libraries(program, build_argv, build_argc, 300);
+    if (build_argc < 0) return false;
+    build_argv[build_argc++] = "-lm";
+    build_argv[build_argc++] = "-o";
+    build_argv[build_argc++] = binary_path;
+    build_argv[build_argc] = NULL;
+    return process_succeeded(run_process(build_argv));
+}
+
+/* Writes a minimal C driver that calls a single extern test function and
+   exits 0/1 on its return status, matching the pass/fail convention the
+   direct backend's generated runner uses per-test (see run_native_tests). */
+/* The compiled asm always contains a `main` symbol (the synthesized one
+   from bir_make_synthetic_main, used only to root reachability) which would
+   collide with the synthesized single-call runner's own C `main` at link
+   time. Its machine code is never invoked once renamed; nothing calls it by
+   the old name. */
+static bool bir_rename_main_symbol(const char *asm_path) {
+    const char *argv[] = {"sed", "-i", "s/\\bmain\\b/__cobra_bir_synthetic_main/g", asm_path, NULL};
+    return process_succeeded(run_process(argv));
+}
+
+static bool bir_write_single_test_runner(const char *runner_c_path, const char *test_name) {
+    FILE *runner = fopen(runner_c_path, "w");
+    if (!runner) return false;
+    fprintf(runner, "#include <stdlib.h>\n");
+    fprintf(runner, "extern int %s(void);\n", test_name);
+    fprintf(runner, "int main(void) { int r = %s(); return r == 0 ? 0 : 1; }\n", test_name);
+    fclose(runner);
+    return true;
+}
+
+/* The isolated backend's native test runner. Discovers `def test_...`
+   functions the same way run_native_tests does, then tries to compile the
+   whole isolated-backend program at once (mirroring `cobra build
+   --backend=native`); if the whole program compiles, every discovered test
+   is PASS/FAIL like the direct runner. backend_ir does not yet support
+   every construct, so when the whole-program compile fails, this falls back
+   to compiling each test function individually (dropping every *other*
+   test_ function from the AST first) so one unsupported test doesn't hide
+   the pass/fail signal for the rest: a test whose individual compile also
+   fails is reported SKIP (backend_ir does not support it yet), which is
+   deliberately distinct from FAIL (backend_ir compiled it and it asserted
+   wrong) so convergence work can tell "not built yet" apart from "real
+   regression". */
+static bool run_native_tests_isolated(const char *source_path, ASTNode *program,
+                                      const CobraProjectConfig *project_config) {
+    CobraSourceBuffer isolated_buffer;
+    ASTNode *isolated_program = build_isolated_test_program(source_path, project_config, &isolated_buffer);
+    if (!isolated_program) {
+        fprintf(stderr, "[test] --backend=native could not load '%s'\n", source_path);
+        free(isolated_buffer.data);
+        return false;
+    }
+
+    size_t test_count = 0;
+    for (size_t i = 0; i < isolated_program->child_count; i++) {
+        ASTNode *function = isolated_program->children[i];
+        if (function->type != AST_FUNCTION || strncmp(function->name, "test_", 5) != 0) continue;
+        for (size_t j = 0; j < function->child_count; j++) {
+            if (function->children[j]->type == AST_PARAM) {
+                fprintf(stderr, "[test] Native tests must have no parameters: %s()\n", function->name);
+                ast_free(isolated_program);
+                free(isolated_buffer.data);
+                return false;
+            }
+        }
+        if (function->declared_type == COBRA_TYPE_VOID ||
+            function->declared_type == COBRA_TYPE_F32 ||
+            function->declared_type == COBRA_TYPE_F64 ||
+            function->declared_type == COBRA_TYPE_V256) {
+            fprintf(stderr, "[test] Native tests must return an integer status: %s()\n", function->name);
+            ast_free(isolated_program);
+            free(isolated_buffer.data);
+            return false;
+        }
+        test_count++;
+    }
+    if (test_count == 0) {
+        fprintf(stderr, "[test] No test_ functions found\n");
+        ast_free(isolated_program);
+        free(isolated_buffer.data);
+        return false;
+    }
+
+    char asm_path[128], runner_c_path[128], binary_path[128];
+    long pid = (long)getpid();
+    snprintf(asm_path, sizeof(asm_path), ".cobra_test_bir_%ld.s", pid);
+    snprintf(runner_c_path, sizeof(runner_c_path), ".cobra_test_bir_%ld.c", pid);
+    snprintf(binary_path, sizeof(binary_path), ".cobra_test_bir_%ld", pid);
+
+    const char *test_names[512];
+    size_t test_name_count = 0;
+    for (size_t i = 0; i < isolated_program->child_count && test_name_count < 512; i++) {
+        ASTNode *function = isolated_program->children[i];
+        if (function->type == AST_FUNCTION && strncmp(function->name, "test_", 5) == 0) {
+            test_names[test_name_count++] = function->name;
+        }
+    }
+
+    ASTNode whole_view;
+    bool whole_view_built = bir_filter_program_view(isolated_program, &whole_view,
+                                                     test_names, test_name_count, NULL);
+    char whole_err[512] = {0};
+    bool whole_ok = whole_view_built &&
+        bir_try_compile_forked(&whole_view, source_path, asm_path, whole_err, sizeof(whole_err));
+    if (whole_view_built) free(whole_view.children);
+    if (whole_ok) whole_ok = bir_rename_main_symbol(asm_path);
+
+    size_t passed = 0, failed = 0, skipped = 0;
+
+    if (whole_ok) {
+        /* Fast path: one compile of the whole program (reachability rooted
+           at a synthesized main that calls every test); link a tiny
+           single-call runner against that same asm_path per test, so a
+           crash in one test process can't take down measurement of the
+           rest (each test is its own child process either way). */
+        for (size_t i = 0; i < isolated_program->child_count; i++) {
+            ASTNode *function = isolated_program->children[i];
+            if (function->type != AST_FUNCTION || strncmp(function->name, "test_", 5) != 0) continue;
+            if (!bir_write_single_test_runner(runner_c_path, function->name)) {
+                fprintf(stderr, "[test] Could not create native test runner\n");
+                continue;
+            }
+            char test_binary[256];
+            snprintf(test_binary, sizeof(test_binary), "%s_%s", binary_path, function->name);
+            BirTestOutcome outcome;
+            if (!bir_link_test_binary(asm_path, runner_c_path, test_binary, program)) {
+                outcome = BIR_TEST_FAIL;
+            } else {
+                outcome = bir_run_test_binary(test_binary);
+            }
+            remove(test_binary);
+            if (outcome == BIR_TEST_PASS) { printf("  PASS: %s()\n", function->name); passed++; }
+            else { printf("  FAIL: %s()\n", function->name); failed++; }
+        }
+        remove(runner_c_path);
+        remove(asm_path);
+    } else {
+        /* Whole program didn't compile under backend_ir; isolate each test
+           function (with its own synthesized single-test main, so
+           reachability is precise per attempt) so an unsupported construct
+           in one doesn't hide the signal for the rest. */
+        for (size_t i = 0; i < isolated_program->child_count; i++) {
+            ASTNode *function = isolated_program->children[i];
+            if (function->type != AST_FUNCTION || strncmp(function->name, "test_", 5) != 0) continue;
+
+            ASTNode filtered;
+            bool filtered_built = bir_filter_program_view(isolated_program, &filtered,
+                                                           NULL, 0, function->name);
+            char single_err[512] = {0};
+            bool single_ok = filtered_built &&
+                bir_try_compile_forked(&filtered, source_path, asm_path, single_err, sizeof(single_err));
+            if (filtered_built) free(filtered.children);
+            if (single_ok) single_ok = bir_rename_main_symbol(asm_path);
+
+            if (!single_ok) {
+                printf("  SKIP: %s() (unsupported by backend_ir: %s)\n", function->name,
+                       single_err[0] ? single_err : "unknown");
+                skipped++;
+                continue;
+            }
+            if (!bir_write_single_test_runner(runner_c_path, function->name)) {
+                fprintf(stderr, "[test] Could not create native test runner\n");
+                remove(asm_path);
+                skipped++;
+                continue;
+            }
+            BirTestOutcome outcome;
+            if (!bir_link_test_binary(asm_path, runner_c_path, binary_path, program)) {
+                outcome = BIR_TEST_FAIL;
+            } else {
+                outcome = bir_run_test_binary(binary_path);
+            }
+            remove(binary_path);
+            remove(runner_c_path);
+            remove(asm_path);
+            if (outcome == BIR_TEST_PASS) { printf("  PASS: %s()\n", function->name); passed++; }
+            else { printf("  FAIL: %s()\n", function->name); failed++; }
+        }
+    }
+
+    printf("-----------------------------------------\n");
+    printf("Result: %zu passed, %zu failed, %zu skipped (unsupported)\n", passed, failed, skipped);
+
+    ast_free(isolated_program);
+    free(isolated_buffer.data);
+    return failed == 0;
+}
+
 static void run_update(void) {
     printf("[update] Checking GitHub (Aaron-Savron/Cobra) for latest release...\n");
     int pipe_fds[2];
@@ -2046,12 +2449,23 @@ int main(int argc, char **argv) {
 
     if (strcmp(command, "test") == 0) {
         if (use_isolated_backend) {
-            fprintf(stderr, "Error: 'cobra test --backend=native' is not supported yet; "
-                             "the isolated backend has no native test runner. Use "
-                             "'cobra build --backend=native' to check that a program compiles.\n");
+            if (!native_test_cpu_supports_compute(program, "[test] @compute tests")) {
+                free(combined_source);
+                ast_free(program);
+                return 1;
+            }
+            if (program_has_tensor_kernel && (!host_supports_avx2() || !host_supports_fma())) {
+                fprintf(stderr, "[test] f32 tensor intrinsics require AVX2 and FMA support on the host CPU\n");
+                free(combined_source);
+                ast_free(program);
+                return 1;
+            }
+            printf("[test] Cobra Native Test Runner (Linux x86_64, backend_ir)\n");
+            printf("[test] Compiling test functions for the host CPU...\n");
+            bool passed = run_native_tests_isolated(source_path, program, &project_config);
             free(combined_source);
             ast_free(program);
-            return 1;
+            return passed ? 0 : 1;
         }
         CobraIR test_ir;
         if (!cobra_ir_build(program, &test_ir)) {

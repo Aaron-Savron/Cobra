@@ -1692,4 +1692,105 @@ threading this note worried about turned out not to need a new
 `element_dyn_trait_name`-shaped field: it reuses `IRLocal`/`VarSymbol`'s
 existing (otherwise-idle-for-a-list) `dyn_trait_name` field on the list's
 own local/symbol instead, and `list[T]` parsing gained a `dyn` case
+
+## `cobra test --backend=native`: a real native test runner for backend_ir
+
+Every parity measurement of backend_ir up to this point went through
+`cobra build <file> --backend=native`, checked only against the 41
+`def main`-entry-point examples. The other 118 example files - the actual
+regression suite, each with one or more `def test_...` functions and
+internal `assert()` calls, normally run via `cobra test` against the direct
+backend - had never once been run through backend_ir. `cobra test
+--backend=native` was previously made to error out outright ("the isolated
+backend has no native test runner") rather than silently run the direct
+backend and lie about the result, which was correct as far as it went but
+left a real measurement gap. That gap is now closed: `cobra test
+--backend=native` runs a real backend_ir test runner (`src/main.c`,
+`run_native_tests_isolated` and friends), output-compatible with the
+direct backend's `PASS: name()` / `FAIL: name()` / `Result: N passed, M
+failed` format, plus a third state direct testing has no precedent for.
+
+Design: PASS/FAIL/SKIP, not just PASS/FAIL. backend_ir does not support
+every construct a test might use, and conflating "backend_ir doesn't build
+this yet" with "backend_ir built this and got the wrong answer" would make
+the numbers useless for prioritizing convergence work. So:
+- The runner first tries to compile the whole program at once (mirroring
+  `cobra build --backend=native`), rooted at a *synthesized* `main` that
+  calls every discovered `test_...` function - not the user's own `main`,
+  which is dropped. This matters mechanically as well as semantically:
+  `bir_build_program`'s reachability pass (`mark_reachable_functions` in
+  hir.c) only tolerates an "unsupported construct" failure as skippable
+  when the failing function is unreachable from a top-level function
+  literally named `main`; with no `main` at all it conservatively treats
+  every top-level declaration as reachable, so a single unsupported
+  construct anywhere across the six always-linked prelude libraries
+  (std/mem/fs/cpu/time/net) would fail the *entire* compile regardless of
+  whether the test in question ever touches it. Rooting reachability at a
+  synthetic `main(): { test_a(); test_b(); ... }` makes pruning precise:
+  prelude code no test actually uses is dropped instead of failing the
+  build, while a genuinely unsupported construct in a *reachable* test
+  still fails that attempt. The synthesized `main`'s compiled code is
+  never invoked - it exists purely to root reachability - so its symbol is
+  renamed post-compile (`sed` over the emitted assembly) before linking
+  against a tiny generated single-call C runner per test, avoiding a
+  `main`/`main` link collision.
+- If the whole program compiles, every test is genuinely PASS/FAIL, run
+  the same way the direct runner isolates each test (its own process,
+  polled with a timeout, SIGKILL on hang).
+- If the whole program does not compile, the runner falls back to
+  compiling each test function individually - dropping every *other*
+  `test_` function from the AST and synthesizing a `main` that calls only
+  that one - so one unsupported test can't hide the pass/fail signal for
+  the rest. A test whose individual compile also fails is reported `SKIP:
+  name() (unsupported by backend_ir: <reason>)`; a test that compiles is
+  run and reported PASS or FAIL exactly as in the fast path.
+- Every `bir_backend_compile_program` call runs inside a forked child, not
+  the CLI process itself. This uncovered a real, separate backend_ir bug:
+  it had never previously been invoked more than once per process (every
+  prior caller was a one-shot `cobra build`/`cobra test` invocation), and
+  calling it repeatedly in this runner's loop reproducibly corrupted the
+  heap on a later call (`bir_add_const`'s realloc segfaulting on bad heap
+  metadata) after an earlier one. Forking gives each attempt a pristine
+  copy-on-write snapshot, so this latent cross-call state bug - worth
+  fixing in backend_ir itself at some point - can no longer take down the
+  whole measurement run.
+
+Real numbers, measured for the first time across the full 118-file suite
+(`for f in examples/*.cb; do grep -qE '^def test_' "$f" && ./cobra test
+"$f" --backend=native; done`), by individual test function:
+
+- **107 passed**, **20 failed**, **165 skipped (unsupported)** - 292 test
+  functions total.
+- By file: 46 files pass every test with nothing skipped, 52 files skip
+  every test (backend_ir cannot yet build any test in the file), 13 files
+  have at least one real failure, and the remaining 7 are a mix of passing
+  and skipped tests with no failures.
+- The 20 real failures (backend_ir compiles the test but produces the
+  wrong answer) cluster tightly: `list[T]` value semantics
+  (examples/121_generic_list_struct.cb, 142_list_return_value.cb,
+  165_list_pop.cb), collections (35_collections.cb), and the fs/net/time
+  stdlib wrapper result types (63_time_results.cb, 64_fs_results.cb,
+  65_net_results.cb) plus memory-contract edge cases
+  (97_memory_contracts.cb). These are genuine regressions, not compile
+  gaps, and are the most concrete next-work list this backend has had.
+- The skips are dominated by constructs already known to be unsupported
+  from the `cobra build --backend=native` def-main survey above: closures
+  (`apply: parameter 'f' is outside the backend-IR subset`), generic
+  aggregate/struct layouts, and GPU-dispatched tensor builtins
+  (`sum_f32`/`matmul_f32`/etc.) - plus some newly visible ones specific to
+  the assertion-test corpus, like nested-struct ownership verification
+  failures (`cannot lower unverified SSA: ... stores an invalid or
+  already-owned struct field`, examples/132_nested_struct_autofree.cb).
+
+Verified: a deliberately broken assertion in a normally-passing test
+(examples/100_generic_functions.cb, `assert(value_i64 == 7)` changed to
+`== 999`) correctly reports `FAIL: test_generic_functions()`, matching the
+direct backend's own report for the same break, then reverted cleanly. A
+test using an unsupported construct (closures) correctly reports SKIP
+without crashing or silently vanishing from the count. Full regression
+check after adding this: `cobra test` (direct backend, no flag) is
+unaffected - all 118 example files still pass with 0 regressions; all 114
+`tests/negative/*.cb` cases are still rejected by `cobra check`; `make
+type-tests` and `make backend-ir-tests` (1629 checks, 0 failures) are
+unaffected.
 directly in `parser_component_type`'s list branch.
