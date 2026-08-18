@@ -14,6 +14,12 @@
 #define COBRA_FRAME_BYTES 4096
 #define COBRA_LOCAL_BASE 256
 #define COBRA_FRAME_LIMIT 4000
+/* Ordinary functions get their real, buffered-and-patched frame size (see
+   emit_function), so they don't need to share the flat-frame ceiling that
+   @parallel workers/thunks still use unpatched. A function that genuinely
+   needs large local storage (big fixed arrays, etc.) should be able to get
+   it instead of hitting "native frame exhausted" at the old 4000 mark. */
+#define COBRA_FRAME_LIMIT_LARGE (1 << 20)
 #define COBRA_SCR_M 160
 #define COBRA_SCR_N 168
 #define COBRA_SCR_K 176
@@ -117,6 +123,7 @@ typedef struct {
     VarSymbol symbols[256];
     int symbol_count;
     int stack_offset;
+    int stack_limit;
     int label_count;
     int string_count;
     int const_count;
@@ -933,7 +940,8 @@ static bool expression_is_float_codegen(CodeGen *cg, ASTNode *node) {
 static int reserve(CodeGen *cg, int bytes) {
     int aligned = (bytes + 7) & ~7;
     if (cg->stack_offset < COBRA_LOCAL_BASE) cg->stack_offset = COBRA_LOCAL_BASE;
-    if (cg->stack_offset + aligned > COBRA_FRAME_LIMIT) {
+    int limit = cg->stack_limit ? cg->stack_limit : COBRA_FRAME_LIMIT;
+    if (cg->stack_offset + aligned > limit) {
         fprintf(stderr, "CodeGen Error: native frame exhausted\n"); exit(EXIT_FAILURE);
     }
     cg->stack_offset += aligned;
@@ -4429,6 +4437,7 @@ static void flush_pending_parallel(CodeGen *cg) {
 
         cg->symbol_count = 0;
         cg->stack_offset = COBRA_LOCAL_BASE;
+        cg->stack_limit = COBRA_FRAME_LIMIT;
         cg->loop_depth = 0;
 
         fprintf(cg->out, "    .type cobra_par_worker_%d, @function\ncobra_par_worker_%d:\n    push rbp\n    mov rbp, rsp\n    sub rsp, %d\n    mov QWORD PTR [rbp-248], rbx\n", pw->id, pw->id, COBRA_FRAME_BYTES);
@@ -5495,7 +5504,7 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
 }
 
 static void emit_function(CodeGen *cg, ASTNode *fn) {
-    cg->symbol_count = 0; cg->stack_offset = COBRA_LOCAL_BASE; cg->loop_depth = 0;
+    cg->symbol_count = 0; cg->stack_offset = COBRA_LOCAL_BASE; cg->stack_limit = COBRA_FRAME_LIMIT_LARGE; cg->loop_depth = 0;
     compute_safe_autofree_structs(cg, fn);
     cg->current_return_type = fn->declared_type;
     cg->current_return_payload_type = ast_element_kind(fn);
@@ -5691,7 +5700,12 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
        reset cg->stack_offset for their own separate function frames. */
     int frame_size = (cg->stack_offset + 15) & ~15;
     if (frame_size < COBRA_LOCAL_BASE) frame_size = COBRA_LOCAL_BASE;
-    if (frame_size > COBRA_FRAME_BYTES) frame_size = COBRA_FRAME_BYTES;
+    /* reserve() already refuses to grow cg->stack_offset past stack_limit
+       (COBRA_FRAME_LIMIT_LARGE here), so this is just the matching 16-byte-
+       aligned ceiling - not the old flat COBRA_FRAME_BYTES cap, which used
+       to silently truncate any function whose real usage exceeded 4096. */
+    int aligned_limit = (COBRA_FRAME_LIMIT_LARGE + 15) & ~15;
+    if (frame_size > aligned_limit) frame_size = aligned_limit;
 
     fclose(mem);
     cg->out = real_out;

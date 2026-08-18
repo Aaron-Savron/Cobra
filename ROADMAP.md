@@ -1573,6 +1573,28 @@ separate function frames emitted after this function's frame size is
 captured and flushed, so they're unaffected and still use the flat
 `COBRA_FRAME_BYTES` reservation -- narrowing that is future work.
 
+That first pass left a second half of the same bug unfixed: `reserve()`
+still refused any function's real usage past `COBRA_FRAME_LIMIT` (4000
+bytes), and `emit_function` still clamped its patched `sub rsp` to the old
+flat `COBRA_FRAME_BYTES` (4096) even after computing a larger real peak --
+so a function that legitimately needed more than one page of locals still
+hit "native frame exhausted" at compile time or got silently truncated,
+same as before. Fixed by giving `CodeGen` a `stack_limit` field that
+`reserve()` checks instead of the hardcoded constant: ordinary functions
+now compile against a much larger `COBRA_FRAME_LIMIT_LARGE` (1MB) ceiling,
+while @parallel workers/fn-thunks (which still use the flat, unpatched
+frame) keep the original `COBRA_FRAME_LIMIT` so their real usage can never
+exceed what they actually reserve. `emit_function`'s frame-size clamp now
+matches `COBRA_FRAME_LIMIT_LARGE` instead of the old 4096 ceiling.
+Verified with a function declaring twenty 32-field structs as locals
+(5712 bytes of real usage, `sub rsp, 5712` in the emitted assembly,
+confirmed by inspection) that previously would have been rejected outright
+by the 4000-byte `reserve()` ceiling; it now compiles and runs correctly.
+Full regression re-run after this change: all 118 `examples/*.cb` test
+files (`cobra test`) pass, all 114 `tests/negative/*.cb` cases are still
+rejected by `cobra check`, `make type-tests` and `make backend-ir-tests`
+(1629 checks) are unaffected.
+
 Tightening the frame size exposed two real, previously-latent bugs that
 the old 4096-byte margin had silently absorbed -- both fixed alongside
 the frame-size change, since shipping the tighter frame without them
