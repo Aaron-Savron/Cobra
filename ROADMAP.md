@@ -586,17 +586,26 @@ Finish the language contracts for:
 - [x] (isolated backend / `--backend=native` only, see `tests/backend_ir.c`'s
   `test_source_generic_writable_slices`) Scalar mutable generic slices through
   `out []T` writable views, including indexed stores, calls, borrowed returns,
-  provenance, and borrow-contract checks. The direct/production backend
-  (`src/ir.c`) explicitly rejects this today with "generic collection
-  parameters are reserved for the backend-v2 path" - this checklist line was
-  previously unqualified and read as if it covered the production backend,
-  which it never did; corrected after an investigation confirmed there is no
-  scalar `out []T` generic-parameter binding, provenance checking, or codegen
-  anywhere in the direct backend to extend. Building it there is a real,
-  separate, from-scratch undertaking, not a small extension.
-- [ ] Non-scalar mutable generic slices (direct backend). Blocked on the item
-  above: this needs scalar `out []T` generic-parameter support in the direct
-  backend to exist first.
+  provenance, and borrow-contract checks.
+- [x] Scalar `out []T` generic slice parameters in the direct/production
+  backend (`src/ir.c`, `examples/171_generic_writable_slice.cb`). The old
+  blanket rejection ("generic collection parameters are reserved for the
+  backend-v2 path") turned out to be broader than necessary: the ordinary
+  scalar generic-function specialization machinery
+  (`specialize_generic_function` / `cobra_type_bind_generic` /
+  `cobra_type_substitute`) already binds and substitutes generic slice types
+  correctly, including under `out` mutability - the rejection was only ever
+  needed for dynamic `COBRA_TYPE_LIST` generics, which is what it's now
+  scoped to. Indexed load/store through a bound scalar `out []T` view
+  monomorphizes per concrete T exactly like a non-generic `out []i64`/`out
+  []f32` parameter, with the same borrow-contract and provenance checks. Also
+  confirmed (not assumed) that scalar `readonly []T` element access already
+  worked end to end; the "operator '==' cannot combine T and i64" failure
+  from an earlier probe reproduces on plain scalar `T` params with no slice
+  involved (`v == 1` inside a generic function returning `bool`) and is an
+  unrelated, pre-existing generic-comparison-return-type gap, left as-is.
+- [ ] Non-scalar mutable generic slices (direct backend). Blocked on
+  struct-typed T support, which stays out of scope here.
 - [x] Lifetime-aware generic returns for scalar `readonly []T` and `out []T`
   specializations, with one source view parameter, call-boundary provenance,
   and frame or region escape rejection

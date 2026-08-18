@@ -1,0 +1,44 @@
+# Scalar out []T generic slice parameters monomorphize per concrete T,
+# reusing the same specialize_generic_function path as scalar generic
+# functions (see 103_generic_readonly_slices.cb for the readonly side).
+
+def set_first[T](values: out []T, val: T) -> void: {
+    values[0] = val
+}
+
+def swap_ends[T](values: out []T) -> void: {
+    let n = len(values)
+    let tmp = values[0]
+    values[0] = values[n - 1]
+    values[n - 1] = tmp
+}
+
+def test_generic_writable_slice_i64() -> i64: {
+    let ints: []i64 = alloc_i64(3)
+    set_first(ints, 42)
+    assert(ints[0] == 42)
+
+    ints[1] = 7
+    ints[2] = 9
+    swap_ends(ints)
+    assert(ints[0] == 9)
+    assert(ints[2] == 42)
+
+    free(ints)
+    return 0
+}
+
+def test_generic_writable_slice_f32() -> i64: {
+    let floats: []f32 = alloc_f32(3)
+    set_first(floats, 1.5)
+    assert(floats[0] == 1.5)
+
+    floats[1] = 2.5
+    floats[2] = 3.5
+    swap_ends(floats)
+    assert(floats[0] == 3.5)
+    assert(floats[2] == 1.5)
+
+    free(floats)
+    return 0
+}

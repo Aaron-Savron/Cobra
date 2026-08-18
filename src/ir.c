@@ -4846,25 +4846,16 @@ bool cobra_ir_build(ASTNode *root, CobraIR *ir) {
         if (function->type != AST_FUNCTION) continue;
         if (function->generic_param_count > 0) {
             /* The production validator still does not instantiate generic
-               collections. Keep the parser permissive for backend-v2
-               monomorphization, but preserve the production rejection until
-               that path is integrated. */
+               list collections (dynamic COBRA_TYPE_LIST). Fixed-width
+               scalar out []T / readonly []T slices reuse the ordinary
+               scalar generic-function specialization path below (via
+               specialize_generic_function / cobra_type_bind_generic) and
+               are monomorphized per concrete T like any other scalar
+               generic parameter, so they are not rejected here. */
             for (size_t parameter = 0; parameter < function->child_count; parameter++) {
                 ASTNode *param = function->children[parameter];
                 if (param->type != AST_PARAM) continue;
-                bool generic_collection = param->declared_type == COBRA_TYPE_LIST;
-                if (!generic_collection && param->canonical_type &&
-                    generic_slice_kind(param->canonical_type->kind) &&
-                    param->canonical_type->mutability == COBRA_MUTABILITY_OUT) {
-                    for (size_t s = 0; s < function->generic_param_count; s++) {
-                        if (type_contains_generic_type(param->canonical_type,
-                                                       function->generic_param_types[s])) {
-                            generic_collection = true;
-                            break;
-                        }
-                    }
-                }
-                if (!generic_collection) continue;
+                if (param->declared_type != COBRA_TYPE_LIST) continue;
                 ir_error(&root_context, param,
                          "generic collection parameters are reserved for the backend-v2 path");
                 ir->error_count++;
