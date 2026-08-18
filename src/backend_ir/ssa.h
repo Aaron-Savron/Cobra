@@ -218,6 +218,7 @@ typedef enum {
     SSA_OP_DIV,
     SSA_OP_REM,
     SSA_OP_NEG,
+    SSA_OP_CONVERT,        /* scalar numeric/bool -> scalar numeric/bool, runtime conversion */
     SSA_OP_EQ,
     SSA_OP_NE,
     SSA_OP_LT,
@@ -414,7 +415,8 @@ typedef enum {
     HIR_EXPR_DICT_GET,      /* dict lookup with fallback (d["key"] read)      */
     HIR_EXPR_DICT_HAS,      /* dict membership test                          */
     HIR_EXPR_DICT_POP,      /* dict pop with fallback (moves the dict local) */
-    HIR_EXPR_DICT_LEN       /* dict logical entry count                      */
+    HIR_EXPR_DICT_LEN,      /* dict logical entry count                      */
+    HIR_EXPR_CAST           /* expr as Type: runtime scalar/bool conversion   */
 } HirExprKind;
 
 typedef struct HirExpr HirExpr;

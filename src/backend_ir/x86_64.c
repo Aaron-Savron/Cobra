@@ -482,6 +482,70 @@ static bool x86_emit_neg(X86Context *ctx, const MirInst *inst) {
     return x86_emit_store_integer(ctx, inst->result, "%r10", "%r10d");
 }
 
+/* Loads an int/bool operand into a 64-bit GPR holding its true mathematical
+   value (sign-extended for i32, zero-extended for u8/bool/u32, raw for
+   i64/u64), unlike x86_emit_load_integer which only loads the width the
+   value's own arithmetic needs and leaves wider bits unspecified. CONVERT is
+   the one place that widening/narrowing crosses type boundaries, so it needs
+   the honest value rather than the width-local convention. */
+static void x86_emit_convert_widen(X86Context *ctx, MirReg reg, const char *target64,
+                                   const char *target32) {
+    MirMachineType type = ctx->module->arena.regs[reg].machine_type;
+    fprintf(ctx->out, "    ");
+    if (type == MIR_TYPE_I8 || type == MIR_TYPE_BOOL) {
+        fprintf(ctx->out, "movzbq ");
+        x86_reg_mem(ctx->out, ctx, reg);
+        fprintf(ctx->out, ", %s\n", target64);
+    } else if (type == MIR_TYPE_I32) {
+        fprintf(ctx->out, "movslq ");
+        x86_reg_mem(ctx->out, ctx, reg);
+        fprintf(ctx->out, ", %s\n", target64);
+    } else if (type == MIR_TYPE_U32) {
+        fprintf(ctx->out, "movl ");
+        x86_reg_mem(ctx->out, ctx, reg);
+        fprintf(ctx->out, ", %s\n", target32);
+    } else {
+        fprintf(ctx->out, "movq ");
+        x86_reg_mem(ctx->out, ctx, reg);
+        fprintf(ctx->out, ", %s\n", target64);
+    }
+}
+
+static bool x86_emit_convert(X86Context *ctx, const MirInst *inst) {
+    MirReg operand = ctx->module->arena.operands[inst->operand_start];
+    MirMachineType from = ctx->module->arena.regs[operand].machine_type;
+    MirMachineType to = inst->machine_type;
+    if (x86_is_float(from) && x86_is_float(to)) {
+        x86_emit_load_float(ctx, operand, "%xmm14");
+        if (from != to)
+            fprintf(ctx->out, "    %s %%xmm14, %%xmm14\n", to == MIR_TYPE_F64 ? "cvtss2sd" : "cvtsd2ss");
+        return x86_emit_store_float(ctx, inst->result, "%xmm14");
+    }
+    if (x86_is_float(from)) {
+        x86_emit_load_float(ctx, operand, "%xmm14");
+        if (to == MIR_TYPE_BOOL) {
+            fprintf(ctx->out, "    pxor %%xmm15, %%xmm15\n    ucomis%s %%xmm15, %%xmm14\n"
+                              "    setne %%al\n    movzbl %%al, %%r10d\n",
+                    from == MIR_TYPE_F32 ? "s" : "d");
+            return x86_emit_store_integer(ctx, inst->result, "%r10", "%r10d");
+        }
+        /* Truncating conversion (matches direct backend's emit_cast_int_width
+           reference: cvttss2si/cvttsd2si, never the rounding cvtsi variant). */
+        fprintf(ctx->out, "    %s %%xmm14, %%r10\n", from == MIR_TYPE_F32 ? "cvttss2si" : "cvttsd2si");
+        return x86_emit_store_integer(ctx, inst->result, "%r10", "%r10d");
+    }
+    x86_emit_convert_widen(ctx, operand, "%r10", "%r10d");
+    if (x86_is_float(to)) {
+        fprintf(ctx->out, "    %s %%r10, %%xmm14\n", to == MIR_TYPE_F32 ? "cvtsi2ss" : "cvtsi2sd");
+        return x86_emit_store_float(ctx, inst->result, "%xmm14");
+    }
+    if (to == MIR_TYPE_BOOL) {
+        fprintf(ctx->out, "    testq %%r10, %%r10\n    setne %%al\n    movzbl %%al, %%r10d\n");
+        return x86_emit_store_integer(ctx, inst->result, "%r10", "%r10d");
+    }
+    return x86_emit_store_integer(ctx, inst->result, "%r10", "%r10d");
+}
+
 static bool x86_emit_compare(X86Context *ctx, const MirInst *inst) {
     MirReg lhs = ctx->module->arena.operands[inst->operand_start];
     MirReg rhs = ctx->module->arena.operands[inst->operand_start + 1];
@@ -1516,6 +1580,7 @@ static bool x86_emit_instruction(X86Context *ctx, const MirInst *inst) {
             if (x86_is_float(inst->machine_type)) return x86_emit_binary(ctx, inst);
             return x86_emit_div_rem(ctx, inst);
         case MIR_OP_NEG: return x86_emit_neg(ctx, inst);
+        case MIR_OP_CONVERT: return x86_emit_convert(ctx, inst);
         case MIR_OP_EQ:
         case MIR_OP_NE:
         case MIR_OP_LT:

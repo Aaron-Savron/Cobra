@@ -50,6 +50,7 @@ typedef enum {
     MIR_OP_DIV,
     MIR_OP_REM,
     MIR_OP_NEG,
+    MIR_OP_CONVERT,
     MIR_OP_EQ,
     MIR_OP_NE,
     MIR_OP_LT,

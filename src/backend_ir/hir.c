@@ -1937,6 +1937,33 @@ static bool hir_complete_float_expr(HirBuilder *b, HirExpr *expr,
     return true;
 }
 
+/* Maps a parsed 'as Type' target kind onto this module's canonical scalar
+   type, or NULL for anything cast can't produce (f64 is filtered by the
+   caller before this is reached, so only truly non-scalar kinds land here). */
+static const CobraType *hir_cobra_scalar_type(HirBuilder *b, CobraTypeKind kind) {
+    switch (kind) {
+        case COBRA_TYPE_I32: return b->module->type_i32;
+        case COBRA_TYPE_I64: return b->module->type_i64;
+        case COBRA_TYPE_U8: return b->module->type_u8;
+        case COBRA_TYPE_U32: return b->module->type_u32;
+        case COBRA_TYPE_U64: return b->module->type_u64;
+        case COBRA_TYPE_F32: return b->module->type_f32;
+        case COBRA_TYPE_F64: return b->module->type_f64;
+        case COBRA_TYPE_BOOL: return b->module->type_bool;
+        default: return NULL;
+    }
+}
+
+static bool hir_is_scalar_convert_type(HirBuilder *b, const CobraType *type) {
+    return bir_types_equal(type, b->module->type_i64) ||
+           bir_types_equal(type, b->module->type_i32) ||
+           bir_types_equal(type, b->module->type_u32) ||
+           bir_types_equal(type, b->module->type_u64) ||
+           bir_types_equal(type, b->module->type_u8) ||
+           bir_types_equal(type, b->module->type_f32) ||
+           bir_types_equal(type, b->module->type_bool);
+}
+
 static bool hir_is_numeric(const CobraType *type, const BackendIrModule *module) {
     return bir_types_equal(type, module->type_i64) ||
            bir_types_equal(type, module->type_i32) ||
@@ -3465,6 +3492,48 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                 expr->args[1] = zero;
                 expr->arg_count = 2;
             }
+            break;
+        }
+        case AST_CAST_EXPR: {
+            /* Mirrors ir.c's AST_CAST_EXPR check exactly: f64 is reserved
+               language-wide until native double-precision lowering lands,
+               and 'as' only ever converts among the scalar numeric/bool
+               kinds - never structs, slices, strings, or sums. */
+            const CobraType *target = hir_cobra_scalar_type(b, node->declared_type);
+            if (node->declared_type == COBRA_TYPE_F64 || !target) {
+                bir_fail(b, node->source_line, node->source_col,
+                         "f64 is reserved until native double-precision lowering is implemented");
+                return false;
+            }
+            if (node->child_count != 1) {
+                bir_fail(b, node->source_line, node->source_col,
+                         "cast requires exactly one source expression");
+                return false;
+            }
+            HirExpr *source = NULL;
+            if (!hir_build_expr(b, node->children[0], &source)) return false;
+            if (!hir_complete_float_expr(b, source, b->module->type_f32)) {
+                hir_expr_free(source);
+                return false;
+            }
+            if (source->type == b->module->type_f64 || !hir_is_scalar_convert_type(b, source->type)) {
+                bir_fail(b, node->source_line, node->source_col,
+                         "cannot cast this expression; 'as' only converts between numeric and bool scalar types");
+                hir_expr_free(source);
+                return false;
+            }
+            expr = hir_expr_alloc(b, node->source_line, node->source_col);
+            if (!expr) { hir_expr_free(source); return false; }
+            expr->kind = HIR_EXPR_CAST;
+            expr->type = target;
+            expr->args = calloc(1, sizeof(HirExpr *));
+            if (!expr->args) {
+                hir_expr_free(source);
+                hir_expr_free(expr);
+                return false;
+            }
+            expr->args[0] = source;
+            expr->arg_count = 1;
             break;
         }
         default:

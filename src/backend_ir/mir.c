@@ -129,6 +129,7 @@ static MirOpcode mir_opcode_for_ssa(SsaOpcode op) {
         case SSA_OP_DIV: return MIR_OP_DIV;
         case SSA_OP_REM: return MIR_OP_REM;
         case SSA_OP_NEG: return MIR_OP_NEG;
+        case SSA_OP_CONVERT: return MIR_OP_CONVERT;
         case SSA_OP_EQ: return MIR_OP_EQ;
         case SSA_OP_NE: return MIR_OP_NE;
         case SSA_OP_LT: return MIR_OP_LT;
@@ -197,6 +198,7 @@ const char *mir_opcode_name(MirOpcode op) {
         case MIR_OP_DIV: return "div";
         case MIR_OP_REM: return "rem";
         case MIR_OP_NEG: return "neg";
+        case MIR_OP_CONVERT: return "convert";
         case MIR_OP_EQ: return "eq";
         case MIR_OP_NE: return "ne";
         case MIR_OP_LT: return "lt";
@@ -798,6 +800,10 @@ static bool mir_type_is_numeric(MirMachineType type) {
            type == MIR_TYPE_F64;
 }
 
+static bool mir_type_is_convert_scalar(MirMachineType type) {
+    return mir_type_is_numeric(type) || type == MIR_TYPE_BOOL;
+}
+
 static bool mir_check_edge(const MirModule *module, MirBlockRef target,
                            uint32_t start, uint32_t count, char *err,
                            size_t err_size) {
@@ -923,6 +929,18 @@ static bool mir_check_instruction(const MirModule *module, size_t function_index
                 !mir_type_is_numeric(inst->machine_type) ||
                 arena->regs[arena->operands[inst->operand_start]].machine_type != inst->machine_type) {
                 mir_set_error(err, err_size, "MIR negation has an invalid signature");
+                return false;
+            }
+            break;
+        case MIR_OP_CONVERT:
+            /* Deliberately not the equal-type shape every other unary op
+               uses above: convert's operand and result machine types are
+               independent, each only constrained to the scalar-convert set. */
+            if (inst->operand_count != 1 || inst->result == MIR_REG_NONE ||
+                !mir_type_is_convert_scalar(inst->machine_type) ||
+                !mir_type_is_convert_scalar(
+                    arena->regs[arena->operands[inst->operand_start]].machine_type)) {
+                mir_set_error(err, err_size, "MIR convert has an invalid signature");
                 return false;
             }
             break;

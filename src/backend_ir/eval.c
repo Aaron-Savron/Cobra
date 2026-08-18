@@ -2900,6 +2900,63 @@ bool bir_eval_function_value(const BackendIrModule *module, const char *name,
                     ev->current_slots[inst->result] = value;
                 break;
             }
+            case SSA_OP_CONVERT: {
+                BirScalarValue operand = eval_value(ev, arena->operands[inst->operand_start]);
+                bool from_float = operand.kind == BIR_SCALAR_F32 || operand.kind == BIR_SCALAR_F64;
+                /* Two distinct integer readings are kept: as_signed matches
+                   every non-u64 kind's true value (payload.i64 already holds
+                   it, sign-extended by the constructors above), while
+                   as_unsigned re-reads the same bits as unsigned so a u64
+                   operand's magnitude survives when it doesn't fit int64_t. */
+                double as_double = 0.0;
+                int64_t as_signed = 0;
+                uint64_t as_unsigned = 0;
+                if (from_float) {
+                    as_double = operand.kind == BIR_SCALAR_F32
+                        ? (double)bir_scalar_as_f32(operand)
+                        : bir_scalar_as_f64(operand);
+                } else {
+                    as_signed = operand.payload.i64;
+                    as_unsigned = operand.kind == BIR_SCALAR_U64
+                        ? (uint64_t)operand.payload.i64
+                        : (uint64_t)as_signed;
+                }
+                bool from_u64 = operand.kind == BIR_SCALAR_U64;
+                CobraTypeKind to = inst->type ? inst->type->kind : COBRA_TYPE_UNKNOWN;
+                BirScalarValue value;
+                switch (to) {
+                    case COBRA_TYPE_BOOL:
+                        value = bir_scalar_bool(inst->type, from_float ? as_double != 0.0 : as_signed != 0);
+                        break;
+                    case COBRA_TYPE_F32:
+                        value = bir_scalar_f32(inst->type, from_float ? (float)as_double :
+                                              (from_u64 ? (float)as_unsigned : (float)as_signed));
+                        break;
+                    case COBRA_TYPE_F64:
+                        value = bir_scalar_f64(inst->type, from_float ? as_double :
+                                              (from_u64 ? (double)as_unsigned : (double)as_signed));
+                        break;
+                    case COBRA_TYPE_I32:
+                        value = bir_scalar_i32(inst->type, from_float ? (int32_t)(int64_t)as_double : (int32_t)as_signed);
+                        break;
+                    case COBRA_TYPE_U32:
+                        value = bir_scalar_u32(inst->type, from_float ? (uint32_t)(int64_t)as_double : (uint32_t)as_signed);
+                        break;
+                    case COBRA_TYPE_U8:
+                        value = bir_scalar_u8(inst->type, from_float ? (uint8_t)(int64_t)as_double : (uint8_t)as_signed);
+                        break;
+                    case COBRA_TYPE_U64:
+                        value = bir_scalar_u64(inst->type, from_float ? (uint64_t)(int64_t)as_double : as_unsigned);
+                        break;
+                    case COBRA_TYPE_I64:
+                    default:
+                        value = bir_scalar_i64(inst->type, from_float ? (int64_t)as_double : as_signed);
+                        break;
+                }
+                if (inst->result != SSA_VALUE_NONE && inst->result < ev->slot_count)
+                    ev->current_slots[inst->result] = value;
+                break;
+            }
             case SSA_OP_EQ:
             case SSA_OP_NE:
             case SSA_OP_LT:

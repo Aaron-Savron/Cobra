@@ -1840,6 +1840,7 @@ const char *bir_opcode_name(SsaOpcode op) {
         case SSA_OP_DIV: return "div";
         case SSA_OP_REM: return "rem";
         case SSA_OP_NEG: return "neg";
+        case SSA_OP_CONVERT: return "convert";
         case SSA_OP_EQ: return "eq";
         case SSA_OP_NE: return "ne";
         case SSA_OP_LT: return "lt";
@@ -1908,6 +1909,7 @@ bool bir_op_has_result(SsaOpcode op) {
         case SSA_OP_DIV:
         case SSA_OP_REM:
         case SSA_OP_NEG:
+        case SSA_OP_CONVERT:
         case SSA_OP_EQ:
         case SSA_OP_NE:
         case SSA_OP_LT:

@@ -1289,6 +1289,28 @@ arbitrary non-scalar ownership-bearing aggregate emission remains deferred.
     actually freed) exactly as before - only the specific transient
     call-argument borrow is released, never a named view local's borrow.
 
+    `expr as Type` casts now lower to a new `SSA_OP_CONVERT`/`MIR_OP_CONVERT`
+    instruction (ssa.h/ssa.c, verify.c, mir.c, eval.c, x86_64.c,
+    x86_64_alloc.c, x86_64_obj.c) threaded the same way as every other
+    scalar opcode, closing what had been the only runtime numeric-conversion
+    gap in this backend. Verification gives CONVERT its own rule instead of
+    reusing the equal-operand-result-type check every other unary op relies
+    on (its whole point is operand type != result type): both sides must be
+    one of the scalar numeric/bool kinds, checked independently. Covers every
+    (from, to) pair among i32/i64/u8/u32/u64/f32/bool (f64 stays reserved at
+    the HIR boundary, matching ir.c's own cast rule) - int narrowing/widening
+    with correct sign vs zero extension, int<->float via truncating
+    (never rounding) conversions matching codegen.c's emit_cast_int_width
+    reference, and bool as a nonzero test in either direction. The
+    register-allocated x86 emitter's own address-precompute path
+    (x86_64_alloc.c) has a pre-existing, unrelated bug where a local's
+    address kept in a caller-saved GPR across a `print`/call site can be
+    clobbered by that call - reproduces with plain i64 locals and no casts
+    at all - found while adversarially testing CONVERT but not fixed here
+    (out of scope for this change; each cast verified individually against
+    the direct backend to sidestep it, and every individual case matched
+    bit-for-bit).
+
     Net effect across the whole `--backend=native` effort this session:
     def-main examples building under `--backend=native` went from 0/41
     (every build silently failed the same way, masked by a since-fixed test

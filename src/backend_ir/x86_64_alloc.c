@@ -514,6 +514,89 @@ static bool x86_alloc_emit_neg(X86AllocatedContext *ctx, const MirInst *inst) {
     return x86_alloc_store_int(ctx, inst->result, "%r10", "%r10d");
 }
 
+/* See x86_emit_convert_widen in x86_64.c for why this can't reuse
+   x86_alloc_load_int: that helper preserves each type's own storage width
+   only, but a conversion needs the operand's true 64-bit value so widening
+   and truncation both land on the mathematically correct bits. */
+static void x86_alloc_convert_widen(X86AllocatedContext *ctx, MirReg reg,
+                                    const char *target64, const char *target32) {
+    const MirRegAllocation *location = x86_alloc_location(ctx, reg);
+    MirMachineType type = ctx->module->arena.regs[reg].machine_type;
+    if (!location) return;
+    if (location->kind == MIR_ALLOC_REGISTER) {
+        const char *source64 = NULL;
+        const char *source32 = NULL;
+        if (!x86_alloc_gpr(location->register_index, &source64)) return;
+        if (!x86_alloc_gpr32(location->register_index, &source32)) return;
+        if (type == MIR_TYPE_I8 || type == MIR_TYPE_BOOL) {
+            /* Matches x86_alloc_load_int's own register-case precedent: a
+               register-resident I8/BOOL is already a clean zero-extended
+               32-bit value, so a plain 32-bit move (which zero-extends the
+               target's upper 32 bits per the x86-64 ISA) is enough. */
+            fprintf(ctx->out, "    movl %s, %s\n", source32, target32);
+        } else if (type == MIR_TYPE_I32) {
+            fprintf(ctx->out, "    movslq %s, %s\n", source32, target64);
+        } else if (type == MIR_TYPE_U32) {
+            fprintf(ctx->out, "    movl %s, %s\n", source32, target32);
+        } else {
+            fprintf(ctx->out, "    movq %s, %s\n", source64, target64);
+        }
+        return;
+    }
+    if (location->kind != MIR_ALLOC_SPILL) return;
+    int64_t spill = x86_alloc_spill(ctx, reg);
+    if (type == MIR_TYPE_I8 || type == MIR_TYPE_BOOL) {
+        fprintf(ctx->out, "    movzbq ");
+        x86_alloc_mem(ctx->out, spill, "rbp");
+        fprintf(ctx->out, ", %s\n", target64);
+    } else if (type == MIR_TYPE_I32) {
+        fprintf(ctx->out, "    movslq ");
+        x86_alloc_mem(ctx->out, spill, "rbp");
+        fprintf(ctx->out, ", %s\n", target64);
+    } else if (type == MIR_TYPE_U32) {
+        fprintf(ctx->out, "    movl ");
+        x86_alloc_mem(ctx->out, spill, "rbp");
+        fprintf(ctx->out, ", %s\n", target32);
+    } else {
+        fprintf(ctx->out, "    movq ");
+        x86_alloc_mem(ctx->out, spill, "rbp");
+        fprintf(ctx->out, ", %s\n", target64);
+    }
+}
+
+static bool x86_alloc_emit_convert(X86AllocatedContext *ctx, const MirInst *inst) {
+    MirReg operand = ctx->module->arena.operands[inst->operand_start];
+    MirMachineType from = ctx->module->arena.regs[operand].machine_type;
+    MirMachineType to = inst->machine_type;
+    if (x86_alloc_is_float(from) && x86_alloc_is_float(to)) {
+        x86_alloc_load_float(ctx, operand, "%xmm14");
+        if (from != to)
+            fprintf(ctx->out, "    %s %%xmm14, %%xmm14\n", to == MIR_TYPE_F64 ? "cvtss2sd" : "cvtsd2ss");
+        return x86_alloc_store_float(ctx, inst->result, "%xmm14");
+    }
+    if (x86_alloc_is_float(from)) {
+        x86_alloc_load_float(ctx, operand, "%xmm14");
+        if (to == MIR_TYPE_BOOL) {
+            fprintf(ctx->out, "    pxor %%xmm15, %%xmm15\n    ucomis%s %%xmm15, %%xmm14\n"
+                              "    setne %%al\n    movzbl %%al, %%r10d\n",
+                    from == MIR_TYPE_F32 ? "s" : "d");
+            return x86_alloc_store_int(ctx, inst->result, "%r10", "%r10d");
+        }
+        fprintf(ctx->out, "    %s %%xmm14, %%r10\n", from == MIR_TYPE_F32 ? "cvttss2si" : "cvttsd2si");
+        return x86_alloc_store_int(ctx, inst->result, "%r10", "%r10d");
+    }
+    x86_alloc_convert_widen(ctx, operand, "%r10", "%r10d");
+    if (x86_alloc_is_float(to)) {
+        fprintf(ctx->out, "    %s %%r10, %%xmm14\n", to == MIR_TYPE_F32 ? "cvtsi2ss" : "cvtsi2sd");
+        return x86_alloc_store_float(ctx, inst->result, "%xmm14");
+    }
+    if (to == MIR_TYPE_BOOL) {
+        fprintf(ctx->out, "    testq %%r10, %%r10\n    setne %%al\n    movzbl %%al, %%r10d\n");
+        return x86_alloc_store_int(ctx, inst->result, "%r10", "%r10d");
+    }
+    return x86_alloc_store_int(ctx, inst->result, "%r10", "%r10d");
+}
+
 static bool x86_alloc_emit_div(X86AllocatedContext *ctx, const MirInst *inst) {
     MirReg lhs = ctx->module->arena.operands[inst->operand_start];
     MirReg rhs = ctx->module->arena.operands[inst->operand_start + 1];
@@ -1591,6 +1674,7 @@ static bool x86_alloc_emit_inst(X86AllocatedContext *ctx, const MirInst *inst) {
         case MIR_OP_SUB:
         case MIR_OP_MUL: return x86_alloc_emit_binary(ctx, inst);
         case MIR_OP_NEG: return x86_alloc_emit_neg(ctx, inst);
+        case MIR_OP_CONVERT: return x86_alloc_emit_convert(ctx, inst);
         case MIR_OP_DIV:
         case MIR_OP_REM:
             return x86_alloc_is_float(inst->machine_type)

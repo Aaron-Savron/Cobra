@@ -421,6 +421,26 @@ static bool is_pointer_type(const CobraType *type) {
            type->generic_arg_count == 1 && type->generic_args[0];
 }
 
+/* CONVERT's legal domain: every scalar kind that has a runtime numeric or
+   boolean representation. Struct/slice/sum/etc are rejected here so a
+   convert can never masquerade as an aggregate reinterpretation. */
+static bool is_scalar_convert_type(const CobraType *type) {
+    if (!type) return false;
+    switch (type->kind) {
+        case COBRA_TYPE_I32:
+        case COBRA_TYPE_I64:
+        case COBRA_TYPE_U8:
+        case COBRA_TYPE_U32:
+        case COBRA_TYPE_U64:
+        case COBRA_TYPE_F32:
+        case COBRA_TYPE_F64:
+        case COBRA_TYPE_BOOL:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static bool is_view_type(const CobraType *type) {
     return bir_is_borrowed_view_type(type);
 }
@@ -599,6 +619,17 @@ static bool check_instruction_signature(VerifyCtx *ctx, SsaBlockRef ref,
             expected_operands = 1;
             has_result = true;
             operands_are_numeric = true;
+            break;
+        case SSA_OP_CONVERT:
+            /* Unlike every other unary op, CONVERT's entire purpose is
+               operand type != result type, so it cannot reuse the
+               operands_are_numeric path below (that path forces the result
+               to match the single operand's type). Its operand/result types
+               are checked directly against the scalar-convert set further
+               down, once result_type has been set to inst->type here. */
+            expected_operands = 1;
+            result_type = inst->type;
+            has_result = true;
             break;
         case SSA_OP_EQ:
         case SSA_OP_NE:
@@ -850,6 +881,14 @@ static bool check_instruction_signature(VerifyCtx *ctx, SsaBlockRef ref,
             if (!check_value_type(ctx, ops[i], numeric_type, "numeric opcode operand")) return false;
         }
         if (!result_type) result_type = numeric_type;
+    }
+    if (inst->op == SSA_OP_CONVERT) {
+        const CobraType *from = arena->values[ops[0]].type;
+        const CobraType *to = inst->type;
+        if (!is_scalar_convert_type(from) || !is_scalar_convert_type(to)) {
+            verr(ctx, "block b%u convert requires scalar numeric or bool operand and result types", ref);
+            return false;
+        }
     }
     if (inst->op == SSA_OP_STACK_SLOT &&
         (inst->pointer_contract != BIR_POINTER_CONTRACT_OWNED_FRAME &&

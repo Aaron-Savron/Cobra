@@ -497,6 +497,32 @@ static void emit_ucomix(X86ObjContext *ctx, bool is_f64, int a, int b) {
        not F2/F3 like the arithmetic ops. */
     emit_xmm_rr(ctx, is_f64 ? 0x66 : 0x00, 0x2E, a, b);
 }
+static void emit_pxor_x(X86ObjContext *ctx, int dst, int src) {
+    emit_xmm_rr(ctx, 0x66, 0xEF, dst, src);
+}
+/* cvtss2sd/cvtsd2ss: converts float precision, xmm <- xmm. The source
+   precision picks the mandatory prefix (F3 reads a single, F2 a double). */
+static void emit_cvt_float_width(X86ObjContext *ctx, bool from_f64, int dst, int src) {
+    emit_xmm_rr(ctx, from_f64 ? 0xF2 : 0xF3, 0x5A, dst, src);
+}
+/* cvtsi2ss/cvtsi2sd: xmm <- r/m64 (always the 64-bit GPR form here, REX.W
+   set explicitly since emit_xmm_rr's implicit REX omits W). */
+static void emit_cvtsi2sx(X86ObjContext *ctx, bool is_f64, int xmm_dst, int gpr_src) {
+    emit_u8(ctx, x86obj_float_prefix(is_f64));
+    emit_u8(ctx, x86obj_rex(true, xmm_dst, gpr_src));
+    emit_u8(ctx, 0x0F);
+    emit_u8(ctx, 0x2A);
+    emit_u8(ctx, x86obj_modrm(3, xmm_dst, gpr_src));
+}
+/* cvttss2si/cvttsd2si: r64 <- xmm, truncating toward zero (matches the
+   direct backend's own cast semantics, never the rounding cvtsi2si form). */
+static void emit_cvttsx2si(X86ObjContext *ctx, bool is_f64, int gpr_dst, int xmm_src) {
+    emit_u8(ctx, x86obj_float_prefix(is_f64));
+    emit_u8(ctx, x86obj_rex(true, gpr_dst, xmm_src));
+    emit_u8(ctx, 0x0F);
+    emit_u8(ctx, 0x2C);
+    emit_u8(ctx, x86obj_modrm(3, gpr_dst, xmm_src));
+}
 
 /* movd/movq between a GPR and the low bits of an xmm register. reg/rm follow
    the same slots as the integer encoders: xmm goes in the ModRM.reg field,
@@ -1148,6 +1174,52 @@ static bool x86obj_emit_inst(X86ObjContext *ctx, size_t function_index, const Mi
             }
             if (!x86obj_load(ctx, operand, X86OBJ_R10)) return false;
             emit_neg_r(ctx, X86OBJ_R10);
+            return x86obj_store(ctx, inst->result, X86OBJ_R10);
+        }
+        case MIR_OP_CONVERT: {
+            /* Same v1 scope line as every other compute opcode in this
+               emitter (see x86obj_supported_scalar/x86obj_movable_scalar
+               above): I32/U32 aren't encoded here yet, so a convert
+               touching either width cleanly fails the object build instead
+               of emitting a value that lost its width truncation. */
+            MirReg operand = ctx->module->arena.operands[inst->operand_start];
+            MirMachineType from = ctx->module->arena.regs[operand].machine_type;
+            MirMachineType to = inst->machine_type;
+            if (!x86obj_supported_scalar(from) || !x86obj_supported_scalar(to)) return false;
+            if (x86obj_is_float(from) && x86obj_is_float(to)) {
+                if (!x86obj_load_float(ctx, operand, X86OBJ_XMM_SCRATCH0)) return false;
+                if (from != to) emit_cvt_float_width(ctx, from == MIR_TYPE_F64,
+                                                     X86OBJ_XMM_SCRATCH0, X86OBJ_XMM_SCRATCH0);
+                return x86obj_store_float(ctx, inst->result, X86OBJ_XMM_SCRATCH0);
+            }
+            if (x86obj_is_float(from)) {
+                if (!x86obj_load_float(ctx, operand, X86OBJ_XMM_SCRATCH0)) return false;
+                if (to == MIR_TYPE_BOOL) {
+                    emit_pxor_x(ctx, X86OBJ_XMM_SCRATCH1, X86OBJ_XMM_SCRATCH1);
+                    emit_ucomix(ctx, from == MIR_TYPE_F64, X86OBJ_XMM_SCRATCH0, X86OBJ_XMM_SCRATCH1);
+                    emit_setcc(ctx, 0x5 /* setne */, X86OBJ_R10);
+                    emit_movzx64_8(ctx, X86OBJ_R10, X86OBJ_R10);
+                    return x86obj_store(ctx, inst->result, X86OBJ_R10);
+                }
+                emit_cvttsx2si(ctx, from == MIR_TYPE_F64, X86OBJ_R10, X86OBJ_XMM_SCRATCH0);
+                return x86obj_store(ctx, inst->result, X86OBJ_R10);
+            }
+            /* Every supported int/bool width here is already carried as a
+               clean, fully-extended 64-bit slot (see x86obj_movable_scalar's
+               comment), so no extra widening load is needed before using it. */
+            if (!x86obj_load(ctx, operand, X86OBJ_R10)) return false;
+            if (x86obj_is_float(to)) {
+                emit_cvtsi2sx(ctx, to == MIR_TYPE_F64, X86OBJ_XMM_SCRATCH0, X86OBJ_R10);
+                return x86obj_store_float(ctx, inst->result, X86OBJ_XMM_SCRATCH0);
+            }
+            if (to == MIR_TYPE_BOOL) {
+                emit_test_rr(ctx, X86OBJ_R10);
+                emit_setcc(ctx, 0x5, X86OBJ_R10);
+                emit_movzx64_8(ctx, X86OBJ_R10, X86OBJ_R10);
+                return x86obj_store(ctx, inst->result, X86OBJ_R10);
+            }
+            /* i64<->u64 share a bit pattern; the clean 64-bit slot needs
+               nothing further. */
             return x86obj_store(ctx, inst->result, X86OBJ_R10);
         }
         case MIR_OP_DIV:

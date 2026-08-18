@@ -114,6 +114,7 @@ static void mark_expr_reads(SsaPass *p, size_t block, HirExpr *expr) {
         case HIR_EXPR_DICT_HAS:
         case HIR_EXPR_DICT_POP:
         case HIR_EXPR_DICT_LEN:
+        case HIR_EXPR_CAST:
             for (size_t i = 0; i < expr->arg_count; i++) {
                 mark_expr_reads(p, block, expr->args[i]);
             }
@@ -1483,6 +1484,18 @@ static SsaValueRef ssa_eval_expr(SsaPass *p, size_t block, HirExpr *expr) {
             const SsaValueRef operands[2] = {lhs, rhs};
             SsaInstRef inst = bir_add_inst(arena, expr->binop,
                                            expr->type, operands, 2,
+                                           expr->source_line, expr->source_col);
+            if (inst == SSA_INST_NONE ||
+                !bir_block_add_inst(arena, p->base + block, inst)) {
+                return SSA_VALUE_NONE;
+            }
+            return bir_inst_result(arena, inst, expr->source_line, expr->source_col);
+        }
+        case HIR_EXPR_CAST: {
+            SsaValueRef source = ssa_eval_expr(p, block, expr->args[0]);
+            if (source == SSA_VALUE_NONE) return SSA_VALUE_NONE;
+            SsaInstRef inst = bir_add_inst(arena, SSA_OP_CONVERT,
+                                           expr->type, &source, 1,
                                            expr->source_line, expr->source_col);
             if (inst == SSA_INST_NONE ||
                 !bir_block_add_inst(arena, p->base + block, inst)) {
