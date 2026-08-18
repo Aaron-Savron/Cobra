@@ -3359,6 +3359,18 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                     return node->value_type;
                 }
                 for (size_t i = 0; i < node->child_count; i++) (void)infer_expr(node->children[i], ctx);
+                /* Every builtin/qualified/indirect call shape has already
+                   returned above; anything reaching here with no matching
+                   declaration is a plain unqualified call to a name that
+                   doesn't exist, unless it's an `import c` symbol codegen
+                   resolves separately (see is_imported_function there). */
+                if (!is_imported_function(ctx, node->name)) {
+                    char message[180];
+                    snprintf(message, sizeof(message),
+                             "undefined function '%s' (not defined or imported with 'import c')",
+                             node->name);
+                    ir_error(ctx, node, message);
+                }
             }
             /* Untyped function declarations retain the historical integer ABI;
                typed f32/tensor returns flow through their native return class. */

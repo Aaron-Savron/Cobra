@@ -9,10 +9,13 @@ column, and undefined-variable errors suggest the closest-spelled name in
 scope (locals, closure-enclosing scopes, and top-level functions) when one is
 within edit-distance 1-2. `undefined function` codegen errors now carry
 file:line:col like every IR-level diagnostic instead of a bare message.
-Remaining gap found in the same pass: `cobra check` does not currently
-validate that a called function exists (only codegen does, at build time) -
-a typo'd call name is accepted by `check` and only caught by `build`. No
-formatter, LSP, package manager, or debugger exist yet; a minimal
+`cobra check` now also rejects calls to undefined functions itself (the IR
+pass's call-resolution fallback used to assume any unqualified name with no
+matching declaration was an external import and defer the check to codegen,
+so `check` silently accepted typo'd call names that only `build`/`test`
+caught); a typo'd call name is now rejected at `check` time with the same
+diagnostic codegen used to produce. No formatter, LSP, package manager, or
+debugger exist yet; a minimal
 diagnostics-only LSP (wrapping `cobra check`'s output as LSP diagnostics
 over stdio) is likely the next-highest-value tooling piece since the compiler
 already does the hard part, followed by a mechanical `cobra fmt`. A package
