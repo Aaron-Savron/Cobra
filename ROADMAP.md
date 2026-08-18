@@ -573,8 +573,16 @@ Finish the language contracts for:
   (`cobra_dict_capacity`/`cobra_dict_raw_entries`) freeing each value before
   freeing the dict itself. Key type is still string-only - widening it is a
   separate, larger undertaking left out of scope here. Iteration over a dict's
-  entries (`for k, v in dict:` or similar) does not exist for dicts at all yet,
-  independent of this work, and remains open)
+  entries now works too: `for k in dict:` (key-only, `k` a borrowed string
+  view of the entry's own heap key) and `for k, v in dict:` (key+value; `v`
+  is the scalar value or, for a struct V, a borrowed view of the entry's
+  heap-owned struct copy - not a fresh copy, mirroring how list[Struct]
+  iteration binds its loop variable). Codegen walks the raw hash-table entry
+  array directly via `cobra_dict_capacity`/`cobra_dict_raw_entries`, skipping
+  empty/tombstone slots, rather than routing through the index-into-buffer
+  loop machinery `for x in list:` uses - a dict's entries aren't contiguous
+  or index-addressable the way a list's buffer is. The dict can still be
+  freed normally after iterating)
 - [x] Scalar mutable generic slices through `out []T` writable views, including
   indexed stores, calls, borrowed returns, provenance, and borrow-contract checks
 - [ ] Non-scalar mutable generic slices

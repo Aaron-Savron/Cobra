@@ -132,6 +132,19 @@ typedef struct {
         int index_offset;
         CobraTypeKind element_type;
         bool enumerate;
+        /* Dict iteration (`for k in d:` / `for k, v in d:`): entries are a
+           hash table, not a contiguous index-addressable buffer, so it gets
+           its own base (raw entry array pointer) instead of reusing `source`
+           (a buffer name resolved through emit_load_buffer_ptr). index_offset
+           is reused as the current entry slot index into that array. */
+        bool is_dict;
+        int dict_base_offset;
+        char dict_value_type_name[COBRA_MAX_IDENT_LEN];
+        /* Non-empty only for `for x in list_of_dyn_trait:` - names the trait
+           so a method call on the loop variable resolves through
+           emit_dyn_dispatch_call exactly like a dyn-typed local does, even
+           though the loop variable itself has no VarSymbol/stack slot. */
+        char dyn_trait_name[COBRA_MAX_IDENT_LEN];
     } loops[16];
     int loop_depth;
     RegionInfo regions[16];
@@ -354,6 +367,14 @@ static CobraTypeKind ast_error_kind(const ASTNode *node) {
 
 static const char *ast_payload_name(const ASTNode *node) {
     return cobra_type_node_name(node);
+}
+
+/* list[dyn Trait]'s trait name lives directly on the declaring node's own
+   dyn_trait_name field (see parser_component_type's list[...] case) -
+   cobra_type_node_name has no notion of it since the element's canonical
+   type is the same dummy func type a bare `dyn Trait` local uses. */
+static const char *ast_list_dyn_trait_name(const ASTNode *node) {
+    return node && node->dyn_trait_name[0] ? node->dyn_trait_name : NULL;
 }
 
 static const char *ast_error_name(const ASTNode *node) {
@@ -1075,6 +1096,13 @@ static VarSymbol *ensure_list_named(CodeGen *cg, const char *name, CobraTypeKind
     return s;
 }
 
+static VarSymbol *ensure_list_dyn(CodeGen *cg, const char *name, const char *dyn_trait_name) {
+    VarSymbol *s = ensure_list_named(cg, name, COBRA_TYPE_FUNC, NULL);
+    if (dyn_trait_name && !s->dyn_trait_name[0])
+        snprintf(s->dyn_trait_name, sizeof(s->dyn_trait_name), "%.63s", dyn_trait_name);
+    return s;
+}
+
 static VarSymbol *ensure_list(CodeGen *cg, const char *name, CobraTypeKind element_type) {
     return ensure_list_named(cg, name, element_type, NULL);
 }
@@ -1112,6 +1140,15 @@ static void emit_struct_address(CodeGen *cg, ASTNode *node) {
     }
     if (node->type == AST_VAR_REF) {
         int loop = current_iter(cg, node->name);
+        if (loop >= 0 && cg->loops[loop].is_dict) {
+            /* Struct-valued `for k, v in d:` loop variable: mirrors the
+               list[Struct] case below, but the entry's value slot (at
+               +8 in CobraDictEntry) already holds the heap pointer to the
+               entry's private struct copy - see emit_dict_set_key. */
+            fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    imul rax, 24\n    add rax, QWORD PTR [rbp-%d]\n    mov rax, QWORD PTR [rax+8]\n",
+                    cg->loops[loop].index_offset, cg->loops[loop].dict_base_offset);
+            return;
+        }
         if (loop >= 0 && cg->loops[loop].source[0] != '\0') {
             /* Struct-element `for p in list_of_struct:` loop variable: the
                list stores each element as a pointer (see emit_list_append),
@@ -2000,6 +2037,19 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
         case AST_COMPTIME_EXPR: fprintf(cg->out, "    mov rax, %d\n", interpreter_eval_expr(node)); return;
         case AST_VAR_REF: {
             int loop = current_iter(cg, node->name);
+            if (loop >= 0 && cg->loops[loop].is_dict) {
+                /* Key reads the entry's own heap string pointer (a borrowed
+                   view - the dict still owns it); scalar value reads the
+                   8-byte value slot directly. Struct values are read through
+                   emit_struct_address instead (member access, arguments). */
+                fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    imul rax, 24\n    add rax, QWORD PTR [rbp-%d]\n",
+                        cg->loops[loop].index_offset, cg->loops[loop].dict_base_offset);
+                if (!strcmp(node->name, cg->loops[loop].name))
+                    fprintf(cg->out, "    mov rax, QWORD PTR [rax]\n");
+                else
+                    fprintf(cg->out, "    mov rax, QWORD PTR [rax+8]\n");
+                return;
+            }
             if (loop >= 0) {
                 fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n", cg->loops[loop].index_offset);
                 if (cg->loops[loop].enumerate &&
@@ -2230,6 +2280,13 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
                 int field_addr;
                 VarSymbol *s = materialize_list_field(cg, a, &field_addr);
                 fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n", s->length_offset);
+            } else if (a && a->type == AST_VAR_REF && current_iter(cg, a->name) >= 0 &&
+                       cg->loops[current_iter(cg, a->name)].is_dict) {
+                /* dict loop var: neither a real VarSymbol nor a buffer -
+                   emit_expr already knows how to load it (key string
+                   pointer or scalar value), so route len() through that. */
+                emit_expr(cg, a);
+                fprintf(cg->out, "    mov rdi, rax\n    call strlen@PLT\n");
             } else if (a && a->type == AST_VAR_REF) {
                 VarSymbol *s = find_symbol(cg, a->name);
                 if (s && s->type == COBRA_TYPE_STRING) {
@@ -4384,9 +4441,56 @@ static bool try_emit_parallel(CodeGen *cg, ASTNode *n) {
 
 static void emit_loop_owned_cleanup(CodeGen *cg, ASTNode *body);
 
+/* `for k in d:` / `for k, v in d:` over a dict local. The entry array isn't
+   index-addressable the way a list buffer is (see emit_dict_struct_element_cleanup's
+   comment on CobraDictEntry's fixed 24-byte layout), so this walks it directly
+   with cobra_dict_capacity/raw_entries rather than routing through emit_for's
+   `source`-buffer machinery, which assumes a contiguous rax*4/rax*8 stride.
+   Key binds as a borrowed string view of the entry's own heap key (never
+   freed by the loop - the dict still owns it); a struct value binds the same
+   way list[Struct] iteration does elsewhere, as a borrowed pointer into the
+   entry's already-heap-allocated private copy, not a fresh copy. */
+static void emit_for_dict(CodeGen *cg, ASTNode *n, VarSymbol *dict_sym) {
+    int cap = reserve(cg, 8), base = reserve(cg, 8), i = reserve(cg, 8);
+    int label = cg->label_count++;
+    fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    call cobra_dict_capacity@PLT\n    mov QWORD PTR [rbp-%d], rax\n",
+            dict_sym->offset, cap);
+    fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    call cobra_dict_raw_entries@PLT\n    mov QWORD PTR [rbp-%d], rax\n",
+            dict_sym->offset, base);
+    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], 0\n.Ldict_for_%d:\n", i, label);
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    cmp rax, QWORD PTR [rbp-%d]\n    jge .Ldict_for_done_%d\n",
+            i, cap, label);
+    fprintf(cg->out, "    mov rbx, QWORD PTR [rbp-%d]\n    imul rax, 24\n    add rbx, rax\n", base);
+    fprintf(cg->out, "    cmp BYTE PTR [rbx+16], 0\n    je .Ldict_for_next_%d\n", label);
+
+    snprintf(cg->loops[cg->loop_depth].name, sizeof(cg->loops[cg->loop_depth].name), "%s", n->name);
+    snprintf(cg->loops[cg->loop_depth].secondary_name, sizeof(cg->loops[cg->loop_depth].secondary_name), "%s", n->secondary_name);
+    cg->loops[cg->loop_depth].source[0] = '\0';
+    cg->loops[cg->loop_depth].active = true;
+    cg->loops[cg->loop_depth].enumerate = false;
+    cg->loops[cg->loop_depth].is_dict = true;
+    cg->loops[cg->loop_depth].index_offset = i;
+    cg->loops[cg->loop_depth].dict_base_offset = base;
+    cg->loops[cg->loop_depth].element_type = dict_sym->element_type;
+    snprintf(cg->loops[cg->loop_depth].dict_value_type_name, sizeof(cg->loops[cg->loop_depth].dict_value_type_name),
+             "%s", dict_sym->type_name);
+    cg->loop_depth++;
+    if (n->child_count > 1) { emit_statement(cg, n->children[1]); emit_loop_owned_cleanup(cg, n->children[1]); }
+    cg->loop_depth--;
+    fprintf(cg->out, ".Ldict_for_next_%d:\n    inc QWORD PTR [rbp-%d]\n    jmp .Ldict_for_%d\n.Ldict_for_done_%d:\n",
+            label, i, label, label);
+}
+
 static void emit_for(CodeGen *cg, ASTNode *n) {
     int index = reserve(cg, 8), bound = reserve(cg, 8), label = cg->label_count++;
     ASTNode *target = n->child_count ? n->children[0] : NULL;
+    if (target && target->type == AST_VAR_REF) {
+        VarSymbol *dict_sym = find_symbol(cg, target->name);
+        if (dict_sym && dict_sym->kind == SYM_DICT) {
+            emit_for_dict(cg, n, dict_sym);
+            return;
+        }
+    }
     bool is_range = target && target->type == AST_FUNC_CALL && !strcmp(target->name, "range");
     bool is_enumerate = target && target->type == AST_FUNC_CALL && !strcmp(target->name, "enumerate");
     bool element = target && target->type == AST_VAR_REF && symbol_is_buffer(cg, target->name);
@@ -4465,6 +4569,14 @@ static void emit_for(CodeGen *cg, ASTNode *n) {
     if (source) snprintf(cg->loops[cg->loop_depth].source, sizeof(cg->loops[cg->loop_depth].source), "%s", source); else cg->loops[cg->loop_depth].source[0] = 0;
     cg->loops[cg->loop_depth].active = true;
     cg->loops[cg->loop_depth].enumerate = is_enumerate;
+    {
+        VarSymbol *dyn_source = source ? find_symbol(cg, source) : NULL;
+        if (dyn_source && dyn_source->dyn_trait_name[0])
+            snprintf(cg->loops[cg->loop_depth].dyn_trait_name, sizeof(cg->loops[cg->loop_depth].dyn_trait_name),
+                     "%s", dyn_source->dyn_trait_name);
+        else
+            cg->loops[cg->loop_depth].dyn_trait_name[0] = '\0';
+    }
     cg->loops[cg->loop_depth].index_offset = index;
     VarSymbol *ss = source ? find_symbol(cg, source) : NULL;
     cg->loops[cg->loop_depth].element_type = ss &&
@@ -4961,7 +5073,9 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             }
             if (v->type == AST_ARRAY_LITERAL && n->declared_type == COBRA_TYPE_LIST) {
                 CobraTypeKind element = ast_element_kind(n) == COBRA_TYPE_UNTYPED ? COBRA_TYPE_I64 : ast_element_kind(n);
-                VarSymbol *s = ensure_list_named(cg, n->name, element, ast_payload_name(n));
+                const char *list_dyn_trait = ast_list_dyn_trait_name(n);
+                VarSymbol *s = list_dyn_trait ? ensure_list_dyn(cg, n->name, list_dyn_trait)
+                                               : ensure_list_named(cg, n->name, element, ast_payload_name(n));
                 s->owned = true;
                 fprintf(cg->out, "    mov QWORD PTR [rbp-%d], 0\n    mov QWORD PTR [rbp-%d], 0\n    mov QWORD PTR [rbp-%d], 0\n", s->offset, s->length_offset, s->capacity_offset);
                 for (size_t i = 0; i < v->child_count; i++) emit_list_append(cg, s, v->children[i]);
@@ -5027,6 +5141,15 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
                 if (s->dyn_trait_name[0] == '\0')
                     snprintf(s->dyn_trait_name, sizeof(s->dyn_trait_name), "%.63s", n->dyn_trait_name);
                 if (v->type == AST_FUNC_CALL) {
+                    emit_expr(cg, v);
+                    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", s->offset);
+                    return;
+                }
+                if (v->type == AST_ARRAY_INDEX) {
+                    /* let x: dyn Trait = list_of_dyn[i] - the list already
+                       holds a built dispatch-block pointer for this trait
+                       (ir.c verified the list's own dyn trait matches), so
+                       this is a plain pointer copy too. */
                     emit_expr(cg, v);
                     fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", s->offset);
                     return;

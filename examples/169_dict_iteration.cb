@@ -1,0 +1,87 @@
+# dict iteration: `for k in d:` (key-only) and `for k, v in d:` (key+value).
+# Entries are a hash table, not a contiguous buffer, so this walks the raw
+# entry array (cobra_dict_capacity/raw_entries, runtime/cobra_collections.c)
+# skipping empty/tombstone slots rather than reusing list[T]'s index-into-
+# buffer loop machinery. Key binds as a borrowed string view of the entry's
+# own heap key; a struct value binds as a borrowed view of the entry's
+# private struct copy, exactly like list[Struct] iteration - see
+# 168_dict_struct_values.cb for the ownership story that copy relies on.
+
+struct Counter: { label: string, count: i64 }
+
+def test_key_only_iteration(): {
+    let d: dict[string]i64 = {}
+    set(d, "a", 1)
+    set(d, "b", 2)
+    set(d, "c", 3)
+    let seen: i64 = 0
+    let key_chars: i64 = 0
+    for k in d: {
+        seen = seen + 1
+        key_chars = key_chars + len(k)
+    }
+    assert(seen == 3)
+    assert(key_chars == 3)
+}
+
+def test_key_only_after_delete(): {
+    let d: dict[string]i64 = {}
+    set(d, "a", 1)
+    set(d, "b", 2)
+    set(d, "c", 3)
+    delete(d, "b")
+    let seen: i64 = 0
+    for k in d: {
+        seen = seen + 1
+        assert(has(d, k))
+    }
+    assert(seen == 2)
+}
+
+def test_key_value_scalar_iteration(): {
+    let d: dict[string]i64 = {}
+    set(d, "a", 10)
+    set(d, "b", 20)
+    set(d, "c", 30)
+    let total: i64 = 0
+    let seen: i64 = 0
+    for k, v in d: {
+        total = total + v
+        seen = seen + 1
+        assert(get(d, k, -1) == v)
+    }
+    assert(seen == 3)
+    assert(total == 60)
+}
+
+def test_key_value_struct_iteration(): {
+    let counters: dict[string]Counter = {}
+    let a: Counter
+    a.label = "alpha-" + "x"
+    a.count = 5
+    counters["a"] = a
+    let b: Counter
+    b.label = "beta-" + "x"
+    b.count = 7
+    counters["b"] = b
+    let total: i64 = 0
+    let seen: i64 = 0
+    for k, c in counters: {
+        seen = seen + 1
+        total = total + c.count
+        assert(len(k) == 1)
+    }
+    assert(seen == 2)
+    assert(total == 12)
+    # the dict must still free cleanly after iterating over its struct values
+    free(counters)
+}
+
+def test_iterate_empty_dict(): {
+    let d: dict[string]i64 = {}
+    let seen: i64 = 0
+    for k in d: {
+        seen = seen + 1
+    }
+    assert(seen == 0)
+}

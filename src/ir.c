@@ -2722,6 +2722,12 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                             !(is_integer(list->element_type) && is_integer(value))) {
                             ir_error(ctx, node, "append value does not match the list element type");
                         }
+                        if (list && list->dyn_trait_name[0] && node->children[1]->type == AST_VAR_REF) {
+                            IRLocal *value_local = find_local_entry(ctx, node->children[1]->name);
+                            if (value_local && strcmp(value_local->dyn_trait_name, list->dyn_trait_name) != 0) {
+                                ir_error(ctx, node, "append value does not implement the list's dyn trait");
+                            }
+                        }
                     }
                 }
                 node->value_type = COBRA_TYPE_VOID;
@@ -3754,6 +3760,16 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                     if (!callee || strcmp(callee->dyn_trait_name, node->dyn_trait_name) != 0) {
                         ir_error(ctx, node, "function does not return this dyn trait type");
                     }
+                } else if (node->child_count > 0 && node->children[0]->type == AST_ARRAY_INDEX) {
+                    /* let s: dyn Trait = list_of_dyn[i] - the list already
+                       stores a built dispatch-block pointer for this trait
+                       (see list[dyn Trait] element handling), so this is a
+                       plain pointer copy, not a fresh coercion. */
+                    IRLocal *list_local = find_local_entry(ctx, node->children[0]->name);
+                    if (!list_local || list_local->type != COBRA_TYPE_LIST ||
+                        strcmp(list_local->dyn_trait_name, node->dyn_trait_name) != 0) {
+                        ir_error(ctx, node, "list index is not a dyn trait value of this trait");
+                    }
                 } else if (node->child_count == 0 || node->children[0]->type != AST_VAR_REF) {
                     ir_error(ctx, node, "dyn trait initializer must be a named struct value");
                 } else {
@@ -4347,6 +4363,10 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
             memcpy(saved_locals, ctx->locals, sizeof(saved_locals));
             CobraTypeKind iterator_type = COBRA_TYPE_I64;
             const CobraType *struct_element_type = NULL;
+            const char *dyn_element_trait_name = NULL;
+            bool is_dict_source = false;
+            CobraTypeKind dict_value_kind = COBRA_TYPE_UNTYPED;
+            const CobraType *dict_struct_value_type = NULL;
             ASTNode *target = node->child_count > 0 ? node->children[0] : NULL;
             if (target) {
                 CobraTypeKind target_type = infer_expr(target, ctx);
@@ -4365,7 +4385,18 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                     }
                 } else if (target->type == AST_VAR_REF) {
                     IRLocal *source = find_local_entry(ctx, target->name);
-                    if (source && ((source->type == COBRA_TYPE_LIST || source->type == COBRA_TYPE_ARRAY) &&
+                    if (source && source->type == COBRA_TYPE_DICT) {
+                        /* Key is always the primary target; value (when a
+                           second name is given) reuses the dict local's own
+                           precomputed collection_value_type/type_name rather
+                           than re-deriving it, since cobra_type_element has
+                           no dict case (see add_local's dict comment). */
+                        is_dict_source = true;
+                        iterator_type = COBRA_TYPE_STRING;
+                        dict_value_kind = source->collection_value_type;
+                        if (dict_value_kind == COBRA_TYPE_STRUCT)
+                            dict_struct_value_type = cobra_type_value(source->canonical_type);
+                    } else if (source && ((source->type == COBRA_TYPE_LIST || source->type == COBRA_TYPE_ARRAY) &&
                                    canonical_element_kind(source->canonical_type) == COBRA_TYPE_F32))
                         iterator_type = COBRA_TYPE_F32;
                     else if (source && source->type == COBRA_TYPE_SLICE_F32)
@@ -4374,16 +4405,28 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                              canonical_element_kind(source->canonical_type) == COBRA_TYPE_STRUCT) {
                         iterator_type = COBRA_TYPE_STRUCT;
                         struct_element_type = cobra_type_element(source->canonical_type);
+                    } else if (source && source->type == COBRA_TYPE_LIST &&
+                               canonical_element_kind(source->canonical_type) == COBRA_TYPE_FUNC &&
+                               source->dyn_trait_name[0]) {
+                        /* list[dyn Trait] iteration: each stored word is already
+                           a built dispatch-block pointer, so the loop variable
+                           just needs the trait name to dispatch method calls -
+                           same COBRA_TYPE_FUNC ABI a bare dyn local uses. */
+                        iterator_type = COBRA_TYPE_FUNC;
+                        dyn_element_trait_name = source->dyn_trait_name;
                     }
                 }
             }            if (node->secondary_name[0] != '\0' &&
-                !(target && target->type == AST_FUNC_CALL && strcmp(target->name, "enumerate") == 0)) {
+                !(target && target->type == AST_FUNC_CALL && strcmp(target->name, "enumerate") == 0) &&
+                !is_dict_source) {
                 ir_error(ctx, node, "two loop targets require enumerate(collection)");
             }
             /* enumerate has two semantic locals: the primary target is always the
-               integer index, while the secondary target carries the source element. */
-            CobraTypeKind primary_iterator_type = node->secondary_name[0] != '\0' ?
-                COBRA_TYPE_I64 : iterator_type;
+               integer index, while the secondary target carries the source element.
+               Dict iteration mirrors that shape but with the key (always string)
+               as the primary target and the value (when named) as the secondary. */
+            CobraTypeKind primary_iterator_type = is_dict_source ? COBRA_TYPE_STRING :
+                (node->secondary_name[0] != '\0' ? COBRA_TYPE_I64 : iterator_type);
       if (!add_local(ctx, node->name, primary_iterator_type, NULL)) {
           char message[160];
           snprintf(message, sizeof(message), "duplicate iterator '%s'", node->name);
@@ -4398,13 +4441,25 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
               snprintf(loop_local->type_name, sizeof(loop_local->type_name), "%.63s",
                        canonical_type_name(struct_element_type));
           }
+      } else if (dyn_element_trait_name && primary_iterator_type == COBRA_TYPE_FUNC) {
+          IRLocal *loop_local = find_local_entry(ctx, node->name);
+          if (loop_local)
+              snprintf(loop_local->dyn_trait_name, sizeof(loop_local->dyn_trait_name), "%.63s", dyn_element_trait_name);
       }
+      CobraTypeKind secondary_iterator_type = is_dict_source ? dict_value_kind : iterator_type;
       if (node->secondary_name[0] != '\0' &&
-          !add_local(ctx, node->secondary_name, iterator_type, NULL)) {
+          !add_local(ctx, node->secondary_name, secondary_iterator_type, NULL)) {
                 char message[160];
                 snprintf(message, sizeof(message), "duplicate iterator '%s'", node->secondary_name);
                 ir_error(ctx, node, message);
-            }
+      } else if (is_dict_source && dict_struct_value_type && node->secondary_name[0] != '\0') {
+          IRLocal *value_local = find_local_entry(ctx, node->secondary_name);
+          if (value_local) {
+              value_local->canonical_type = dict_struct_value_type;
+              snprintf(value_local->type_name, sizeof(value_local->type_name), "%.63s",
+                       canonical_type_name(dict_struct_value_type));
+          }
+      }
             if (node->child_count > 1) {
                 size_t branch_base = ctx->count;
                 validate_block(node->children[1], ctx);
