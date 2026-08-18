@@ -998,7 +998,15 @@ Add CI for clean-checkout builds, strict warnings, sanitizers, fuzzing, positive
     through the checked sum-access path (scalar loads, owning-struct and
     nested-sum moves with source-tag clearing), and missing patterns,
     duplicates, wrong-kind patterns, and binding-rule violations are
-    rejected. Nested scalar sums are done to arbitrary depth with aggregate
+    rejected. Literal-pattern match (`match n: { 0: {...} 1, 2: {...} n if
+    cond: {...} _: {...} }`) is done for integer and bool scrutinees: the
+    same sequential compare-and-branch desugaring as enum match, extended
+    with or-patterns (multiple literals per arm) and guards (re-evaluated
+    once per arm, after any of that arm's literals match, never
+    precomputed), matching the direct backend's exhaustiveness rule (an
+    else/`_` arm is required unless the scrutinee is bool with both `true`
+    and `false` covered by unguarded arms) and duplicate-literal check
+    (skipped for guarded arms). Nested scalar sums are done to arbitrary depth with aggregate
     component layout, construction, access, params, and returns. Fresh owned strings from concat and string `+`, indexed reads,
 `string_free`, and fresh returns are done. Direct owned string and owned
 slice payloads in Option/Result now have move, extraction, call, return,

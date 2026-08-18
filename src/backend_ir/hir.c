@@ -3874,6 +3874,290 @@ static bool hir_build_if(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_blo
     return true;
 }
 
+static bool bir_is_match_scrutinee_type(const CobraType *type) {
+    return type && (type->kind == COBRA_TYPE_I32 || type->kind == COBRA_TYPE_I64 ||
+                    type->kind == COBRA_TYPE_U8 || type->kind == COBRA_TYPE_U32 ||
+                    type->kind == COBRA_TYPE_U64 || type->kind == COBRA_TYPE_BOOL);
+}
+
+/* literal-pattern match: match x: { 0: {...} 1, 2: {...} n if n > 10: {...} _: {...} }
+
+   Lowered as a sequential compare-and-branch chain, the same shape as an
+   if/elif/.../else ladder, rather than a jump table: guards can have side
+   effects and must be re-evaluated per arm (only once, in a shared block
+   reached by any of that arm's or-pattern literals matching), not
+   precomputed into a dispatch table. This mirrors the direct backend's
+   validate_literal_match_statement/codegen contract exactly, including its
+   exhaustiveness rule (else/_ required unless the scrutinee is bool with
+   both true and false covered by unguarded arms) and its duplicate-literal
+   check (skipped for guarded arms, since a guard can make an otherwise
+   duplicate literal reachable only conditionally). */
+static bool hir_build_literal_match(HirBuilder *b, ASTNode *stmt, HirExpr *target,
+                                    HirBlockRef *continue_block) {
+    if (!bir_is_match_scrutinee_type(target->type)) {
+        bir_fail(b, stmt->source_line, stmt->source_col,
+                 "literal match patterns require an integer or bool scrutinee");
+        hir_expr_free(target);
+        return false;
+    }
+    const bool is_bool = target->type->kind == COBRA_TYPE_BOOL;
+
+    ASTNode *else_arm = NULL;
+    bool has_default = false;
+    int64_t seen_literals[64];
+    int seen_count = 0;
+    size_t arm_count = 0;
+    for (size_t i = 1; i < stmt->child_count; i++) {
+        ASTNode *arm = stmt->children[i];
+        if (arm->type != AST_MATCH_CASE || arm->child_count == 0) {
+            bir_fail(b, arm ? arm->source_line : stmt->source_line,
+                     arm ? arm->source_col : stmt->source_col,
+                     "invalid match arm");
+            hir_expr_free(target);
+            return false;
+        }
+        if (arm->is_default_case) {
+            if (has_default) {
+                bir_fail(b, arm->source_line, arm->source_col,
+                         "match may contain only one else/_ arm");
+                hir_expr_free(target);
+                return false;
+            }
+            has_default = true;
+            else_arm = arm;
+            continue;
+        }
+        if (!arm->is_literal_case) {
+            bir_fail(b, arm->source_line, arm->source_col,
+                     "cannot mix enum-variant case arms with literal patterns in the same match");
+            hir_expr_free(target);
+            return false;
+        }
+        if (is_bool) {
+            for (int j = 0; j < arm->match_literal_count; j++) {
+                if (arm->match_literals[j] != 0 && arm->match_literals[j] != 1) {
+                    bir_fail(b, arm->source_line, arm->source_col,
+                             "bool match pattern must be true or false");
+                    hir_expr_free(target);
+                    return false;
+                }
+            }
+        }
+        if (!arm->match_guard) {
+            for (int j = 0; j < arm->match_literal_count; j++) {
+                bool dup = false;
+                for (int k = 0; k < seen_count; k++) {
+                    if (seen_literals[k] == arm->match_literals[j]) { dup = true; break; }
+                }
+                if (dup) {
+                    bir_fail(b, arm->source_line, arm->source_col,
+                             "duplicate literal value in match");
+                    hir_expr_free(target);
+                    return false;
+                } else if (seen_count < 64) {
+                    seen_literals[seen_count++] = arm->match_literals[j];
+                }
+            }
+        }
+        arm_count++;
+    }
+    if (!has_default && is_bool) {
+        bool seen_true = false, seen_false = false;
+        for (int k = 0; k < seen_count; k++) {
+            if (seen_literals[k] == 1) seen_true = true;
+            if (seen_literals[k] == 0) seen_false = true;
+        }
+        has_default = seen_true && seen_false;
+    }
+    if (!has_default) {
+        bir_fail(b, stmt->source_line, stmt->source_col,
+                 "non-exhaustive match requires an else or _ arm");
+        hir_expr_free(target);
+        return false;
+    }
+    /* Recompute has_default's real meaning for control flow: a bool match
+       that is exhaustive purely through literal coverage (no else/_ arm
+       written) still falls through to the merge block on the last arm's
+       failure, exactly like the direct backend treats it as proven
+       unreachable rather than requiring a synthesized else block. */
+    bool has_else_block = else_arm != NULL;
+
+    char tmp_name[COBRA_MAX_IDENT_LEN];
+    snprintf(tmp_name, sizeof(tmp_name), "@match_%d", b->synthetic_seq++);
+    int tmp_local = hir_add_local(b, tmp_name, false, target->type,
+                                  stmt->source_line, stmt->source_col);
+    if (tmp_local < 0 || !hir_emit_assign(b, (uint32_t)tmp_local, target))
+        return false;
+
+    /* Every hir_new_block call can realloc fn->blocks, invalidating every
+       previously returned HirBlock* - see the identical warning above
+       hir_build_match. Body/arm-start blocks are precreated and their ids
+       captured immediately; sub-blocks for or-pattern literals and guards
+       are created lazily inside the per-arm loop below, with the same
+       discipline. */
+    HirBlock **body_blocks = calloc(arm_count, sizeof(HirBlock *));
+    HirBlockRef *body_ids = calloc(arm_count, sizeof(HirBlockRef));
+    HirBlockRef *arm_start_ids = calloc(arm_count > 0 ? arm_count - 1 : 0, sizeof(HirBlockRef));
+    if (!body_blocks || !body_ids || (arm_count > 1 && !arm_start_ids)) {
+        free(body_blocks); free(body_ids); free(arm_start_ids);
+        return false;
+    }
+    for (size_t i = 0; i < arm_count; i++) {
+        body_blocks[i] = hir_new_block(b, "match_arm", stmt->source_line, stmt->source_col);
+        if (!body_blocks[i]) { free(body_blocks); free(body_ids); free(arm_start_ids); return false; }
+        body_ids[i] = body_blocks[i]->id;
+    }
+    for (size_t i = 0; i + 1 < arm_count; i++) {
+        HirBlock *blk = hir_new_block(b, "match_cmp", stmt->source_line, stmt->source_col);
+        if (!blk) { free(body_blocks); free(body_ids); free(arm_start_ids); return false; }
+        arm_start_ids[i] = blk->id;
+    }
+    HirBlock *else_block = has_else_block
+        ? hir_new_block(b, "match_else", stmt->source_line, stmt->source_col) : NULL;
+    if (has_else_block && !else_block) {
+        free(body_blocks); free(body_ids); free(arm_start_ids);
+        return false;
+    }
+    HirBlockRef else_id = else_block ? else_block->id : HIR_BLOCK_NONE;
+    HirBlock *merge = hir_new_block(b, "match_merge", stmt->source_line, stmt->source_col);
+    if (!merge) { free(body_blocks); free(body_ids); free(arm_start_ids); return false; }
+    HirBlockRef merge_id = merge->id;
+
+    HirBlockRef chain = b->current;
+    size_t arm_index = 0;
+    bool ok = true;
+    for (size_t i = 1; ok && i < stmt->child_count; i++) {
+        ASTNode *arm = stmt->children[i];
+        if (arm->is_default_case) continue;
+
+        HirBlockRef body_blk = body_ids[arm_index];
+        HirBlockRef fallthrough = (arm_index + 1 < arm_count)
+            ? arm_start_ids[arm_index]
+            : (has_else_block ? else_id : merge_id);
+
+        HirBlockRef guard_blk = HIR_BLOCK_NONE;
+        if (arm->match_guard) {
+            HirBlock *gb = hir_new_block(b, "match_guard", arm->source_line, arm->source_col);
+            if (!gb) { ok = false; break; }
+            guard_blk = gb->id;
+        }
+        HirBlockRef literal_success = arm->match_guard ? guard_blk : body_blk;
+
+        HirBlockRef cur = chain;
+        for (int j = 0; j < arm->match_literal_count; j++) {
+            bool last_lit = (j + 1 == arm->match_literal_count);
+            HirBlockRef fail_target;
+            if (last_lit) {
+                fail_target = fallthrough;
+            } else {
+                HirBlock *lb = hir_new_block(b, "match_lit", arm->source_line, arm->source_col);
+                if (!lb) { ok = false; break; }
+                fail_target = lb->id;
+            }
+            HirExpr *cond = hir_expr_alloc(b, arm->source_line, arm->source_col);
+            if (!cond) { ok = false; break; }
+            cond->kind = HIR_EXPR_BINOP;
+            cond->binop = SSA_OP_EQ;
+            cond->type = b->module->type_bool;
+            cond->args = calloc(2, sizeof(HirExpr *));
+            if (!cond->args) { hir_expr_free(cond); ok = false; break; }
+            cond->arg_count = 2;
+            cond->args[0] = hir_expr_alloc(b, arm->source_line, arm->source_col);
+            cond->args[1] = hir_expr_alloc(b, arm->source_line, arm->source_col);
+            if (!cond->args[0] || !cond->args[1]) { hir_expr_free(cond); ok = false; break; }
+            cond->args[0]->kind = HIR_EXPR_LOCAL;
+            cond->args[0]->type = target->type;
+            cond->args[0]->local = (uint32_t)tmp_local;
+            cond->args[1]->kind = HIR_EXPR_CONST;
+            cond->args[1]->type = target->type;
+            cond->args[1]->const_value = is_bool
+                ? bir_scalar_bool(target->type, arm->match_literals[j] != 0)
+                : bir_scalar_i64(target->type, arm->match_literals[j]);
+
+            b->current = cur;
+            HirTerm term;
+            memset(&term, 0, sizeof(term));
+            term.kind = HIR_TERM_BRANCH;
+            term.cond = cond;
+            term.target = literal_success;
+            term.target2 = fail_target;
+            if (!hir_set_term(b, b->current, term) ||
+                !hir_add_edge(b, b->current, literal_success) ||
+                !hir_add_edge(b, b->current, fail_target)) { ok = false; break; }
+            cur = fail_target;
+        }
+        if (!ok) break;
+
+        if (arm->match_guard) {
+            b->current = guard_blk;
+            HirExpr *guard_cond = NULL;
+            if (!hir_build_expr(b, arm->match_guard, &guard_cond)) { ok = false; break; }
+            if (!bir_types_equal(guard_cond->type, b->module->type_bool)) {
+                bir_fail(b, arm->source_line, arm->source_col,
+                         "match guard must be a boolean expression");
+                hir_expr_free(guard_cond);
+                ok = false;
+                break;
+            }
+            HirTerm gterm;
+            memset(&gterm, 0, sizeof(gterm));
+            gterm.kind = HIR_TERM_BRANCH;
+            gterm.cond = guard_cond;
+            gterm.target = body_blk;
+            gterm.target2 = fallthrough;
+            if (!hir_set_term(b, b->current, gterm) ||
+                !hir_add_edge(b, b->current, body_blk) ||
+                !hir_add_edge(b, b->current, fallthrough)) { ok = false; break; }
+        }
+
+        b->current = body_blk;
+        bool terminated = false;
+        ASTNode *arm_body = arm->children[arm->child_count - 1];
+        if (!hir_build_stmt_list(b, arm_body->children, arm_body->child_count, &terminated)) {
+            ok = false;
+            break;
+        }
+        if (!terminated) {
+            HirTerm jump;
+            memset(&jump, 0, sizeof(jump));
+            jump.kind = HIR_TERM_JUMP;
+            jump.target = merge_id;
+            if (!hir_set_term(b, b->current, jump) || !hir_add_edge(b, b->current, merge_id)) {
+                ok = false;
+                break;
+            }
+        }
+        chain = fallthrough;
+        arm_index++;
+    }
+    free(body_blocks);
+    free(body_ids);
+    free(arm_start_ids);
+    if (!ok) return false;
+
+    b->current = chain;
+    if (else_block) {
+        bool terminated = false;
+        if (else_arm &&
+            !hir_build_stmt_list(b, else_arm->children[0]->children,
+                                 else_arm->children[0]->child_count, &terminated)) {
+            return false;
+        }
+        if (!terminated) {
+            HirTerm jump;
+            memset(&jump, 0, sizeof(jump));
+            jump.kind = HIR_TERM_JUMP;
+            jump.target = merge_id;
+            if (!hir_set_term(b, b->current, jump) || !hir_add_edge(b, b->current, merge_id)) {
+                return false;
+            }
+        }
+        b->current = merge_id;
+    }
+    *continue_block = merge_id;
+    return true;
+}
+
 /* match value: { case Enum.Variant: { ... } else: { ... } }
 
    The target is evaluated once into a synthetic local, then the arms lower
@@ -3881,14 +4165,8 @@ static bool hir_build_if(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_blo
    discriminant, with the else arm (or the merge block) as the fallback.
    Duplicate arms and non-exhaustive matches without an else arm are
    rejected here, mirroring the frontend IR validation. */
-static bool hir_build_match(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_block) {
-    if (stmt->child_count < 2) {
-        bir_fail(b, stmt->source_line, stmt->source_col,
-                 "match requires a value and at least one arm");
-        return false;
-    }
-    HirExpr *target = NULL;
-    if (!hir_build_expr(b, stmt->children[0], &target)) return false;
+static bool hir_build_match(HirBuilder *b, ASTNode *stmt, HirExpr *target,
+                            HirBlockRef *continue_block) {
     const bool is_enum = target->type && target->type->kind == COBRA_TYPE_ENUM;
     const bool is_sum = target->type && bir_is_sum_type(target->type);
     if (!is_enum && !is_sum) {
@@ -5539,7 +5817,33 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
             }
             case AST_MATCH_STMT: {
                 HirBlockRef next = cur;
-                if (!hir_build_match(b, stmt, &next)) return false;
+                if (stmt->child_count < 2) {
+                    bir_fail(b, stmt->source_line, stmt->source_col,
+                             "match requires a value and at least one arm");
+                    return false;
+                }
+                HirExpr *match_target = NULL;
+                if (!hir_build_expr(b, stmt->children[0], &match_target)) return false;
+                bool any_literal_arm = false;
+                for (size_t k = 1; k < stmt->child_count; k++) {
+                    if (stmt->children[k]->type == AST_MATCH_CASE &&
+                        stmt->children[k]->is_literal_case) {
+                        any_literal_arm = true;
+                        break;
+                    }
+                }
+                /* Route on the scrutinee's type, mirroring the direct
+                   backend's dispatch in validate_match_statement: a
+                   wildcard-only match on a non-enum scalar is still a
+                   literal match (with zero non-default arms), not an
+                   error, as long as it isn't an enum/sum value. */
+                bool is_enum_or_sum = match_target->type &&
+                    (match_target->type->kind == COBRA_TYPE_ENUM ||
+                     bir_is_sum_type(match_target->type));
+                bool built = (any_literal_arm || !is_enum_or_sum)
+                    ? hir_build_literal_match(b, stmt, match_target, &next)
+                    : hir_build_match(b, stmt, match_target, &next);
+                if (!built) return false;
                 cur = next;
                 b->current = next;
                 break;

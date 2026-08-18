@@ -3778,9 +3778,12 @@ static void test_source_enums(void) {
         "  return 0\n"
         "}\n");
 
-    unit_rejected("match on a non-enum value",
+    unit_rejected("match on a struct value",
+        "struct P: { x: i64 }\n"
         "def main() -> i64: {\n"
-        "  match 5: {\n"
+        "  let p: P\n"
+        "  p.x = 1\n"
+        "  match p: {\n"
         "    else: { return 2 }\n"
         "  }\n"
         "  return 0\n"
