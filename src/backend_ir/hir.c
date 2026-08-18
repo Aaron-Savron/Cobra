@@ -3125,12 +3125,8 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                 break;
             }
             if (strcmp(node->name, "pop") == 0 &&
-                node->child_count == 1) {
-                if (node->children[0]->type != AST_VAR_REF) {
-                    bir_fail(b, node->source_line, node->source_col,
-                             "pop requires one named list");
-                    return false;
-                }
+                node->child_count == 2 &&
+                node->children[0]->type == AST_VAR_REF) {
                 int local = hir_require_local(b, node->children[0]->name,
                                               node->source_line, node->source_col);
                 if (local >= 0 &&
@@ -3140,12 +3136,13 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                                  "pop of non-scalar list elements is outside the backend-IR subset");
                         return false;
                     }
+                    const CobraType *element = cobra_type_element(b->fn->locals[local].type);
                     expr = hir_expr_alloc(b, node->source_line, node->source_col);
                     if (!expr) return false;
                     expr->kind = HIR_EXPR_BUFFER_POP;
                     expr->local = (uint32_t)local;
-                    expr->type = cobra_type_element(b->fn->locals[local].type);
-                    expr->args = calloc(1, sizeof(HirExpr *));
+                    expr->type = element;
+                    expr->args = calloc(2, sizeof(HirExpr *));
                     if (!expr->args) {
                         hir_expr_free(expr);
                         return false;
@@ -3154,7 +3151,22 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                         hir_expr_free(expr);
                         return false;
                     }
-                    expr->arg_count = 1;
+                    HirExpr *fallback = NULL;
+                    if (!hir_build_expr(b, node->children[1], &fallback)) {
+                        hir_expr_free(expr);
+                        return false;
+                    }
+                    fallback = hir_coerce_int_const(b, fallback, element);
+                    if (!fallback || !hir_complete_float_expr(b, fallback, element) ||
+                        !bir_types_equal(fallback->type, element)) {
+                        hir_expr_free(fallback);
+                        hir_expr_free(expr);
+                        bir_fail(b, node->source_line, node->source_col,
+                                 "pop default has the wrong scalar type");
+                        return false;
+                    }
+                    expr->args[1] = fallback;
+                    expr->arg_count = 2;
                     break;
                 }
             }

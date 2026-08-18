@@ -1141,11 +1141,13 @@ static bool mir_check_instruction(const MirModule *module, size_t function_index
             break;
         }
         case MIR_OP_BUFFER_POP: {
-            if (inst->operand_count != 1 || inst->result == MIR_REG_NONE ||
+            if (inst->operand_count != 2 || inst->result == MIR_REG_NONE ||
                 !inst->type || !cobra_type_is_scalar(inst->type) || !inst->memory_type ||
                 !mir_types_equal(inst->type, inst->memory_type) ||
                 inst->effect != MIR_EFFECT_READWRITE ||
-                arena->regs[arena->operands[inst->operand_start]].machine_type != MIR_TYPE_VIEW) {
+                arena->regs[arena->operands[inst->operand_start]].machine_type != MIR_TYPE_VIEW ||
+                arena->regs[arena->operands[inst->operand_start + 1]].machine_type !=
+                    mir_type_for_cobra(inst->memory_type)) {
                 mir_set_error(err, err_size, "MIR buffer pop has invalid metadata");
                 return false;
             }

@@ -1859,10 +1859,15 @@ bool bir_eval_function_value(const BackendIrModule *module, const char *name,
                 uint32_t allocation = source.kind == BIR_SCALAR_VIEW
                     ? source.payload.view.pointer.allocation_id : 0;
                 if (source.kind != BIR_SCALAR_VIEW || !bir_is_owned_buffer_type(source.type) ||
-                    source.payload.view.length <= 0 || allocation == 0 ||
-                    allocation > BIR_MAX_STACK_SLOTS || !ev->allocation_live[allocation] ||
-                    !element) {
-                    eval_fail(ev, "pop from an empty or inactive buffer");
+                    allocation == 0 || allocation > BIR_MAX_STACK_SLOTS ||
+                    !ev->allocation_live[allocation] || !element) {
+                    eval_fail(ev, "pop from an inactive buffer");
+                    break;
+                }
+                if (source.payload.view.length <= 0) {
+                    BirScalarValue fallback = eval_value(ev, arena->operands[inst->operand_start + 1]);
+                    if (inst->result != SSA_VALUE_NONE && inst->result < ev->slot_count)
+                        ev->current_slots[inst->result] = fallback;
                     break;
                 }
                 BirPointerValue pointer = source.payload.view.pointer;

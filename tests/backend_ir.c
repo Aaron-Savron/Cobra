@@ -958,7 +958,7 @@ static void test_source_scalar_generic_collections(void) {
         "  return append(values, item)\n"
         "}\n"
         "def last[T](values: list[T]) -> T: {\n"
-        "  let value: T = pop(values)\n"
+        "  let value: T = pop(values, values[0])\n"
         "  free(values)\n"
         "  return value\n"
         "}\n"
@@ -5348,7 +5348,7 @@ static void test_x86_native_struct_buffers(void) {
         "  p1.x = 1\n"
         "  p1.y = 2\n"
         "  let pts: list[Point] = [p1]\n"
-        "  let q: Point = pop(pts)\n"
+        "  let q: Point = pop(pts, p1)\n"
         "  free(pts)\n"
         "  return 0\n"
         "}\n");
@@ -7100,7 +7100,7 @@ static void test_source_object_emitter_coverage2(void) {
         "  let values: list[i64] = [10]\n"
         "  append(values, 20)\n"
         "  append(values, 30)\n"
-        "  let popped: i64 = pop(values)\n"
+        "  let popped: i64 = pop(values, 0)\n"
         "  let buf_total: i64 = values[0] + values[1] + popped\n"
         "  free(values)\n"
         "  return point_total + shape_total + box_total + dict_total + buf_total\n"
@@ -7277,7 +7277,7 @@ static void test_x86_native_owned_slices(void) {
         "def buffer_main() -> i64: {\n"
         "  let values: list[i64] = [40]\n"
         "  append(values, 2)\n"
-        "  let popped: i64 = pop(values)\n"
+        "  let popped: i64 = pop(values, 0)\n"
         "  if popped == 2: {\n"
         "    free(values)\n"
         "    return 42\n"
@@ -7608,7 +7608,7 @@ static void test_source_owned_buffers(void) {
     unit_expected("owned list pop mutates the source buffer",
         "def main() -> i64: {\n"
         "  let values: list[i64] = [4, 5, 6]\n"
-        "  let last: i64 = pop(values)\n"
+        "  let last: i64 = pop(values, 0)\n"
         "  r = last * 10 + len(values) + values[1]\n"
         "  free(values)\n"
         "  return r\n"
@@ -7648,11 +7648,11 @@ static void test_source_owned_buffers(void) {
         "  return values[-1]\n"
         "}\n");
 
-    unit_rejected("pop from an empty owned list",
+    unit_expected("pop from an empty owned list returns the fallback",
         "def main() -> i64: {\n"
         "  let values: list[i64] = []\n"
-        "  return pop(values)\n"
-        "}\n");
+        "  return pop(values, 99)\n"
+        "}\n", 99);
 
     unit_rejected("owned list double free",
         "def main() -> i64: {\n"

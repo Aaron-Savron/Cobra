@@ -1015,8 +1015,10 @@ static SsaValueRef ssa_eval_expr(SsaPass *p, size_t block, HirExpr *expr) {
         }
         case HIR_EXPR_BUFFER_POP: {
             SsaValueRef buffer = ssa_eval_expr(p, block, expr->args[0]);
-            if (buffer == SSA_VALUE_NONE) return SSA_VALUE_NONE;
-            SsaInstRef pop = bir_add_buffer_pop(arena, expr->type, buffer,
+            SsaValueRef fallback = ssa_eval_expr(p, block, expr->args[1]);
+            if (buffer == SSA_VALUE_NONE || fallback == SSA_VALUE_NONE)
+                return SSA_VALUE_NONE;
+            SsaInstRef pop = bir_add_buffer_pop(arena, expr->type, buffer, fallback,
                                                 expr->source_line, expr->source_col);
             if (pop == SSA_INST_NONE ||
                 !bir_block_add_inst(arena, p->base + block, pop)) return SSA_VALUE_NONE;

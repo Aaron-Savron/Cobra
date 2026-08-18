@@ -526,9 +526,11 @@ SsaInstRef bir_add_buffer_append(SsaArena *arena, const CobraType *buffer_type,
 }
 
 SsaInstRef bir_add_buffer_pop(SsaArena *arena, const CobraType *element_type,
-                              SsaValueRef buffer, int line, int col) {
+                              SsaValueRef buffer, SsaValueRef fallback,
+                              int line, int col) {
+    const SsaValueRef operands[2] = {buffer, fallback};
     SsaInstRef inst = bir_add_inst(arena, SSA_OP_BUFFER_POP, element_type,
-                                   &buffer, 1, line, col);
+                                   operands, 2, line, col);
     if (inst == SSA_INST_NONE) return SSA_INST_NONE;
     arena->insts[inst].memory_type = element_type;
     arena->insts[inst].effect = SSA_EFFECT_READWRITE;

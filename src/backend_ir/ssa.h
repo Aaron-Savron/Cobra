@@ -697,7 +697,8 @@ SsaInstRef bir_add_buffer_append(SsaArena *arena, const CobraType *buffer_type,
                                  SsaValueRef value, uint32_t allocation_id,
                                  int line, int col);
 SsaInstRef bir_add_buffer_pop(SsaArena *arena, const CobraType *element_type,
-                              SsaValueRef buffer, int line, int col);
+                              SsaValueRef buffer, SsaValueRef fallback,
+                              int line, int col);
 SsaInstRef bir_add_buffer_free(SsaArena *arena, SsaValueRef buffer,
                                int line, int col);
 SsaInstRef bir_add_dict_alloc(SsaArena *arena, const CobraType *dict_type,

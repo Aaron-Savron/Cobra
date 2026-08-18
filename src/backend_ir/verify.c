@@ -725,7 +725,7 @@ static bool check_instruction_signature(VerifyCtx *ctx, SsaBlockRef ref,
             has_result = true;
             break;
         case SSA_OP_BUFFER_POP:
-            expected_operands = 1;
+            expected_operands = 2;
             result_type = inst->type;
             has_result = true;
             break;
@@ -1090,9 +1090,11 @@ static bool check_instruction_signature(VerifyCtx *ctx, SsaBlockRef ref,
     }
     if (inst->op == SSA_OP_BUFFER_POP) {
         const SsaValue *buffer = &arena->values[ops[0]];
+        const SsaValue *fallback = &arena->values[ops[1]];
         if (!bir_is_owned_buffer_type(buffer->type) ||
             !is_memory_scalar(inst->type) ||
             !type_matches(cobra_type_element(buffer->type), inst->type) ||
+            !type_matches(fallback->type, inst->type) ||
             inst->memory_type != inst->type || inst->effect != SSA_EFFECT_READWRITE) {
             verr(ctx, "block b%u buffer pop has invalid metadata", ref);
             return false;

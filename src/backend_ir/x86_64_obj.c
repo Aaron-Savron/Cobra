@@ -1824,12 +1824,13 @@ static bool x86obj_emit_inst(X86ObjContext *ctx, size_t function_index, const Mi
             return true;
         }
         case MIR_OP_BUFFER_POP: {
-            if (inst->operand_count != 1 || inst->result == MIR_REG_NONE ||
+            if (inst->operand_count != 2 || inst->result == MIR_REG_NONE ||
                 !inst->memory_type || inst->memory_type->size == 0) return false;
             bool is_float_elem = x86obj_is_float(x86obj_machine_type_for_cobra(inst->memory_type));
             if (!is_float_elem && !x86obj_supported_scalar(x86obj_machine_type_for_cobra(inst->memory_type)))
                 return false;
             MirReg source = ctx->module->arena.operands[inst->operand_start];
+            MirReg fallback = ctx->module->arena.operands[inst->operand_start + 1];
             if (!x86obj_load_view_component(ctx, source, false, X86OBJ_R10) ||
                 !x86obj_load_view_component(ctx, source, true, X86OBJ_R11)) return false;
             emit_movabs(ctx, X86OBJ_RAX, 1);
@@ -1851,7 +1852,13 @@ static bool x86obj_emit_inst(X86ObjContext *ctx, size_t function_index, const Mi
             }
             size_t to_done = emit_jmp_fwd(ctx);
             patch_fwd(ctx, fail);
-            emit_ud2(ctx);
+            if (is_float_elem) {
+                if (!x86obj_load_float(ctx, fallback, X86OBJ_XMM_SCRATCH0)) return false;
+                if (!x86obj_store_float(ctx, inst->result, X86OBJ_XMM_SCRATCH0)) return false;
+            } else {
+                if (!x86obj_load(ctx, fallback, X86OBJ_R9)) return false;
+                if (!x86obj_store(ctx, inst->result, X86OBJ_R9)) return false;
+            }
             patch_fwd(ctx, to_done);
             return true;
         }

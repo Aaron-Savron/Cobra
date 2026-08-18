@@ -1093,9 +1093,10 @@ static bool x86_alloc_emit_buffer_append(X86AllocatedContext *ctx, const MirInst
 }
 
 static bool x86_alloc_emit_buffer_pop(X86AllocatedContext *ctx, const MirInst *inst) {
-    if (inst->operand_count != 1 || inst->result == MIR_REG_NONE ||
+    if (inst->operand_count != 2 || inst->result == MIR_REG_NONE ||
         !inst->memory_type || inst->memory_type->size == 0) return false;
     MirReg source = ctx->module->arena.operands[inst->operand_start];
+    MirReg fallback = ctx->module->arena.operands[inst->operand_start + 1];
     char fail[64], done[64];
     uint32_t label = ctx->view_fail_labels++;
     snprintf(fail, sizeof(fail), ".Lcobra_alloc_buffer_pop_fail_%zu_%u", ctx->function_index, label);
@@ -1116,7 +1117,15 @@ static bool x86_alloc_emit_buffer_pop(X86AllocatedContext *ctx, const MirInst *i
         else fprintf(ctx->out, "    movq (%%r10), %%r8\n");
         if (!x86_alloc_store_int(ctx, inst->result, "%r8", "%r8d")) return false;
     }
-    fprintf(ctx->out, "    jmp %s\n%s:\n    ud2\n%s:\n", done, fail, done);
+    fprintf(ctx->out, "    jmp %s\n%s:\n", done, fail);
+    if (x86_alloc_is_float(x86_alloc_machine_type_for_cobra(inst->memory_type))) {
+        if (!x86_alloc_load_float(ctx, fallback, "%xmm14")) return false;
+        if (!x86_alloc_store_float(ctx, inst->result, "%xmm14")) return false;
+    } else {
+        if (!x86_alloc_load_int(ctx, fallback, "%r8", "%r8d")) return false;
+        if (!x86_alloc_store_int(ctx, inst->result, "%r8", "%r8d")) return false;
+    }
+    fprintf(ctx->out, "%s:\n", done);
     return true;
 }
 

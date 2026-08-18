@@ -1052,7 +1052,13 @@ arbitrary non-scalar ownership-bearing aggregate emission remains deferred.
      capacity, literal construction, growth, append, pop, indexed access,
      ownership-moving calls and returns, explicit destruction, bounds and
      lifetime failures, and malformed buffer-IR verifier coverage. Lists with
-     non-scalar elements remain deferred.
+     non-scalar elements remain deferred. `pop` now takes `(list, default)`
+     like the direct backend: `SSA_OP_BUFFER_POP`/`MIR_OP_BUFFER_POP` carry a
+     second fallback operand, and the underlying pop is only executed once
+     the interpreter/emitters have proven the list non-empty (length check
+     first, matching how the runtime already guarded the raw pop with a
+     `ud2` trap) - an empty list yields the fallback instead of aborting,
+     mirroring dict's pop convention. Scalar list elements only.
 21f. [done] Add string-keyed scalar dicts `dict[string]T` with literal
      construction, index reads and writes, `get`/`has`/`set`/`delete`/`pop`/
      `len`/`free`, ownership-moving parameters and calls, rehash growth, and
