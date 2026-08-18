@@ -3742,7 +3742,11 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                 !cobra_type_equal(node->canonical_type, node->children[0]->canonical_type)) {
                 ir_error(ctx, node, "function value's signature does not match its declared fn(...)->... type");
             }
-            bool is_dyn_trait_decl = node->dyn_trait_name[0] != '\0';
+            /* list[dyn Trait] also stashes the trait name on dyn_trait_name
+               (see parser's list[...] case) but that names the ELEMENT
+               trait, not this declaration's own value - a list decl is
+               never itself a single dyn-trait value. */
+            bool is_dyn_trait_decl = node->dyn_trait_name[0] != '\0' && declared != COBRA_TYPE_LIST;
             if (is_dyn_trait_decl) {
                 /* `let x: dyn Trait = concrete_value` - same conformance
                    contract as a dyn-typed call argument (see the

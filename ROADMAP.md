@@ -755,9 +755,35 @@ Finish the language contracts for:
   (`emit_build_dyn_dispatch_block_ex`'s `heap_copy_data` flag,
   src/codegen.c). `let x: dyn Trait = some_func(...)` is a plain scalar
   move, since a dyn-returning call already hands back a fully-built block
-  pointer. Not yet supported: `list[dyn Trait]` elements, generic trait
-  bounds (`def f[T: Shape](x: T)`), and multiple impls of the same trait
-  for the same type (last registration wins silently - not yet diagnosed).
+  pointer. Not yet supported: generic trait bounds (`def f[T: Shape](x: T)`),
+  and multiple impls of the same trait for the same type (last registration
+  wins silently - not yet diagnosed).
+- [x] `list[dyn Trait]` (examples/169_list_dyn_trait.cb). A trait-object
+  value is already one pointer to its heap-allocated dispatch block, so it
+  slots into the same 8-byte scalar-element machinery a `list[i64]` uses -
+  `append` just stores the pointer (no per-element heap copy the way
+  `list[Struct]` needs), and index-read/iteration just load it back.
+  `list[dyn Shape]` parses via a `dyn TraitName` case added to the list
+  element-type grammar (`parser_component_type`, src/parser.c), whose
+  trait name is stashed on the *declaring* node's own `dyn_trait_name`
+  field (otherwise unused for a list declaration) rather than adding a new
+  field - `add_local` (src/ir.c) already copies that onto the list's own
+  `IRLocal`, so `shapes`'s `dyn_trait_name` becomes "the element trait"
+  for free. `let x: dyn Shape = shapes[0]` and `for s in shapes: { ... }`
+  both thread that trait name onto the resulting local/loop-variable so
+  `.method()` calls resolve through the existing `emit_dyn_dispatch_call`
+  exactly like any other `dyn Shape` value; a loop variable has no
+  VarSymbol/stack slot of its own (see the struct-element loop case), so
+  its method-call codegen loads the stored pointer into a fresh temp first
+  (`emit_call`'s loop-var branch, src/codegen.c) rather than reusing
+  `emit_dyn_dispatch_call`'s VarSymbol-based receiver lookup directly.
+  `append` additionally checks the value's own `dyn_trait_name` matches the
+  list's (`tests/negative/148_list_dyn_trait_mismatch.cb`) so a `dyn Named`
+  value can't silently join a `list[dyn Shape]`. Destruction is unchanged
+  from a scalar list: freeing the list's backing buffer never touches the
+  dispatch-block pointers it held, matching the standalone `dyn Trait`
+  no-automatic-drop convention above rather than inventing per-element drop
+  semantics just because the value is now inside a list.
 - [x] Default trait methods and supertraits. A trait method signature may
   include a default body (`def name(...) -> ret: { body }` inside the
   `trait` block); any impl that doesn't override it gets a synthesized
@@ -1514,18 +1540,10 @@ would have reintroduced stack corruption for real programs:
    `test_struct_return_round_trip` (a struct value round-tripped through
    two chained calls, the exact shape that segfaulted before this fix).
 
-`list[dyn Trait]` (a heterogeneous collection of trait-object values) was
-investigated and NOT implemented. A `dyn Trait` value is already just one
-pointer (to its heap-allocated dispatch block), so it should in principle
-slot into `list[T]`'s existing 8-byte scalar-element machinery -- but
-`list[T]` parsing has no `dyn` case (`list[dyn Shape]` fails to parse,
-"Expected ']' after list element type"), and more fundamentally, nothing
-threads a trait name through list-element metadata today: `IRLocal` tracks
-`element_type`/`type_name` for scalar and struct elements, but recovering
-which trait a `list[dyn Trait]` element belongs to at index-read time (so
-`shapes[0].area()` dispatches correctly) needs an equivalent
-`element_dyn_trait_name`-shaped field threaded through list declaration,
-append, and index-read -- comparable in scope to the original list[Struct]
-support work, not a small addition. Left undone rather than forced blind;
-a real attempt needs that field added to `IRLocal` and index-read taught to
-label its resulting temporary/local as dyn-typed from it.
+`list[dyn Trait]` was later implemented after all - see the dynamic
+dispatch section above (examples/169_list_dyn_trait.cb). The trait name
+threading this note worried about turned out not to need a new
+`element_dyn_trait_name`-shaped field: it reuses `IRLocal`/`VarSymbol`'s
+existing (otherwise-idle-for-a-list) `dyn_trait_name` field on the list's
+own local/symbol instead, and `list[T]` parsing gained a `dyn` case
+directly in `parser_component_type`'s list branch.

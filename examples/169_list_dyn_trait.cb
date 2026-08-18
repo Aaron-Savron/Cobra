@@ -1,0 +1,119 @@
+# list[dyn Trait]: a heterogeneous collection of trait-object values.
+# Each element is one pointer to an already-heap-allocated dispatch block
+# (see dyn Trait as a let declaration, examples/137), so append just stores
+# that pointer - no per-element heap copy the way list[Struct] needs.
+
+trait Shape: {
+    def area() -> i64
+    def name() -> i64
+}
+
+struct Circle: { radius: i64 }
+struct Square: { side: i64 }
+struct Triangle: { base: i64, height: i64 }
+
+impl Shape for Circle: {
+    def area(c: Circle) -> i64: {
+        return c.radius * c.radius * 3
+    }
+    def name(c: Circle) -> i64: {
+        return 1
+    }
+}
+
+impl Shape for Square: {
+    def area(s: Square) -> i64: {
+        return s.side * s.side
+    }
+    def name(s: Square) -> i64: {
+        return 2
+    }
+}
+
+impl Shape for Triangle: {
+    def area(t: Triangle) -> i64: {
+        return t.base * t.height / 2
+    }
+    def name(t: Triangle) -> i64: {
+        return 3
+    }
+}
+
+def test_list_dyn_trait_append_and_index(): {
+    let c: Circle
+    c.radius = 4
+    let circle_shape: dyn Shape = c
+
+    let s: Square
+    s.side = 6
+    let square_shape: dyn Shape = s
+
+    let shapes: list[dyn Shape] = []
+    append(shapes, circle_shape)
+    append(shapes, square_shape)
+
+    assert(len(shapes) == 2)
+
+    let first: dyn Shape = shapes[0]
+    let second: dyn Shape = shapes[1]
+    assert(first.area() == 48)
+    assert(second.area() == 36)
+    return 0
+}
+
+def test_list_dyn_trait_iteration_polymorphism(): {
+    let c: Circle
+    c.radius = 2
+    let circle_shape: dyn Shape = c
+
+    let s: Square
+    s.side = 5
+    let square_shape: dyn Shape = s
+
+    let t: Triangle
+    t.base = 6
+    t.height = 4
+    let triangle_shape: dyn Shape = t
+
+    let shapes: list[dyn Shape] = []
+    append(shapes, circle_shape)
+    append(shapes, square_shape)
+    append(shapes, triangle_shape)
+
+    let total_area: i64 = 0
+    let kinds_seen: i64 = 0
+    for shape in shapes: {
+        total_area = total_area + shape.area()
+        kinds_seen = kinds_seen + shape.name()
+    }
+    # circle 12 + square 25 + triangle 12 == 49
+    assert(total_area == 49)
+    # 1 + 2 + 3 == 6, proves each element dispatched to its own impl,
+    # not all three collapsing onto the same one
+    assert(kinds_seen == 6)
+    return 0
+}
+
+def test_list_dyn_trait_three_types_correct_dispatch(): {
+    let a: Circle
+    a.radius = 1
+    let shape_a: dyn Shape = a
+
+    let b: Square
+    b.side = 1
+    let shape_b: dyn Shape = b
+
+    let list_of_shapes: list[dyn Shape] = []
+    append(list_of_shapes, shape_a)
+    append(list_of_shapes, shape_b)
+
+    # A circle and a square with the same linear size have different areas
+    # (3 vs 1) - if dispatch were broken (e.g. always calling the first
+    # impl registered), both would report the same area.
+    let circle_area: dyn Shape = list_of_shapes[0]
+    let square_area: dyn Shape = list_of_shapes[1]
+    assert(circle_area.area() == 3)
+    assert(square_area.area() == 1)
+    assert(circle_area.area() != square_area.area())
+    return 0
+}

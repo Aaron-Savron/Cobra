@@ -480,8 +480,31 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
         expect(parser, TOKEN_LBRACKET, "Expected '[' after list in collection type");
         const CobraType *generic_element = NULL;
         const CobraType *struct_element = NULL;
+        const CobraType *dyn_element = NULL;
+        char list_dyn_trait_name[COBRA_MAX_IDENT_LEN];
+        list_dyn_trait_name[0] = '\0';
         CobraTypeKind element = token_to_type(parser->current_token.type);
-        if (match(parser, TOKEN_IDENTIFIER)) {
+        if (match(parser, TOKEN_IDENTIFIER) && strcmp(parser->current_token.text, "dyn") == 0) {
+            /* list[dyn TraitName]: element is a trait-object pointer, same
+               single-pointer representation a bare `dyn TraitName` local
+               uses. The trait name is stashed on the list's own owner node
+               (dyn_trait_name is otherwise unused there) so add_local/
+               ensure_list_named can hand it to index-read/iteration to
+               recover which trait the stored pointer dispatches through. */
+            advance_token(parser);
+            if (!match(parser, TOKEN_IDENTIFIER)) {
+                fprintf(stderr, "%s:%d:%d: error: expected trait name after 'dyn' in list element type\n",
+                        parser->source_file, parser->current_token.line, parser->current_token.col);
+                exit(1);
+            }
+            /* Token stays put here (like struct_element below) - the shared
+               advance_token(parser) after this if/else-if chain consumes it. */
+            copy_token_text(parser, list_dyn_trait_name, sizeof(list_dyn_trait_name),
+                            "list dyn trait name");
+            dyn_element = cobra_type_make_func(parser->canonical_arena, NULL, 0,
+                                               parser_component_type(parser, COBRA_TYPE_I64, NULL));
+            element = COBRA_TYPE_FUNC;
+        } else if (match(parser, TOKEN_IDENTIFIER)) {
             generic_element = parser_generic_param(parser, parser->current_token.text);
             if (!generic_element) {
                 /* Named value-owned struct element: list[Point]. The type
@@ -495,7 +518,7 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
                 if (!struct_element) element = COBRA_TYPE_UNKNOWN;
             }
         }
-        if ((!generic_element && !struct_element && element == COBRA_TYPE_UNKNOWN) ||
+        if ((!generic_element && !struct_element && !dyn_element && element == COBRA_TYPE_UNKNOWN) ||
             element == COBRA_TYPE_VOID) {
             fprintf(stderr, "%s:%d:%d: error: list element type must be a scalar type, generic parameter, or named struct\n",
                     parser->source_file, parser->current_token.line, parser->current_token.col);
@@ -511,10 +534,13 @@ static CobraTypeKind parse_type_into(Parser *parser, const char *context,
         expect(parser, TOKEN_RBRACKET, "Expected ']' after list element type");
         if (owner) {
             parser_set_canonical(parser, owner, COBRA_TYPE_LIST, qualifier,
-                                 generic_element ? generic_element
+                                 dyn_element ? dyn_element
+                                     : (generic_element ? generic_element
                                      : (struct_element ? struct_element
-                                                       : parser_component_type(parser, element, NULL)),
+                                                       : parser_component_type(parser, element, NULL))),
                                  NULL, NULL, NULL);
+            if (list_dyn_trait_name[0])
+                snprintf(owner->dyn_trait_name, sizeof(owner->dyn_trait_name), "%.63s", list_dyn_trait_name);
         }
         return COBRA_TYPE_LIST;
     }

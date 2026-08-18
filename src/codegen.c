@@ -3234,10 +3234,10 @@ static void emit_dyn_trait_call(CodeGen *cg, ASTNode *n, ASTNode *fn) {
    to one: a single pointer). Genuinely dynamic: the method slot is loaded
    from the receiver's own dispatch block at runtime, not resolved to a fixed
    mangled symbol at compile time the way static-dispatch x.method() is. */
-static void emit_dyn_dispatch_call(CodeGen *cg, ASTNode *n, VarSymbol *recv) {
-    ASTNode *trait_decl = find_trait_decl(cg, recv->dyn_trait_name);
+static void emit_dyn_dispatch_call_at(CodeGen *cg, ASTNode *n, const char *dyn_trait_name, int receiver_offset) {
+    ASTNode *trait_decl = find_trait_decl(cg, dyn_trait_name);
     if (!trait_decl) {
-        fprintf(stderr, "CodeGen Error: unknown trait '%s'\n", recv->dyn_trait_name);
+        fprintf(stderr, "CodeGen Error: unknown trait '%s'\n", dyn_trait_name);
         exit(EXIT_FAILURE);
     }
     int method_index = -1;
@@ -3245,11 +3245,11 @@ static void emit_dyn_dispatch_call(CodeGen *cg, ASTNode *n, VarSymbol *recv) {
         if (!strcmp(trait_decl->children[m]->name, n->name)) { method_index = (int)m; break; }
     }
     if (method_index < 0) {
-        fprintf(stderr, "CodeGen Error: trait '%s' has no method '%s'\n", recv->dyn_trait_name, n->name);
+        fprintf(stderr, "CodeGen Error: trait '%s' has no method '%s'\n", dyn_trait_name, n->name);
         exit(EXIT_FAILURE);
     }
     int block_slot = reserve(cg, 8);
-    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", recv->offset, block_slot);
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", receiver_offset, block_slot);
     int arg_slot = reserve(cg, (int)n->child_count * 8 + 8);
     for (size_t i = 0; i < n->child_count; i++) {
         ASTNode *arg = n->children[i];
@@ -3266,10 +3266,32 @@ static void emit_dyn_dispatch_call(CodeGen *cg, ASTNode *n, VarSymbol *recv) {
             block_slot, (int)(8 * method_index));
 }
 
+static void emit_dyn_dispatch_call(CodeGen *cg, ASTNode *n, VarSymbol *recv) {
+    emit_dyn_dispatch_call_at(cg, n, recv->dyn_trait_name, recv->offset);
+}
+
 static void emit_call(CodeGen *cg, ASTNode *n) {
     if (n->qualifier[0]) {
         VarSymbol *recv = find_symbol(cg, n->qualifier);
         if (recv && recv->dyn_trait_name[0]) { emit_dyn_dispatch_call(cg, n, recv); return; }
+        if (!recv) {
+            int loop = current_iter(cg, n->qualifier);
+            if (loop >= 0 && cg->loops[loop].dyn_trait_name[0]) {
+                /* `for s in shapes: { s.area() }` - s has no VarSymbol/stack
+                   slot of its own (see AST_VAR_REF's loop case), so load the
+                   stored dispatch-block pointer into a fresh temp the same
+                   way that AST_VAR_REF read does, then dispatch from there. */
+                ASTNode qualifier_ref;
+                memset(&qualifier_ref, 0, sizeof(qualifier_ref));
+                qualifier_ref.type = AST_VAR_REF;
+                snprintf(qualifier_ref.name, sizeof(qualifier_ref.name), "%s", n->qualifier);
+                int receiver_slot = reserve(cg, 8);
+                emit_expr(cg, &qualifier_ref);
+                fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", receiver_slot);
+                emit_dyn_dispatch_call_at(cg, n, cg->loops[loop].dyn_trait_name, receiver_slot);
+                return;
+            }
+        }
     }
     {
         ASTNode *dyn_fn = find_function(cg, n->name);

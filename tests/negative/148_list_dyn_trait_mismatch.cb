@@ -1,0 +1,30 @@
+trait Shape: {
+    def area() -> i64
+}
+
+trait Named: {
+    def label() -> i64
+}
+
+struct Circle: { radius: i64 }
+
+impl Shape for Circle: {
+    def area(c: Circle) -> i64: {
+        return c.radius * c.radius * 3
+    }
+}
+
+impl Named for Circle: {
+    def label(c: Circle) -> i64: {
+        return 1
+    }
+}
+
+def test_append_wrong_dyn_trait(): {
+    let c: Circle
+    c.radius = 4
+    let named_shape: dyn Named = c
+    let shapes: list[dyn Shape] = []
+    append(shapes, named_shape)
+    return 0
+}
