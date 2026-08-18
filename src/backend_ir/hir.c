@@ -2325,6 +2325,54 @@ static HirExpr *hir_build_sum_builtin(HirBuilder *b, ASTNode *node) {
     return NULL;
 }
 
+/* Mirrors src/ir.c's find_impl_method: every impl's methods are recorded as
+   AST_PARAM marker children (name=method, secondary_name=mangled) on the
+   AST_IMPL_DECL nodes sitting in the shared parser root, regardless of
+   which backend consumes them. */
+static const char *hir_find_impl_method(ASTNode *root, const char *type_name,
+                                        const char *method_name) {
+    if (!root || !type_name || !*type_name) return NULL;
+    for (size_t i = 0; i < root->child_count; i++) {
+        ASTNode *decl = root->children[i];
+        if (decl->type != AST_IMPL_DECL || strcmp(decl->secondary_name, type_name) != 0) continue;
+        for (size_t j = 0; j < decl->child_count; j++) {
+            ASTNode *marker = decl->children[j];
+            if (strcmp(marker->name, method_name) == 0) return marker->secondary_name;
+        }
+    }
+    return NULL;
+}
+
+/* x.method(args) parses to an AST_FUNC_CALL with qualifier="x". If "x"
+   names a struct-typed local with a registered impl method of this name
+   (static trait dispatch, or a plain traitless impl), rewrite the call in
+   place to the mangled impl function with the receiver prepended as the
+   first argument, exactly as src/ir.c's AST_FUNC_CALL case does before its
+   own call-resolution logic runs. Done as an AST mutation (not a fresh
+   HirExpr) so every downstream case (extern-arg limits, ABI validation,
+   aggregate-return hoisting) sees an ordinary call to a mangled top-level
+   function and needs no impl-specific awareness. */
+static void hir_rewrite_impl_call(HirBuilder *b, ASTNode *node) {
+    if (node->qualifier[0] == '\0') return;
+    int receiver = hir_find_local(b, node->qualifier);
+    if (receiver < 0) return;
+    const CobraType *receiver_type = b->fn->locals[receiver].type;
+    if (!receiver_type || receiver_type->kind != COBRA_TYPE_STRUCT || !receiver_type->name[0]) return;
+    const char *mangled = hir_find_impl_method(b->root, receiver_type->name, node->name);
+    if (!mangled) return;
+    ASTNode *receiver_ref = ast_create_node(AST_VAR_REF, node->qualifier);
+    if (!receiver_ref) return;
+    receiver_ref->source_line = node->source_line;
+    receiver_ref->source_col = node->source_col;
+    snprintf(receiver_ref->source_file, sizeof(receiver_ref->source_file), "%.127s", node->source_file);
+    ast_add_child(node, receiver_ref);
+    for (size_t shift = node->child_count - 1; shift > 0; shift--)
+        node->children[shift] = node->children[shift - 1];
+    node->children[0] = receiver_ref;
+    snprintf(node->name, sizeof(node->name), "%.63s", mangled);
+    node->qualifier[0] = '\0';
+}
+
 static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
     if (!node) {
         bir_fail(b, 0, 0, "missing expression in backend-IR subset");
@@ -2946,6 +2994,7 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                     if (!expr) return false;
                     break;
                 }
+                hir_rewrite_impl_call(b, node);
             }
             if (strcmp(node->name, "concat") == 0) {
                 bool matched = false;
@@ -6739,6 +6788,13 @@ bool bir_build_program(BackendIrModule *module, ASTNode *root) {
         }
         if (decl->type == AST_STRUCT_DECL || decl->type == AST_ENUM_DECL) continue;
         if (decl->type == AST_IMPORT_DECL) continue;
+        /* AST_IMPL_DECL is bookkeeping only (find_impl_method's mangled-name
+           markers); its methods are already ordinary AST_FUNCTION children
+           of root (see parse_impl_declaration), including synthesized
+           default-trait-method bodies (synthesize_trait_defaults), and get
+           processed by the function loop above like any other function. */
+        if (decl->type == AST_IMPL_DECL) continue;
+        if (decl->type == AST_TRAIT_DECL) continue;
         snprintf(module->error, sizeof(module->error),
                  "%.60s:%d:%d: top-level declaration is outside the backend-IR subset",
                  module->source_file, decl->source_line, decl->source_col);
