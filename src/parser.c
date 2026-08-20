@@ -1200,7 +1200,7 @@ static ASTNode *parse_additive(Parser *parser) {
     return left;
 }
 
-static ASTNode *parse_expression(Parser *parser) {
+static ASTNode *parse_comparison_expression(Parser *parser) {
     ASTNode *left = parse_additive(parser);
     while (is_comparison(parser) || match(parser, TOKEN_IN) || match(parser, TOKEN_NOT)) {
         if (match(parser, TOKEN_NOT)) {
@@ -1243,7 +1243,57 @@ static ASTNode *parse_expression(Parser *parser) {
     return left;
 }
 
+/* `and`/`or` lower to eager scalar booleans: `(a as i64) * (b as i64)` and
+   `(a as i64) + (b as i64)`, compared against zero. There is no
+   short-circuiting; use `if` when operand side effects matter. */
+static ASTNode *make_surface_boolean_op(Parser *parser, ASTNode *left,
+                                        Token op_token, ASTNode *right) {
+    ASTNode *left_cast = parser_create_node_at(parser, AST_CAST_EXPR, "as", op_token);
+    left_cast->declared_type = COBRA_TYPE_I64;
+    ast_add_child(left_cast, left);
+    ASTNode *right_cast = parser_create_node_at(parser, AST_CAST_EXPR, "as", op_token);
+    right_cast->declared_type = COBRA_TYPE_I64;
+    ast_add_child(right_cast, right);
+    ASTNode *binary = parser_create_node_at(parser, AST_BINARY_OP,
+                                            op_token.type == TOKEN_AND ? "*" : "+",
+                                            op_token);
+    ast_add_child(binary, left_cast);
+    ast_add_child(binary, right_cast);
+
+    ASTNode *zero = parser_create_node_at(parser, AST_INT_LITERAL, NULL, op_token);
+    zero->literal_i64 = 0;
+    zero->literal_u64 = 0;
+    zero->int_val = 0;
+    ASTNode *truth = parser_create_node_at(parser, AST_BINARY_OP, "!=", op_token);
+    ast_add_child(truth, binary);
+    ast_add_child(truth, zero);
+    return truth;
+}
+
+static ASTNode *parse_boolean_and(Parser *parser) {
+    ASTNode *left = parse_comparison_expression(parser);
+    while (match(parser, TOKEN_AND)) {
+        Token op_token = parser->current_token;
+        advance_token(parser);
+        left = make_surface_boolean_op(parser, left, op_token,
+                                       parse_comparison_expression(parser));
+    }
+    return left;
+}
+
+static ASTNode *parse_expression(Parser *parser) {
+    ASTNode *left = parse_boolean_and(parser);
+    while (match(parser, TOKEN_OR)) {
+        Token op_token = parser->current_token;
+        advance_token(parser);
+        left = make_surface_boolean_op(parser, left, op_token,
+                                       parse_boolean_and(parser));
+    }
+    return left;
+}
+
 static ASTNode *parse_block(Parser *parser);
+static ASTNode *parse_if_chain(Parser *parser);
 
 static ASTNode *parse_statement(Parser *parser) {
     // @compute block for hardware vectorization / SIMD GPU dispatch
@@ -1518,30 +1568,10 @@ static ASTNode *parse_statement(Parser *parser) {
         return print_node;
     }
 
-    // if statement
+    // if / elif / else. `elif` is a nested else-if, keeping one canonical
+    // branch form for braces and indentation alike.
     if (match(parser, TOKEN_IF)) {
-        advance_token(parser);
-        ASTNode *if_node = parser_create_node(parser, AST_IF_STMT, NULL);
-        
-        // Condition
-        ASTNode *cond = parse_expression(parser);
-        ast_add_child(if_node, cond);
-
-        if (match(parser, TOKEN_COLON)) advance_token(parser);
-
-        // If body
-        ASTNode *then_block = parse_block(parser);
-        ast_add_child(if_node, then_block);
-
-        // Optional else block
-        if (match(parser, TOKEN_ELSE)) {
-            advance_token(parser);
-            if (match(parser, TOKEN_COLON)) advance_token(parser);
-            ASTNode *else_block = parse_block(parser);
-            ast_add_child(if_node, else_block);
-        }
-
-        return if_node;
+        return parse_if_chain(parser);
     }
 
     // while statement
@@ -1745,6 +1775,34 @@ static ASTNode *parse_statement(Parser *parser) {
         char id_name[COBRA_MAX_IDENT_LEN];
         copy_token_text(parser, id_name, sizeof(id_name), "identifier");
 
+        /* `name: i64 = expr` is a typed local declaration. Probe one token
+           ahead to tell it apart from an ordinary assignment. */
+        Lexer saved_lexer = parser->lexer;
+        Token saved_token = parser->current_token;
+        advance_token(parser);
+        bool is_annotated_assignment = match(parser, TOKEN_COLON);
+        parser->lexer = saved_lexer;
+        parser->current_token = saved_token;
+        if (is_annotated_assignment) {
+            advance_token(parser); /* consume the identifier */
+            expect(parser, TOKEN_COLON, "Expected ':' in annotated assignment");
+            ASTNode *var_node = parser_create_node_at(parser, AST_VAR_DECL,
+                                                      id_name, target_token);
+            int alias_qualifier = 0;
+            if (match(parser, TOKEN_IDENTIFIER) &&
+                (!strcmp(parser->current_token.text, "out") ||
+                 !strcmp(parser->current_token.text, "readonly"))) {
+                alias_qualifier = !strcmp(parser->current_token.text, "readonly") ? 1 : 2;
+                advance_token(parser);
+            }
+            var_node->declared_type = parse_type_into(parser,
+                                                      "annotated assignment",
+                                                      var_node, alias_qualifier);
+            expect(parser, TOKEN_ASSIGN, "Expected '=' in annotated assignment");
+            ast_add_child(var_node, parse_expression(parser));
+            return var_node;
+        }
+
         ASTNode *primary = parse_primary(parser);
         if ((primary->type == AST_VAR_REF || primary->type == AST_ARRAY_INDEX ||
              primary->type == AST_MEMBER_ACCESS) && match(parser, TOKEN_ASSIGN)) {
@@ -1903,6 +1961,32 @@ static void parser_append_statement(ASTNode *block, ASTNode *stmt) {
     ast_add_child(block, stmt);
 }
 
+static ASTNode *parse_if_chain(Parser *parser) {
+    bool is_elif = match(parser, TOKEN_ELIF);
+    if (!match(parser, TOKEN_IF) && !is_elif) {
+        fprintf(stderr, "%s:%d:%d: error: expected 'if' or 'elif'\n",
+                parser->source_file, parser->current_token.line,
+                parser->current_token.col);
+        exit(1);
+    }
+    advance_token(parser);
+    ASTNode *if_node = parser_create_node(parser, AST_IF_STMT, NULL);
+    ast_add_child(if_node, parse_expression(parser));
+    if (match(parser, TOKEN_COLON)) advance_token(parser);
+    ast_add_child(if_node, parse_block(parser));
+
+    if (match(parser, TOKEN_ELIF)) {
+        ASTNode *else_block = parser_create_node(parser, AST_PROGRAM, "Block");
+        ast_add_child(else_block, parse_if_chain(parser));
+        ast_add_child(if_node, else_block);
+    } else if (match(parser, TOKEN_ELSE)) {
+        advance_token(parser);
+        if (match(parser, TOKEN_COLON)) advance_token(parser);
+        ast_add_child(if_node, parse_block(parser));
+    }
+    return if_node;
+}
+
 static ASTNode *parse_block(Parser *parser) {
     ASTNode *block = parser_create_node(parser, AST_PROGRAM, "Block");
 
@@ -1912,8 +1996,14 @@ static ASTNode *parse_block(Parser *parser) {
             parser_append_statement(block, parse_statement(parser));
         }
         expect(parser, TOKEN_RBRACE, "Expected '}' after block");
+    } else if (match(parser, TOKEN_INDENT)) {
+        advance_token(parser);
+        while (!match(parser, TOKEN_DEDENT) && !match(parser, TOKEN_EOF)) {
+            parser_append_statement(block, parse_statement(parser));
+        }
+        expect(parser, TOKEN_DEDENT, "Expected dedent after indented block");
     } else {
-        // Single statement or indented line
+        // Single statement, the original brace-less shorthand.
         parser_append_statement(block, parse_statement(parser));
     }
 
@@ -2263,6 +2353,12 @@ static ASTNode *parse_function_signature_and_body(Parser *parser, ASTNode *fn_no
             parser_append_statement(fn_node, parse_statement(parser));
         }
         expect(parser, TOKEN_RBRACE, "Expected '}' at end of function block");
+    } else if (match(parser, TOKEN_INDENT)) {
+        advance_token(parser);
+        while (!match(parser, TOKEN_DEDENT) && !match(parser, TOKEN_EOF)) {
+            parser_append_statement(fn_node, parse_statement(parser));
+        }
+        expect(parser, TOKEN_DEDENT, "Expected dedent at end of function block");
     } else {
         while (!match(parser, TOKEN_EOF) && !match(parser, TOKEN_DEF)) {
             parser_append_statement(fn_node, parse_statement(parser));

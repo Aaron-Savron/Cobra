@@ -33,7 +33,9 @@ Cobra currently has:
 - SSA verification and evaluation tests
 - A scalar SSA verifier that checks function-owned block ranges, unreachable
   block contents, signatures, effects, dominance, and use ordering
-- 133 example programs (108 with `test_` suites) and 101 negative diagnostics
+- Python-style indentation blocks, `elif`, `and`/`or`, and `True`/`False`/
+  `None` aliases alongside the existing brace syntax
+- 144 example programs (119 with `test_` suites) and 114 negative diagnostics
 
 The backend IR is linked into the production `cobra` binary and selectable
 with `cobra build|run <file> --backend=native` (see Phase 15 item 28 below

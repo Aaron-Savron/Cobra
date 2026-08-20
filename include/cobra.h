@@ -60,11 +60,14 @@ typedef enum {
     TOKEN_RETURN,
     TOKEN_IF,
     TOKEN_ELSE,
+    TOKEN_ELIF,
     TOKEN_WHILE,
     TOKEN_ASM,
     TOKEN_PRINT,
     TOKEN_ASSERT,
     TOKEN_NOT,   // not (currently only the 'not in' membership form)
+    TOKEN_AND,   // Python-style boolean conjunction
+    TOKEN_OR,    // Python-style boolean disjunction
     TOKEN_CONST,
     TOKEN_TRUE,
     TOKEN_FALSE,
@@ -115,6 +118,9 @@ typedef enum {
     TOKEN_RBRACE,
     TOKEN_LBRACKET,
     TOKEN_RBRACKET,
+    /* Indentation markers for Python-style blocks outside braces. */
+    TOKEN_INDENT,
+    TOKEN_DEDENT,
     TOKEN_UNKNOWN
 } TokenType;
 
@@ -125,12 +131,22 @@ typedef struct {
     int col;
 } Token;
 
+#define COBRA_MAX_INDENT_LEVELS 64
+
 typedef struct {
     const char *source;
     size_t length;
     size_t cursor;
     int line;
     int col;
+    bool at_line_start;
+    int brace_depth;
+    int paren_depth;
+    int bracket_depth;
+    int indent_depth;
+    int indent_stack[COBRA_MAX_INDENT_LEVELS];
+    int pending_dedents;
+    bool emitted_eof_dedents;
 } Lexer;
 
 void lexer_init(Lexer *lexer, const char *source);

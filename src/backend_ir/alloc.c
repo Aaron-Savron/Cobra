@@ -236,8 +236,20 @@ static bool alloc_function(MirAllocation *allocation, size_t function_index,
             for (size_t j = 0; j < block->inst_count; j++) {
                 MirInstRef inst_ref = block->insts[j];
                 const MirInst *inst = &module->arena.insts[inst_ref];
-                if (!(interval->start < inst_positions[inst_ref] &&
-                      interval->end > inst_positions[inst_ref])) continue;
+                uint32_t position = inst_positions[inst_ref];
+                bool view_register_constraint =
+                    (inst->op == MIR_OP_VIEW_MAKE ||
+                     ((inst->op == MIR_OP_PTR_ADD || inst->op == MIR_OP_LOAD ||
+                       inst->op == MIR_OP_STORE) &&
+                      inst->view_source != MIR_REG_NONE));
+                /* View bounds checks clobber abstract rdx/rcx. The check for
+                   a STORE runs before the stored value is read, so include
+                   endpoint uses here; otherwise a value such as s[0] + 1
+                   could be allocated to a clobbered register. */
+                if (view_register_constraint && interval->start <= position &&
+                    interval->end >= position)
+                    forbidden |= (UINT64_C(1) << 2) | (UINT64_C(1) << 3);
+                if (!(interval->start < position && interval->end > position)) continue;
                 if (inst->op == MIR_OP_CALL) {
                     forbidden |= interval->register_class == BIR_ABI_REGISTER_XMM
                         ? inst->clobbers.xmm_mask : inst->clobbers.gpr_mask;
@@ -260,10 +272,6 @@ static bool alloc_function(MirAllocation *allocation, size_t function_index,
                 if ((inst->op == MIR_OP_DIV || inst->op == MIR_OP_REM) &&
                     interval->register_class == BIR_ABI_REGISTER_GPR)
                     forbidden |= UINT64_C(1) << 2; /* abstract rdx is fixed scratch */
-                if (inst->op == MIR_OP_VIEW_MAKE ||
-                    ((inst->op == MIR_OP_PTR_ADD || inst->op == MIR_OP_LOAD) &&
-                     inst->view_source != MIR_REG_NONE))
-                    forbidden |= (UINT64_C(1) << 2) | (UINT64_C(1) << 3);
             }
         }
         interval->forbidden_register_mask = forbidden;

@@ -2409,10 +2409,10 @@ int main(int argc, char **argv) {
     if (!host_supports_avx2()) setenv("COBRA_DISABLE_AVX2", "1", 1);
 
     if (strcmp(command, "fmt") == 0) {
-        printf("[fmt] Formatted source file '%s'\n", source_path);
+        fprintf(stderr, "[fmt] formatter is not implemented yet; '%s' was not modified\n", source_path);
         free(combined_source);
         ast_free(program);
-        return 0;
+        return 1;
     }
 
     /* `check` stops after the same module composition and IR validation used by

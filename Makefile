@@ -9,7 +9,7 @@ TARGET = cobra
 TYPE_TEST_TARGET = cobra-type-tests
 BIR_TEST_TARGET = cobra-backend-ir-tests
 
-# Isolated backend-IR foundation (docs/BACKEND_IR.md). Linked into the
+# Optional backend-IR pipeline (docs/BACKEND_IR.md). Linked into the
 # production compiler behind `--backend=native` (src/main.c); the direct
 # emitter (src/codegen.c) remains the default.
 BIR_SRCS = src/backend_ir/ssa.c src/backend_ir/hir.c src/backend_ir/ssa_pass.c \

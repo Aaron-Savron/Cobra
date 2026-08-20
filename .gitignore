@@ -23,8 +23,9 @@ dist/
 .env
 .cobra-site-check/
 
-# Local agent instructions
+# Local agent tooling
 agents.md
+.claude/
 
 # Python tooling caches
 __pycache__/

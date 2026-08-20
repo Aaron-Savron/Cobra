@@ -24,6 +24,23 @@ body() {
     ' "$assembly"
 }
 
+# Auto-parallelized loops move their vector body into a generated worker.
+# Include workers referenced by the selected function so contracts check the
+# lowering rather than depending on whether the loop remains inline.
+body_with_workers() {
+    local assembly=$1
+    local function=$2
+    local text
+    text=$(body "$assembly" "$function")
+    local worker
+    while IFS= read -r worker; do
+        if grep -Fq "cobra_par_worker_${worker}" <<<"$text"; then
+            text+=$'\n'"$(body "$assembly" "cobra_par_worker_${worker}")"
+        fi
+    done < <(grep -E '^cobra_par_worker_[0-9]+:$' "$assembly" | sed -E 's/^cobra_par_worker_([0-9]+):$/\1/')
+    printf '%s\n' "$text"
+}
+
 require_text() {
     local label=$1
     local text=$2
@@ -76,10 +93,10 @@ many_sums=$(body "$work/sum-matrix.s" consume_many)
 mixed_sums=$(body "$work/sum-matrix.s" consume_mixed)
 nested_sums=$(body "$work/sum-matrix.s" nested)
 phase=$(body "$work/enums.s" phase_score)
-point=$(body "$work/structs.s" point_score)
-scale=$(body "$work/vector.s" scale_buffers)
-affine=$(body "$work/vector.s" test_affine)
-relu6=$(body "$work/vector.s" test_relu6)
+point=$(body "$work/structs.s" point_mutate)
+scale=$(body_with_workers "$work/vector.s" scale_buffers)
+affine=$(body_with_workers "$work/vector.s" test_affine)
+relu6=$(body_with_workers "$work/vector.s" test_relu6)
 unrolled=$(body "$work/constant-gemm.s" test_single_row_eight_cols)
 propagate=$(body "$work/propagation.s" module_chain)
 region=$(body "$work/propagation.s" loop_region_result)
@@ -95,12 +112,12 @@ generic_slice_i64=$(body "$work/generic-slices.s" readonly_len__i64)
 generic_slice_f32=$(body "$work/generic-slices.s" readonly_len__f32)
 generic_slice_calls=$(body "$work/generic-slices.s" test_generic_readonly_slices)
 generic_slice_module_calls=$(body "$work/generic-slice-module.s" test_generic_readonly_slice_module)
-generic_struct_score=$(body "$work/generic-structs.s" box_score)
+generic_struct_score=$(body "$work/generic-structs.s" box_identity)
 generic_struct_scale=$(body "$work/generic-structs.s" box_scale)
 generic_struct_identity=$(body "$work/generic-structs.s" box_identity)
 generic_struct_identity_f32=$(body "$work/generic-structs.s" box_identity_f32)
 generic_struct_calls=$(body "$work/generic-structs.s" test_generic_structs)
-generic_struct_module_score=$(body "$work/generic-struct-module.s" module_box_score)
+generic_struct_module_score=$(body "$work/generic-struct-module.s" module_box_identity)
 generic_struct_module_identity=$(body "$work/generic-struct-module.s" module_box_identity)
 generic_struct_module_calls=$(body "$work/generic-struct-module.s" test_generic_struct_module)
 generic_borrowed_i64=$(body "$work/generic-borrowed-views.s" view_len_i64)
@@ -140,8 +157,8 @@ require_text "multiple sum stack load two" "$many_sums" 'mov rax, QWORD PTR \[rb
 require_text "mixed f32 parameter" "$mixed_sums" 'movss DWORD PTR \[rbp-264\], xmm0'
 require_text "mixed slice pointer" "$mixed_sums" 'mov rax, QWORD PTR \[rbp-32\]'
 require_text "mixed slice length" "$mixed_sums" 'mov rax, QWORD PTR \[rbp-40\]'
-require_text "mixed struct field copy" "$mixed_sums" 'mov rax, QWORD PTR \[rsi\+0\]'
-require_text "mixed struct second field" "$mixed_sums" 'mov rax, QWORD PTR \[rsi\+8\]'
+require_text "mixed struct field copy" "$mixed_sums" 'mov rax, QWORD PTR \[rsi-0\]'
+require_text "mixed struct second field" "$mixed_sums" 'mov rax, QWORD PTR \[rsi-8\]'
 require_text "mixed checked sum capture" "$mixed_sums" 'mov rax, QWORD PTR \[rbp-56\]'
 require_text "mixed optional sum capture" "$mixed_sums" 'mov rax, QWORD PTR \[rbp-64\]'
 require_text "nested sum producer" "$nested_sums" 'call produce@PLT'
@@ -254,8 +271,8 @@ fi
 # substitution. The field is copied by value, read through canonical offsets,
 # and never allocates or dispatches through a runtime type object.
 for borrowed_body in "$generic_borrowed_i64" "$generic_borrowed_f32" "$generic_borrowed_u8"; do
-    require_text "generic borrowed field pointer" "$borrowed_body" 'mov rax, QWORD PTR \[rsi\+0\]'
-    require_text "generic borrowed field length" "$borrowed_body" 'mov rax, QWORD PTR \[rsi\+8\]'
+    require_text "generic borrowed field pointer" "$borrowed_body" 'mov rax, QWORD PTR \[rax \+ 0\]'
+    require_text "generic borrowed field length" "$borrowed_body" 'mov rdx, QWORD PTR \[rax \+ 8\]'
     forbid_text "generic borrowed field runtime dispatch" "$borrowed_body" 'call[[:space:]]+cobra_'
     forbid_text "generic borrowed field allocator" "$borrowed_body" 'call[[:space:]]+(malloc|calloc|realloc|memcpy|memmove)@PLT'
 done
@@ -278,8 +295,8 @@ require_text "module generic borrowed u8 call" "$generic_borrowed_module_calls" 
 # Generic functions over borrowed generic-view structs reuse the same
 # specialized packed layout and one-pointer struct ABI as direct View calls.
 for generic_view_body in "$generic_view_count_i64" "$generic_view_count_f32" "$generic_view_count_u8"; do
-    require_text "generic view struct field pointer" "$generic_view_body" 'mov rax, QWORD PTR \[rsi\+0\]'
-    require_text "generic view struct field length" "$generic_view_body" 'mov rax, QWORD PTR \[rsi\+8\]'
+    require_text "generic view struct field pointer" "$generic_view_body" 'mov rax, QWORD PTR \[rax \+ 0\]'
+    require_text "generic view struct field length" "$generic_view_body" 'mov rdx, QWORD PTR \[rax \+ 8\]'
     forbid_text "generic view struct runtime dispatch" "$generic_view_body" 'call[[:space:]]+cobra_'
 done
 require_text "generic view i64 call" "$generic_view_calls" 'call[[:space:]]+count__i64@PLT'

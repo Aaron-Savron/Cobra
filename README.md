@@ -26,10 +26,11 @@ Cobra is that experiment made real: **Python-shaped code with direct native exec
 
 - **Familiar:** Python-like assignments, collections, iteration, modules, and a small CLI.
 - **Native:** Cobra validates `.cb` source with a recursive-descent front end and emits Intel-syntax GNU assembly directly.
+- **Selectable backend:** `cobra build|run <file> --backend=native` routes compilation through the HIR → SSA → MIR → x86-64/object pipeline; the direct emitter remains the default.
 - **Portable on x86_64:** `--cpu=portable` keeps ordinary loops on a scalar baseline, omits unreachable AVX-backed NN helpers, and rejects reachable tensor kernels. It is not yet a cross-machine ARM64 or Wasm backend.
 - **Predictable:** Scope cleanup, region arenas, explicit buffer lifetimes, and zero-copy views keep memory behavior visible.
 - **Fast where it matters:** `@compute` lowers proven loops to 256-bit AVX2, `@parallel` dispatches disjoint work across a persistent worker pool, and model kernels use direct pointer-plus-length ABIs.
-- **Small by design:** The compiler is split across eight small C source files and was designed around a 15KB binary target. Actual release size varies with compiler and linker flags, so measure the artifact you build.
+- **Small by design:** The compiler is a small recursive-descent front end, a direct native emitter, and an optional HIR/SSA/MIR backend, with no third-party dependencies. Release size varies with compiler and linker flags, so measure the artifact you build.
 - **Open:** The compiler, runtime, libraries, tests, and roadmap are all in the repository.
 
 No virtual machine. No bytecode. No tracing garbage collector in the generated program. Just a small front end, a validator that rejects unsafe contracts, and native code you can inspect.
@@ -65,7 +66,7 @@ Run a test and a benchmark:
 ./cobra bench benchmarks/dense_repeat.cb --warmup 3 --runs 20
 ```
 
-The CLI also includes `build`, `fmt`, `repl`, and `check`. `cobra check` validates the composed source graph and native contracts without linking a binary.
+The CLI also includes `build`, `fmt`, `repl`, and `check`. `cobra check` validates the composed source graph and native contracts without linking a binary. `cobra fmt` is not implemented yet and exits with an error rather than modifying source text.
 
 ## The language feels familiar
 
@@ -91,7 +92,7 @@ if "loss" in metrics: {
 }
 ```
 
-The syntax is intentionally light. Add types where an ABI, model boundary, or safety contract benefits from them. Keep quick experiments quick.
+The syntax is intentionally light. Python-style indentation blocks, `elif`, `and`/`or`, and the `True`/`False`/`None` spellings are accepted alongside Cobra's brace blocks, and explicit static contracts are still required where an ABI, ownership, or safety boundary needs them. Keep quick experiments quick.
 
 ## Memory without guesswork
 

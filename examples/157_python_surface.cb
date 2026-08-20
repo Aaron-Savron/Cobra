@@ -1,0 +1,22 @@
+# Python-style indentation, elif, and/or, and True/False/None spellings.
+def classify(value: i64) -> i64:
+    if value < 0:
+        return -1
+    elif value == 0:
+        return 0
+    else:
+        return 1
+
+def test_python_surface() -> i64:
+    score: i64 = 0
+    if True and True:
+        score = score + 1
+    elif False or True:
+        score = score + 10
+    else:
+        score = score + 100
+    for value in range(1, 4):
+        score = score + classify(value)
+    if score == 4:
+        return 0
+    return 1

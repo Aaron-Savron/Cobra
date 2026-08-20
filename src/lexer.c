@@ -10,6 +10,14 @@ void lexer_init(Lexer *lexer, const char *source) {
     lexer->cursor = 0;
     lexer->line = 1;
     lexer->col = 1;
+    lexer->at_line_start = true;
+    lexer->brace_depth = 0;
+    lexer->paren_depth = 0;
+    lexer->bracket_depth = 0;
+    lexer->indent_depth = 0;
+    lexer->indent_stack[0] = 0;
+    lexer->pending_dedents = 0;
+    lexer->emitted_eof_dedents = false;
 }
 
 static char peek(Lexer *lexer) {
@@ -23,29 +31,112 @@ static char advance(Lexer *lexer) {
     if (c == '\n') {
         lexer->line++;
         lexer->col = 1;
+        lexer->at_line_start = true;
     } else {
         lexer->col++;
+        lexer->at_line_start = false;
     }
     return c;
 }
 
-static void skip_whitespace_and_comments(Lexer *lexer) {
-    while (1) {
-        char c = peek(lexer);
-        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+static Token lexer_layout_token(Lexer *lexer, TokenType type, const char *text) {
+    Token token;
+    memset(&token, 0, sizeof(token));
+    token.type = type;
+    token.line = lexer->line;
+    token.col = lexer->col;
+    snprintf(token.text, sizeof(token.text), "%s", text);
+    return token;
+}
+
+/* At line start, outside any bracket context, measure the leading
+   indentation and emit INDENT/DEDENT tokens so indented blocks carry
+   structure. Indentation inside braces is ignored. */
+static bool lexer_prepare_layout(Lexer *lexer, Token *layout) {
+    if (lexer->pending_dedents > 0) {
+        lexer->pending_dedents--;
+        *layout = lexer_layout_token(lexer, TOKEN_DEDENT, "DEDENT");
+        return true;
+    }
+
+    while (lexer->at_line_start) {
+        int indent = 0;
+        while (peek(lexer) == ' ' || peek(lexer) == '\t') {
+            indent += peek(lexer) == '\t' ? 4 : 1;
             advance(lexer);
-        } else if (c == '#') {
-            while (peek(lexer) != '\n' && peek(lexer) != '\0') {
-                advance(lexer);
+        }
+        if (peek(lexer) == '#') {
+            while (peek(lexer) != '\n' && peek(lexer) != '\0') advance(lexer);
+            continue;
+        }
+        if (peek(lexer) == '\n') {
+            advance(lexer);
+            continue;
+        }
+        if (peek(lexer) == '\0') {
+            if (lexer->brace_depth == 0 && lexer->indent_depth > 0 &&
+                !lexer->emitted_eof_dedents) {
+                lexer->pending_dedents = lexer->indent_depth;
+                lexer->indent_depth = 0;
+                lexer->emitted_eof_dedents = true;
+                return lexer_prepare_layout(lexer, layout);
             }
-        } else {
-            break;
+            return false;
+        }
+
+        lexer->at_line_start = false;
+        if (lexer->brace_depth != 0 || lexer->paren_depth != 0 ||
+            lexer->bracket_depth != 0) return false;
+        int current = lexer->indent_stack[lexer->indent_depth];
+        if (indent > current) {
+            if (lexer->indent_depth + 1 >= COBRA_MAX_INDENT_LEVELS) {
+                *layout = lexer_layout_token(lexer, TOKEN_UNKNOWN, "indentation too deep");
+                return true;
+            }
+            lexer->indent_stack[++lexer->indent_depth] = indent;
+            *layout = lexer_layout_token(lexer, TOKEN_INDENT, "INDENT");
+            return true;
+        }
+        if (indent < current) {
+            int levels = 0;
+            while (lexer->indent_depth > 0 &&
+                   indent < lexer->indent_stack[lexer->indent_depth]) {
+                lexer->indent_depth--;
+                levels++;
+            }
+            if (indent != lexer->indent_stack[lexer->indent_depth]) {
+                *layout = lexer_layout_token(lexer, TOKEN_UNKNOWN, "inconsistent indentation");
+                return true;
+            }
+            lexer->pending_dedents = levels > 0 ? levels - 1 : 0;
+            *layout = lexer_layout_token(lexer, TOKEN_DEDENT, "DEDENT");
+            return true;
         }
     }
+    return false;
 }
 
 Token lexer_next_token(Lexer *lexer) {
-    skip_whitespace_and_comments(lexer);
+    Token layout;
+    if (lexer_prepare_layout(lexer, &layout)) return layout;
+    while (1) {
+        char whitespace = peek(lexer);
+        if (whitespace == ' ' || whitespace == '\t' || whitespace == '\r') {
+            advance(lexer);
+            continue;
+        }
+        if (whitespace == '#') {
+            while (peek(lexer) != '\n' && peek(lexer) != '\0') advance(lexer);
+            if (lexer_prepare_layout(lexer, &layout)) return layout;
+            continue;
+        }
+        if (whitespace == '\n') {
+            advance(lexer);
+            if (lexer_prepare_layout(lexer, &layout)) return layout;
+            continue;
+        }
+        break;
+    }
 
     Token token;
     token.line = lexer->line;
@@ -90,15 +181,18 @@ Token lexer_next_token(Lexer *lexer) {
         else if (strcmp(token.text, "return") == 0) token.type = TOKEN_RETURN;
         else if (strcmp(token.text, "if") == 0) token.type = TOKEN_IF;
         else if (strcmp(token.text, "else") == 0) token.type = TOKEN_ELSE;
+        else if (strcmp(token.text, "elif") == 0) token.type = TOKEN_ELIF;
         else if (strcmp(token.text, "while") == 0) token.type = TOKEN_WHILE;
         else if (strcmp(token.text, "asm") == 0) token.type = TOKEN_ASM;
         else if (strcmp(token.text, "print") == 0) token.type = TOKEN_PRINT;
         else if (strcmp(token.text, "assert") == 0) token.type = TOKEN_ASSERT;
         else if (strcmp(token.text, "not") == 0) token.type = TOKEN_NOT;
+        else if (strcmp(token.text, "and") == 0) token.type = TOKEN_AND;
+        else if (strcmp(token.text, "or") == 0) token.type = TOKEN_OR;
         else if (strcmp(token.text, "const") == 0) token.type = TOKEN_CONST;
-        else if (strcmp(token.text, "true") == 0) token.type = TOKEN_TRUE;
-        else if (strcmp(token.text, "false") == 0) token.type = TOKEN_FALSE;
-        else if (strcmp(token.text, "none") == 0) token.type = TOKEN_NONE;
+        else if (strcmp(token.text, "true") == 0 || strcmp(token.text, "True") == 0) token.type = TOKEN_TRUE;
+        else if (strcmp(token.text, "false") == 0 || strcmp(token.text, "False") == 0) token.type = TOKEN_FALSE;
+        else if (strcmp(token.text, "none") == 0 || strcmp(token.text, "None") == 0) token.type = TOKEN_NONE;
         else if (strcmp(token.text, "len") == 0) token.type = TOKEN_LEN;
         else if (strcmp(token.text, "with") == 0) token.type = TOKEN_WITH;
         else if (strcmp(token.text, "region") == 0) token.type = TOKEN_REGION;
@@ -278,8 +372,14 @@ Token lexer_next_token(Lexer *lexer) {
                 }
             }
             break;
-        case '[': token.type = TOKEN_LBRACKET; break;
-        case ']': token.type = TOKEN_RBRACKET; break;
+        case '[':
+            token.type = TOKEN_LBRACKET;
+            lexer->bracket_depth++;
+            break;
+        case ']':
+            token.type = TOKEN_RBRACKET;
+            if (lexer->bracket_depth > 0) lexer->bracket_depth--;
+            break;
         case '?': token.type = TOKEN_QUESTION; break;
         case '|':
             if (peek(lexer) == '>') {
@@ -290,10 +390,22 @@ Token lexer_next_token(Lexer *lexer) {
                 token.type = TOKEN_UNKNOWN;
             }
             break;
-        case '(': token.type = TOKEN_LPAREN; break;
-        case ')': token.type = TOKEN_RPAREN; break;
-        case '{': token.type = TOKEN_LBRACE; break;
-        case '}': token.type = TOKEN_RBRACE; break;
+        case '(':
+            token.type = TOKEN_LPAREN;
+            lexer->paren_depth++;
+            break;
+        case ')':
+            token.type = TOKEN_RPAREN;
+            if (lexer->paren_depth > 0) lexer->paren_depth--;
+            break;
+        case '{':
+            token.type = TOKEN_LBRACE;
+            lexer->brace_depth++;
+            break;
+        case '}':
+            token.type = TOKEN_RBRACE;
+            if (lexer->brace_depth > 0) lexer->brace_depth--;
+            break;
         default: token.type = TOKEN_UNKNOWN; break;
     }
 

@@ -1,14 +1,14 @@
 # Backend IR Design
 
-This document describes the first backend-IR foundation: a flat,
+This document describes the backend-IR pipeline: a flat,
 arena-backed SSA representation with an explicit CFG and an i64/i32/u32/u64/
 bool/f32/f64/u8 HIR subset plus bounded fixed value arrays, value-owned
 scalar-field structs and borrowed readonly slice views, scalar dynamic buffers,
 direct owning string and owning Option/Result payloads, and ownership-bearing
-struct fields, built as a separate, isolated component. It is **not**
-wired into the existing direct-to-assembly pipeline yet. The legacy `CobraIR` (src/ir.c) remains a separate validation pass over the
-AST; production codegen continues to consume the AST directly. The isolated
-backend does not replace that production path.
+struct fields. The HIR → SSA → MIR → x86-64 assembly/object path is linked into
+the production `cobra` binary and selected with `--backend=native`; the direct
+emitter (`src/codegen.c`) remains the default. The legacy `CobraIR` (`src/ir.c`)
+remains a separate validation pass over the AST.
 
 Generic borrowed-view structs are concrete, readonly aggregate values in this
 lane. Their scalar type parameter is substituted before import, and a view field
@@ -27,8 +27,8 @@ Cobra source
   -> block-argument SSA                                    <-- new
   -> [verifier, textual dump, evaluator]
   -> target-independent MIR + MIR verifier + MIR dump
-  -> isolated Linux x86-64 assembly emitter with scalar and supported owning aggregates <-- new
-  -> existing IR validation / native codegen (unchanged)
+  -> Linux x86-64 assembly or ELF object emitter with scalar and supported owning aggregates <-- new
+  -> direct emitter when `--backend=direct` (the default)
 ```
 
 ## 1. Responsibilities: HIR versus SSA
@@ -119,18 +119,17 @@ field, and indexing is lowered to a verifier-checked byte address. Scalar
 append growth, pop, indexed access, calls, returns, and destruction. The
 buffer lane accepts scalar and value-only struct elements; its ABI passes the
 pointer, length, and capacity parts, with the capacity part discarded by the
-native view model on receive and passed as length on call. The lane remains
-isolated from production codegen.
+native view model on receive and passed as length on call. It is a limited subset of the `--backend=native` path.
 
 The HIR builder never constructs SSA, and the parser is never asked to
 produce SSA. Unsupported AST forms (tensors, ownership-bearing generic
 structs, non-scalar generic collections, unresolved generic declarations,
 dynamic buffers with owning elements, writable generic-view fields, and
 ownership-bearing aggregate forms not listed above) are rejected
-with an explicit builder diagnostic. The isolated lane accepts owned strings, owned slices, and
-owning sums in struct fields, but it still rejects ownership-bearing forms
-outside that contract. This keeps the new lane separate from the remaining
-ownership/generic machinery that the existing compiler validates.
+with an explicit builder diagnostic. The backend lane accepts owned strings,
+owned slices, and owning sums in struct fields, but it still rejects
+ownership-bearing forms outside that contract. Unsupported forms remain
+explicit backend-subset diagnostics while coverage is expanded.
 
 **Block-argument SSA.** The SSA pass is a dedicated consumer of the HIR. It
 linearizes each block's expression trees into SSA instructions, replaces
@@ -582,15 +581,15 @@ basis for differential tests against the existing host interpreter.
 - verified SSA to MIR lowering, virtual-register definitions, machine types,
   CFG edges, ABI moves, calls, returns, clobber sets, deterministic dumps, and
   MIR rejection of malformed call metadata;
-- isolated x86-64 assembly emission for scalar calls, branches, stack memory,
-  f32/f64 arithmetic, returns, ABI moves, view bounds checks, and writable
-  stores;
+- x86-64 assembly and ELF object emission for scalar calls, branches, stack
+  memory, f32/f64 arithmetic, returns, ABI moves, view bounds checks, and
+  writable stores;
 - native scalar-field struct parameter copies, aggregate calls, field access,
   caller-provided returns, and execution through both spill-all and allocated
   emitters;
 - native readonly and writable view ABI calls, returns, indexed access, and
   execution through both spill-all and allocated emitters;
-- isolated evaluator lowering for ownership-bearing struct fields, including
+- backend-IR evaluator lowering for ownership-bearing struct fields, including
   field replacement, recursive cleanup, parameter moves, and caller-storage
   returns;
 - native owning Option/Result payloads and ownership-bearing struct fields,
@@ -626,15 +625,17 @@ bindings lower through the checked sum-access lane (see section 13.8.2). The bac
 prototype's frame-local `pointer[T]` descriptors are owned by its canonical
 arena and are not frontend source declarations.
 
-The isolated backend modules live under `src/backend_ir/` and are compiled
-and tested on their own; HIR, SSA, and MIR are not linked into the production
-`cobra` binary yet.
+The backend-IR modules live under `src/backend_ir/`, are compiled into the
+production `cobra` binary, and are selectable with `--backend=native`. They are
+also compiled and tested independently through the backend-IR test target,
+giving the lane focused verifier, evaluator, lowering, allocator, and
+native-emission coverage.
 
 ## 13. Explicit non-goals for this milestone
 
-- No target-specific register allocation completion, instruction selection,
-  object/binary writers, JIT, or new targets. The isolated scalar lane already
-  has a verified linear-scan allocation pass and an allocated x86-64 emitter.
+- No JIT or new targets. The scalar lane has a verified linear-scan
+  allocation pass, allocated x86-64 assembly emission, and ELF object output.
+  Instruction selection and frame optimization remain intentionally narrow.
 - No replacement of the existing direct emitter or the existing `CobraIR`
   validation pass.
 - No weakening of ownership/region/lifetime rules; aggregate storage is
@@ -642,7 +643,8 @@ and tested on their own; HIR, SSA, and MIR are not linked into the production
   ownership and use explicit caller storage, while pointer origins, region
   lifetimes, explicit transfer, destruction, and memory effects are verified
   without full alias analysis or general flow-sensitive move analysis.
-- Owned slices in the isolated backend contract are implemented and tested:  explicit `slice_alloc`/`slice_free` with use-after-free and double-free
+- Owned slices in the backend-IR contract are implemented and tested: explicit
+  `slice_alloc`/`slice_free` with use-after-free and double-free
   rejection and borrow-conflict checks against active views. Source-level
   owned slice locals, `alloc_i64`/`alloc_f32`/`alloc_u8` creation, `free`
   destruction, indexed reads/writes, `len`, `slice_u8` subviews of owned
@@ -667,8 +669,8 @@ and tested on their own; HIR, SSA, and MIR are not linked into the production
 - No general borrow checker for arbitrary source CFGs yet; the verifier's
   ownership state is conservative and rejects ambiguous path joins.
 - No native global addresses, object-boundary alias analysis, or general
-  native pointer ABI lowering. The isolated view lane is the explicit
-  exception and receives pointer-plus-length values through its verified ABI.
+  native pointer ABI lowering. The backend-IR view lane is the explicit exception and receives
+  pointer-plus-length values through its verified ABI.
   Native writable-view stores, heap-backed owned slices, region cleanup, scalar
   sum checks, owned-slice argument moves, descriptor transfers, explicit
   destruction, supported owning sum payloads, and ownership-bearing struct
@@ -697,7 +699,7 @@ The HIR builder lowers these Cobra source forms today:
   whole-struct element writes, aggregate-returning calls stored directly into
   element and field slots, array parameters, struct fields, calls and
   returns, and inline aggregate copies in both native emitters; owning-struct
-  elements are rejected at the isolated boundary;
+  elements are rejected at the backend-IR boundary;
 - `if`/`else`, `while`, `for` over a scalar bound, `range(a, b)`, and constant
   array literals (unrolled up to 64 elements);
 - value-owned structs with scalar, owned string, owned slice, and owning
@@ -726,7 +728,7 @@ The HIR builder lowers these Cobra source forms today:
   reads, `len`, growth, ownership-moving calls and returns, explicit `free`,
   bounds failures, and malformed-IR checks;
 - `with region NAME(capacity):` blocks with `NAME.alloc_*` region-qualified
-  allocations; the isolated evaluator models region exit as the cleanup
+  allocations; the backend-IR evaluator models region exit as the cleanup
   boundary (the capacity expression is accepted but not enforced);
 - non-owning scalar sums: `Option[T]`/`Result[T, E]` with scalar components
   (`i64`/`i32`/`u32`/`u64`/`bool`/`f32`/`f64`/`u8` payloads), `some`/`none`/
@@ -791,12 +793,11 @@ Exact source forms that still cannot lower into backend IR:
 
 ## 13.5.1 Dynamic buffers
 
-The isolated backend represents a `list[T]` as an owned growable
+The backend-IR lane represents a `list[T]` as an owned growable
 pointer-plus-length-capacity value. The canonical type remains `list[T]`, and
 scalar and value-only struct elements are admitted in this lane; buffers of
-owning structs stay rejected. The evaluator uses a frame local byte arena,
-while the native production representation remains outside this isolated
-contract.
+owning structs stay rejected. The evaluator uses a frame-local byte arena,
+while direct and backend-native emission retain separate implementation paths.
 
 - `buffer_alloc` creates a zero-initialized buffer with the requested logical
   length and an initial capacity of at least eight elements;
@@ -821,7 +822,7 @@ deferred.
 
 ## 13.5.2 String-keyed scalar dicts
 
-The isolated backend represents a `dict[string]T` as an owned
+The backend-IR lane represents a `dict[string]T` as an owned
 pointer-plus-length view value, matching the production two-part dict ABI.
 Only scalar value types are admitted; dicts of owning or view-bearing values
 stay rejected until their growth and destruction contracts are defined.
@@ -1021,8 +1022,8 @@ Lowering notes:
 - Comparisons, predicates, and mutation remain outside this lane.
 
 Native string concatenation, explicit `string_free`, region cleanup, and
-cleanup-safe scalar and owned-view returns are implemented in the isolated x86-64
-emitters. Supported owning sum payloads and ownership-bearing struct fields now
+cleanup-safe scalar and owned-view returns are implemented in the backend
+x86-64 emitters. Supported owning sum payloads and ownership-bearing struct fields now
 use the same move and drop operations; arbitrary non-scalar aggregate ownership
 remains deferred.
 
@@ -1271,11 +1272,11 @@ Literal and coercion rules:
 
 Not in this lane: explicit casts or widening operators, and `f64` in the
 production direct emitter. The legacy validator still rejects `f64`, while the
-isolated native lane lowers and executes it.
+backend-native lane lowers and executes it.
 
 ## 13.10 ABI-neutral call model
 
-The isolated backend now materializes a `BirCallAbi` record for every function
+The backend now materializes a `BirCallAbi` record for every function
 signature. The record is owned by the canonical backend function table and is
 the only call contract consumed by verification and evaluation. It is not
 reconstructed from AST fields and it does not contain physical register names.
@@ -1333,16 +1334,17 @@ The MIR verifier checks function ownership, type and machine-type consistency,
 operand windows, result definitions, terminators, CFG edge arity, call ABI
 identity, memory effects, clobber metadata, and virtual-register dominance.
 
-MIR is still target independent. The isolated backend now has a separate
-Linux x86-64 assembly emitter that consumes MIR, but MIR itself does not select
+MIR is still target independent. The backend has Linux x86-64 assembly and
+ELF object emitters that consume MIR, but MIR itself does not select
 instructions, assign physical registers, or emit assembly. Those remain later
 target and allocation passes.
 
-## 15. Isolated Linux x86-64 emitter
+## 15. Linux x86-64 emitter
 
-`bir_x86_64_emit` consumes only verified MIR and writes GNU AT&T assembly. It
-is not linked into the production `cobra` binary and does not replace the
-existing direct emitter.
+`bir_x86_64_emit` consumes only verified MIR and writes GNU AT&T assembly;
+`bir_x86_64_emit_object` writes an ELF64 relocatable object from the same MIR.
+Both are linked into `cobra` and selected by `--backend=native`; the direct
+emitter remains the default.
 
 The bootstrap emitter supports:
 
@@ -1381,13 +1383,12 @@ transfers, and explicit destruction are implemented. Native owning sum payload
 moves and drops, ownership-bearing struct field moves and drops, and indirect
 aggregate calls and returns are implemented for the supported layouts.
 Arbitrary non-scalar aggregates remain outside this native
-lane. Target-specific fixed constraints,
-instruction selection improvements, frame optimization,
-object output, and production backend selection remain separate milestones.
+lane. Target-specific fixed constraints, instruction selection improvements,
+and frame optimization remain separate milestones.
 
 ## 16. MIR linear-scan allocation
 
-The isolated allocator consumes verified MIR and assigns virtual registers to
+The backend-IR allocator consumes verified MIR and assigns virtual registers to
 abstract GPR or XMM positions, or to function-local spill slots. Readonly view
 values use two deterministic spill components so their pointer and length stay
 paired across calls and returns. It computes
