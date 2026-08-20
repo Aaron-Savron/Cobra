@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+char *cobra_str_copy(const char *s);
+
 static void cobra_list_grow(void **data, size_t *capacity, size_t length, size_t element_size) {
     if (length == SIZE_MAX || (element_size != 0 && length + 1 > SIZE_MAX / element_size)) abort();
     size_t next = *capacity ? *capacity : 8;
@@ -32,6 +34,75 @@ void cobra_list_free(void **data, size_t *length, size_t *capacity) {
     *data = NULL;
     *length = 0;
     *capacity = 0;
+}
+
+/* Owned list[string] contract: every element slot holds an owned string the
+   list created (append copies, split allocates). Freeing a string list
+   releases each element before the block itself. */
+static void cobra_list_push_string(void **data, size_t *length, size_t *capacity, char *value) {
+    if (*length == *capacity) cobra_list_grow(data, capacity, *length, sizeof(char *));
+    ((char **)*data)[(*length)++] = value;
+}
+
+void cobra_list_append_string(void **data, size_t *length, size_t *capacity, const char *value) {
+    cobra_list_push_string(data, length, capacity, cobra_str_copy(value));
+}
+
+void cobra_list_free_strings(void **data, size_t *length, size_t *capacity) {
+    for (size_t i = 0; i < *length; i++) free(((char **)*data)[i]);
+    free(*data);
+    *data = NULL;
+    *length = 0;
+    *capacity = 0;
+}
+
+/* Splits s on every occurrence of sep into owned pieces. An empty separator
+   yields no pieces, matching a defensive reading of the Python contract. */
+void cobra_str_split(const char *s, const char *sep, void **data, size_t *length, size_t *capacity) {
+    *data = NULL;
+    *length = 0;
+    *capacity = 0;
+    if (!s || !sep || *sep == '\0') return;
+    size_t sep_len = strlen(sep);
+    const char *scan = s;
+    for (;;) {
+        const char *hit = strstr(scan, sep);
+        size_t piece_len = hit ? (size_t)(hit - scan) : strlen(scan);
+        char *piece = malloc(piece_len + 1);
+        if (!piece) abort();
+        memcpy(piece, scan, piece_len);
+        piece[piece_len] = '\0';
+        cobra_list_push_string(data, length, capacity, piece);
+        if (!hit) break;
+        scan = hit + sep_len;
+    }
+}
+
+/* Joins count owned strings with sep into a fresh owned string. */
+char *cobra_str_join(const char *sep, const char **items, size_t count) {
+    if (!sep) sep = "";
+    size_t sep_len = strlen(sep);
+    size_t total = 1;
+    for (size_t i = 0; i < count; i++) {
+        if (items[i]) total += strlen(items[i]);
+        if (i + 1 < count) total += sep_len;
+    }
+    char *out = malloc(total);
+    if (!out) abort();
+    char *w = out;
+    for (size_t i = 0; i < count; i++) {
+        if (items[i]) {
+            size_t n = strlen(items[i]);
+            memcpy(w, items[i], n);
+            w += n;
+        }
+        if (i + 1 < count) {
+            memcpy(w, sep, sep_len);
+            w += sep_len;
+        }
+    }
+    *w = '\0';
+    return out;
 }
 
 typedef struct {

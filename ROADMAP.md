@@ -38,9 +38,11 @@ Cobra currently has:
   compound assignment (`+=`, `//=`, `**=`), and parallel tuple assignment
   (`a, b = b, a`) alongside the existing brace syntax
 - String methods (`strip`/`upper`/`lower`/`replace`), slicing `s[a:b]`,
-  negative indexing, substring membership, and `f"..."` format strings
-  with `str()` conversions
-- 147 example programs (123 with `test_` suites) and 118 negative diagnostics
+  negative indexing, substring membership, `f"..."` format strings with
+  `str()` conversions, and an owned `list[string]` contract with
+  `split`/`join` (append copies, scope exit and return transfer own every
+  element, and string-element iteration)
+- 148 example programs (124 with `test_` suites) and 118 negative diagnostics
 
 The backend IR is linked into the production `cobra` binary and selectable
 with `cobra build|run <file> --backend=native` (see Phase 15 item 28 below
@@ -104,8 +106,10 @@ region provenance. Frame-local and region-local return sources remain rejected.
 append, index-read, index-write, and `for x in list` iteration, via the same
 aggregate-copy codegen path used elsewhere for value-owned structs. The loop
 variable takes the element's own canonical struct type, so normal member
-access works inside the loop body. Ownership-bearing generic values (e.g.
-`list[string]`) remain deferred.
+access works inside the loop body. Owned `list[string]` values now work too:
+append copies strings into the list, scope exit and return transfer own every
+element, iteration types the loop variable as string, and `split`/`join`
+build and consume them.
 The existing native backend still emits assembly directly. The isolated lane
 now materializes a target-neutral `BirCallAbi` for every function, including
 lowered parameter locations, hidden aggregate-return storage, abstract GPR and

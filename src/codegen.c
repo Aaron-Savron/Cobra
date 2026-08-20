@@ -639,9 +639,17 @@ static void emit_scope_cleanup(CodeGen *cg, const char *skip_name) {
         if (!s->owned || (skip_name && strcmp(skip_name, s->name) == 0)) continue;
         if (s->kind == SYM_LIST) {
             emit_list_struct_element_cleanup(cg, s);
-            fprintf(cg->out,
-                    "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free@PLT\n",
-                    s->offset, s->length_offset, s->capacity_offset);
+            if (s->element_type == COBRA_TYPE_STRING) {
+                /* Owned string elements are released before the block; the
+                   returned-list skip_name path transfers them to the caller. */
+                fprintf(cg->out,
+                        "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free_strings@PLT\n",
+                        s->offset, s->length_offset, s->capacity_offset);
+            } else {
+                fprintf(cg->out,
+                        "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free@PLT\n",
+                        s->offset, s->length_offset, s->capacity_offset);
+            }
         } else if (s->kind == SYM_DICT) {
             emit_dict_struct_element_cleanup(cg, s);
             fprintf(cg->out,
@@ -1678,6 +1686,11 @@ static void emit_list_append(CodeGen *cg, VarSymbol *s, ASTNode *value) {
         emit_copy_memory(cg, "rsi", "rdi", struct_size);
         fprintf(cg->out, "    mov rax, rdi\n");
         fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    mov rcx, QWORD PTR [rbp-%d]\n    call cobra_list_append_i64@PLT\n", temp, s->offset, s->length_offset, s->capacity_offset, temp);
+    } else if (s->element_type == COBRA_TYPE_STRING) {
+        /* The list owns its elements: append copies the string so appending
+           a literal, a borrowed value, or a fresh owned string all leave the
+           caller's copy untouched (see cobra_list_append_string). */
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    mov rcx, QWORD PTR [rbp-%d]\n    call cobra_list_append_string@PLT\n", temp, s->offset, s->length_offset, s->capacity_offset, temp);
     } else {
         fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    mov rcx, QWORD PTR [rbp-%d]\n    call cobra_list_append_i64@PLT\n", temp, s->offset, s->length_offset, s->capacity_offset, temp);
     }
@@ -2335,6 +2348,14 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
                    pointer or scalar value), so route len() through that. */
                 emit_expr(cg, a);
                 fprintf(cg->out, "    mov rdi, rax\n    call strlen@PLT\n");
+            } else if (a && a->type == AST_VAR_REF && current_iter(cg, a->name) >= 0 &&
+                       cg->loops[current_iter(cg, a->name)].element_type == COBRA_TYPE_STRING) {
+                /* string-element loop var: load the element pointer exactly
+                   like emit_expr's VAR_REF loop path, then measure it. */
+                int it = current_iter(cg, a->name);
+                fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n", cg->loops[it].index_offset);
+                emit_load_buffer_ptr(cg, cg->loops[it].source, "rbx");
+                fprintf(cg->out, "    mov rax, QWORD PTR [rbx + rdx*8]\n    mov rdi, rax\n    call strlen@PLT\n");
             } else if (a && a->type == AST_VAR_REF) {
                 VarSymbol *s = find_symbol(cg, a->name);
                 if (s && s->type == COBRA_TYPE_STRING) {
@@ -3711,6 +3732,44 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
     if (!strcmp(n->name, "upper") || !strcmp(n->name, "lower") ||
         !strcmp(n->name, "strip") || !strcmp(n->name, "replace") ||
         !strcmp(n->name, "substring")) { emit_string_method(cg, n); return; }
+    if (!strcmp(n->name, "split")) {
+        /* split(s, sep) behaves like a list-returning call: the runtime fills
+           the caller's 24-byte sret descriptor ({data, length, capacity})
+           and rax returns its address, matching the generic list-call path. */
+        int s_slot = reserve(cg, 8), sep_slot = reserve(cg, 8);
+        emit_expr(cg, n->children[0]);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", s_slot);
+        emit_expr(cg, n->children[1]);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", sep_slot);
+        fprintf(cg->out,
+                "    mov rdi, QWORD PTR [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n"
+                "    lea rdx, [rbp-%d]\n    lea rcx, [rbp-%d]\n    lea r8, [rbp-%d]\n"
+                "    call cobra_str_split@PLT\n"
+                "    lea rax, [rbp-%d]\n",
+                s_slot, sep_slot, 240, 232, 224, 240);
+        return;
+    }
+    if (!strcmp(n->name, "join")) {
+        /* join(list, sep) reads the named list's descriptor slots and returns
+           a fresh owned string in rax. */
+        if (n->child_count < 1 || n->children[0]->type != AST_VAR_REF) {
+            fprintf(stderr, "CodeGen Error: join requires a named list\n");
+            exit(EXIT_FAILURE);
+        }
+        VarSymbol *ls = find_symbol(cg, n->children[0]->name);
+        if (!ls || ls->kind != SYM_LIST) {
+            fprintf(stderr, "CodeGen Error: '%s' is not a list value\n", n->children[0]->name);
+            exit(EXIT_FAILURE);
+        }
+        int sep_slot = reserve(cg, 8);
+        emit_expr(cg, n->children[1]);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", sep_slot);
+        fprintf(cg->out,
+                "    mov rdi, QWORD PTR [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n"
+                "    mov rdx, QWORD PTR [rbp-%d]\n    call cobra_str_join@PLT\n",
+                sep_slot, ls->offset, ls->length_offset);
+        return;
+    }
     if (!strcmp(n->name, "string_free")) {
         if (n->child_count && n->children[0]->type == AST_VAR_REF) {
             VarSymbol *s = find_symbol(cg, n->children[0]->name);
@@ -3739,7 +3798,11 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
         if (n->child_count && n->children[0]->type == AST_VAR_REF) {
             VarSymbol *s = find_symbol(cg, n->children[0]->name);            if (s && s->kind == SYM_LIST) {
                 emit_list_struct_element_cleanup(cg, s);
-                fprintf(cg->out, "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free@PLT\n", s->offset, s->length_offset, s->capacity_offset);
+                if (s->element_type == COBRA_TYPE_STRING) {
+                    fprintf(cg->out, "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free_strings@PLT\n", s->offset, s->length_offset, s->capacity_offset);
+                } else {
+                    fprintf(cg->out, "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free@PLT\n", s->offset, s->length_offset, s->capacity_offset);
+                }
                 s->owned = false;
                 return;
             }
@@ -4685,7 +4748,8 @@ static void emit_for(CodeGen *cg, ASTNode *n) {
     cg->loops[cg->loop_depth].element_type = ss &&
         ((ss->type == COBRA_TYPE_SLICE_F32) ||
          ((ss->kind == SYM_LIST || ss->kind == SYM_ARRAY) && ss->element_type == COBRA_TYPE_F32)) ?
-        COBRA_TYPE_F32 : COBRA_TYPE_I64;
+        COBRA_TYPE_F32 : (ss && ((ss->kind == SYM_LIST || ss->kind == SYM_ARRAY) &&
+                                 ss->element_type == COBRA_TYPE_STRING) ? COBRA_TYPE_STRING : COBRA_TYPE_I64);
     if (!source && !is_range) {
         VarSymbol *iter_symbol = ensure_scalar(cg, n->name, COBRA_TYPE_I64);
         fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", index, iter_symbol->offset);
@@ -5001,9 +5065,15 @@ static void emit_loop_owned_cleanup(CodeGen *cg, ASTNode *body) {
         if (!s || !s->owned) continue;
         if (s->kind == SYM_LIST) {
             emit_list_struct_element_cleanup(cg, s);
-            fprintf(cg->out,
-                    "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free@PLT\n",
-                    s->offset, s->length_offset, s->capacity_offset);
+            if (s->element_type == COBRA_TYPE_STRING) {
+                fprintf(cg->out,
+                        "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free_strings@PLT\n",
+                        s->offset, s->length_offset, s->capacity_offset);
+            } else {
+                fprintf(cg->out,
+                        "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call cobra_list_free@PLT\n",
+                        s->offset, s->length_offset, s->capacity_offset);
+            }
             s->owned = false;
         } else if (s->kind == SYM_DICT) {
             emit_dict_struct_element_cleanup(cg, s);

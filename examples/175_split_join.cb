@@ -1,0 +1,49 @@
+# split/join over the owned list[string] contract: split produces owned
+# copies, append copies strings into the list, and both scope exit and
+# return transfer own every element.
+def test_split_basic() -> i64:
+    let msg: string = "a,b,c"
+    let parts: list[string] = split(msg, ",")
+    assert len(parts) == 3
+    assert parts[0] == "a"
+    assert parts[1] == "b"
+    assert parts[2] == "c"
+    return 0
+
+def test_join_method() -> i64:
+    let parts: list[string] = []
+    append(parts, "one")
+    append(parts, "two")
+    append(parts, "three")
+    assert parts.join(", ") == "one, two, three"
+    return 0
+
+def test_roundtrip() -> i64:
+    let msg: string = "hello world cobra"
+    let words: list[string] = split(msg, " ")
+    joined: string = words.join(" ")
+    assert joined == msg
+    return 0
+
+def test_iterate_and_measure() -> i64:
+    let parts: list[string] = split("a b c", " ")
+    let total: i64 = 0
+    for w in parts:
+        total = total + len(w)
+    assert total == 3
+    return 0
+
+def build_words() -> list[string]:
+    let ws: list[string] = []
+    let i: i64 = 0
+    while i < 3:
+        append(ws, "word-" + str(i))
+        i = i + 1
+    return ws
+
+def test_return_transfer() -> i64:
+    let got: list[string] = build_words()
+    assert len(got) == 3
+    assert got[2] == "word-2"
+    assert got.join(" ") == "word-0 word-1 word-2"
+    return 0

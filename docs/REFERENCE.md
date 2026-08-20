@@ -306,6 +306,7 @@ A match without `else` must cover every variant. An `else` arm handles the remai
 | `concat` | Allocate an owned string containing two strings joined together |
 | `str` | Allocate an owned string from an integer, float, bool, or string value |
 | `f"..."` | Format string: `{expr}` holes lower to `str()` joined with `+`; `{{`/`}}` escape literal braces |
+| `split` / `join` | Split a string into an owned `list[string]`, or join a `list[string]` with a separator into an owned string |
 | `string_from_bytes` | Allocate an owned string by copying `len` bytes out of a `[]u8` buffer |
 | `starts_with` / `ends_with` / `contains` | Native string predicates returning integer booleans |
 | `char_at` | Bounds-checked byte lookup |

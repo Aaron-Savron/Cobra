@@ -775,7 +775,8 @@ static bool is_string_builtin(const char *name) {
            strcmp(name, "ends_with") == 0 || strcmp(name, "contains") == 0 ||
            strcmp(name, "char_at") == 0 || strcmp(name, "upper") == 0 ||
            strcmp(name, "lower") == 0 || strcmp(name, "strip") == 0 ||
-           strcmp(name, "replace") == 0 || strcmp(name, "substring") == 0;
+           strcmp(name, "replace") == 0 || strcmp(name, "substring") == 0 ||
+           strcmp(name, "split") == 0;
 }
 
 static bool is_string_free_builtin(const char *name) {
@@ -2486,6 +2487,20 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                         node->children[shift] = node->children[shift - 1];
                     node->children[0] = receiver_ref;
                     node->qualifier[0] = '\0';
+                } else if (receiver_local && receiver_local->type == COBRA_TYPE_LIST &&
+                           !strcmp(node->name, "join")) {
+                    /* xs.join(sep) lowers to join(xs, sep): the receiver is
+                       prepended like the string method calls, so direct and
+                       method forms share one (list, separator) contract. */
+                    ASTNode *receiver_ref = ast_create_node(AST_VAR_REF, node->qualifier);
+                    receiver_ref->source_line = node->source_line;
+                    receiver_ref->source_col = node->source_col;
+                    snprintf(receiver_ref->source_file, sizeof(receiver_ref->source_file), "%.127s", node->source_file);
+                    ast_add_child(node, receiver_ref);
+                    for (size_t shift = node->child_count - 1; shift > 0; shift--)
+                        node->children[shift] = node->children[shift - 1];
+                    node->children[0] = receiver_ref;
+                    node->qualifier[0] = '\0';
                 }
             }
             ASTNode *called_function = find_function(ctx, node->name);
@@ -2888,6 +2903,44 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                     if (!is_integer(arg) && arg != COBRA_TYPE_F32 && arg != COBRA_TYPE_F64 &&
                         arg != COBRA_TYPE_BOOL && arg != COBRA_TYPE_STRING && arg != COBRA_TYPE_UNKNOWN) {
                         ir_error(ctx, node, "str argument must be a scalar or string value");
+                    }
+                }
+                node->value_type = COBRA_TYPE_STRING;
+                node->fresh_string_result = true;
+                return node->value_type;
+            }
+            if (strcmp(node->name, "split") == 0) {
+                /* split(s, sep) returns an owned list[string]; each piece is
+                   an owned copy the list frees on scope exit. */
+                if (node->child_count != 2) {
+                    ir_error(ctx, node, "split requires (string, separator)");
+                } else {
+                    CobraTypeKind s = infer_expr(node->children[0], ctx);
+                    CobraTypeKind sep = infer_expr(node->children[1], ctx);
+                    if ((s != COBRA_TYPE_STRING && s != COBRA_TYPE_UNKNOWN) ||
+                        (sep != COBRA_TYPE_STRING && sep != COBRA_TYPE_UNKNOWN))
+                        ir_error(ctx, node, "split arguments must be strings");
+                }
+                node->value_type = COBRA_TYPE_LIST;
+                return node->value_type;
+            }
+            if (strcmp(node->name, "join") == 0) {
+                /* join(list, sep) joins owned strings into a fresh owned
+                   string; the receiver-first method form lowers here too. */
+                if (node->child_count != 2) {
+                    ir_error(ctx, node, "join requires (list, separator)");
+                } else {
+                    CobraTypeKind list_t = infer_expr(node->children[0], ctx);
+                    CobraTypeKind sep = infer_expr(node->children[1], ctx);
+                    if (list_t != COBRA_TYPE_LIST && list_t != COBRA_TYPE_UNKNOWN)
+                        ir_error(ctx, node, "join list argument must be a list");
+                    if (sep != COBRA_TYPE_STRING && sep != COBRA_TYPE_UNKNOWN)
+                        ir_error(ctx, node, "join separator must be a string");
+                    if (node->children[0]->type == AST_VAR_REF && list_t == COBRA_TYPE_LIST) {
+                        IRLocal *list_local = find_local_entry(ctx, node->children[0]->name);
+                        if (list_local && list_local->element_type != COBRA_TYPE_UNTYPED &&
+                            list_local->element_type != COBRA_TYPE_STRING)
+                            ir_error(ctx, node, "join requires a list of strings");
                     }
                 }
                 node->value_type = COBRA_TYPE_STRING;
@@ -4515,6 +4568,9 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                             iterator_type = COBRA_TYPE_F32;
                         else if (source && source->type == COBRA_TYPE_SLICE_F32)
                             iterator_type = COBRA_TYPE_F32;
+                        else if (source && (source->type == COBRA_TYPE_LIST || source->type == COBRA_TYPE_ARRAY) &&
+                                 canonical_element_kind(source->canonical_type) == COBRA_TYPE_STRING)
+                            iterator_type = COBRA_TYPE_STRING;
                     }
                 } else if (target->type == AST_VAR_REF) {
                     IRLocal *source = find_local_entry(ctx, target->name);
@@ -4534,6 +4590,9 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                         iterator_type = COBRA_TYPE_F32;
                     else if (source && source->type == COBRA_TYPE_SLICE_F32)
                         iterator_type = COBRA_TYPE_F32;
+                    else if (source && (source->type == COBRA_TYPE_LIST || source->type == COBRA_TYPE_ARRAY) &&
+                             canonical_element_kind(source->canonical_type) == COBRA_TYPE_STRING)
+                        iterator_type = COBRA_TYPE_STRING;
                     else if (source && (source->type == COBRA_TYPE_LIST || source->type == COBRA_TYPE_ARRAY) &&
                              canonical_element_kind(source->canonical_type) == COBRA_TYPE_STRUCT) {
                         iterator_type = COBRA_TYPE_STRUCT;
