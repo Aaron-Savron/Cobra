@@ -1,0 +1,7 @@
+# Indentation inside an open parenthesis carries no block structure, so the
+# continuation line is ignored and the subsequent dedent to column 2 must be
+# rejected as inconsistent rather than silently accepted.
+def f() -> i64:
+    total = (1 +
+        2)
+  return total

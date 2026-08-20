@@ -1296,6 +1296,29 @@ static ASTNode *parse_block(Parser *parser);
 static ASTNode *parse_if_chain(Parser *parser);
 
 static ASTNode *parse_statement(Parser *parser) {
+    /* The lexer reports malformed indentation as TOKEN_UNKNOWN with a
+       descriptive message. A stray INDENT/DEDENT means the layout does not
+       match the grammar (for example, an indented line that does not follow
+       a block-opening statement). */
+    if (match(parser, TOKEN_UNKNOWN)) {
+        fprintf(stderr, "%s:%d:%d: error: %s\n",
+                parser->source_file, parser->current_token.line,
+                parser->current_token.col, parser->current_token.text);
+        exit(1);
+    }
+    if (match(parser, TOKEN_INDENT)) {
+        fprintf(stderr, "%s:%d:%d: error: unexpected indent\n",
+                parser->source_file, parser->current_token.line,
+                parser->current_token.col);
+        exit(1);
+    }
+    if (match(parser, TOKEN_DEDENT)) {
+        fprintf(stderr, "%s:%d:%d: error: unexpected dedent\n",
+                parser->source_file, parser->current_token.line,
+                parser->current_token.col);
+        exit(1);
+    }
+
     // @compute block for hardware vectorization / SIMD GPU dispatch
     if (match(parser, TOKEN_COMPUTE)) {
         advance_token(parser);

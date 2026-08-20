@@ -1,0 +1,6 @@
+# A tab counts as four columns. The first body line (two tabs) is therefore
+# at column 8, and the following four-space line dedents to a column that
+# matches no enclosing level, which must be rejected.
+def f() -> i64:
+		x: i64 = 1
+    return x

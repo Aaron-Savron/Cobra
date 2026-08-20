@@ -1,0 +1,8 @@
+# A dedent must land on an existing indentation level. Column 2 matches
+# neither the function body (4) nor the top level (0), so this is malformed
+# Python-style layout and must be rejected.
+def f() -> i64:
+    if True:
+        return 1
+  else:
+        return 2
