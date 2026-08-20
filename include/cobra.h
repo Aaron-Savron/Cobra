@@ -578,6 +578,7 @@ int cobra_type_field_offset(CobraTypeArena *arena, ASTNode *root,
                             const char *struct_name, const char *field_name);
 
 ASTNode *ast_create_node(ASTNodeType type, const char *name);
+ASTNode *ast_clone_node(const ASTNode *node);
 void ast_add_child(ASTNode *parent, ASTNode *child);
 void ast_free(ASTNode *node);
 void ast_print(ASTNode *node, int indent);

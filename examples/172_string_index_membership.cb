@@ -1,0 +1,29 @@
+# String indexing (one byte, like char_at) and `in`/`not in` substring tests.
+def test_string_index() -> i64:
+    msg: string = "hello cobra"
+    assert(msg[0] == 104)
+    assert(msg[4] == 111)
+    return 0
+
+def test_string_membership() -> i64:
+    msg: string = "hello cobra"
+    assert("ell" in msg)
+    assert("xyz" not in msg)
+    assert("" in msg)
+    return 0
+
+def test_string_index_loop() -> i64:
+    msg: string = "cobra"
+    total: i64 = 0
+    i: i64 = 0
+    while i < len(msg):
+        total = total + msg[i]
+        i = i + 1
+    assert(total == 519)
+    return 0
+
+def test_python_surface() -> i64:
+    assert(test_string_index() == 0)
+    assert(test_string_membership() == 0)
+    assert(test_string_index_loop() == 0)
+    return 0

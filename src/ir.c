@@ -2196,6 +2196,9 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                 if (container == COBRA_TYPE_DICT) {
                     if (element != COBRA_TYPE_STRING && element != COBRA_TYPE_UNKNOWN)
                         ir_error(ctx, node, "dict membership requires a string key");
+                } else if (container == COBRA_TYPE_STRING) {
+                    if (element != COBRA_TYPE_STRING && element != COBRA_TYPE_UNKNOWN)
+                        ir_error(ctx, node, "string membership requires a string value");
                 } else if                (container == COBRA_TYPE_LIST || container == COBRA_TYPE_ARRAY ||
                            container == COBRA_TYPE_SLICE || container == COBRA_TYPE_SLICE_U8 ||
                            container == COBRA_TYPE_UNKNOWN) {
@@ -2203,7 +2206,7 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                     if (element != COBRA_TYPE_UNKNOWN && !is_integer(element) && element != COBRA_TYPE_F32)
                         ir_error(ctx, node, "collection membership requires a scalar value");
                 } else {
-                    ir_error(ctx, node, "membership requires a list, array, slice, or dict");
+                    ir_error(ctx, node, "membership requires a list, array, slice, dict, or string");
                 }
             }
             node->value_type = COBRA_TYPE_I64;
@@ -2284,7 +2287,7 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                 ir_error(ctx, node, message);
             } else if (base_type != COBRA_TYPE_ARRAY && !is_slice_type(base_type) &&
                        base_type != COBRA_TYPE_LIST && base_type != COBRA_TYPE_DICT &&
-                       base_type != COBRA_TYPE_UNKNOWN) {
+                       base_type != COBRA_TYPE_STRING && base_type != COBRA_TYPE_UNKNOWN) {
                 char message[160];
                 snprintf(message, sizeof(message), "'%s' is not indexable", node->name);
                 ir_error(ctx, node, message);
@@ -2846,6 +2849,23 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                     CobraTypeKind len = infer_expr(node->children[1], ctx);
                     if (!is_integer(len) && len != COBRA_TYPE_UNKNOWN) {
                         ir_error(ctx, node, "string_from_bytes second argument must be an integer length");
+                    }
+                }
+                node->value_type = COBRA_TYPE_STRING;
+                node->fresh_string_result = true;
+                return node->value_type;
+            }
+            if (strcmp(node->name, "str") == 0) {
+                /* `str(value)` converts a scalar to a freshly allocated owned
+                   string, mirroring concat's allocation contract. */
+                if (node->child_count != 1) {
+                    ir_error(ctx, node, "str requires exactly one argument");
+                }
+                if (node->child_count > 0) {
+                    CobraTypeKind arg = infer_expr(node->children[0], ctx);
+                    if (!is_integer(arg) && arg != COBRA_TYPE_F32 && arg != COBRA_TYPE_F64 &&
+                        arg != COBRA_TYPE_BOOL && arg != COBRA_TYPE_UNKNOWN) {
+                        ir_error(ctx, node, "str argument must be a scalar value");
                     }
                 }
                 node->value_type = COBRA_TYPE_STRING;
@@ -4563,6 +4583,12 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
             break;
         }
         case AST_PRINT_STMT:
+            for (size_t i = 0; i < node->child_count; i++) {
+                reject_illegal_float_context(node->children[i], ctx,
+                                             "scalar f32 expressions are not yet supported");
+                (void)infer_expr(node->children[i], ctx);
+            }
+            break;
         case AST_ASSERT_STMT:
             if (node->child_count > 0) {
                 reject_illegal_float_context(node->children[0], ctx,

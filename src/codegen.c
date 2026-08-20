@@ -1836,6 +1836,18 @@ static void emit_index_read(CodeGen *cg, const char *name, ASTNode **indices, si
     }
     int fail = cg->label_count++;
     emit_expr(cg, indices[0]); fprintf(cg->out, "    mov rdx, rax\n");
+    if (s->type == COBRA_TYPE_STRING) {
+        /* String indexing reads one byte with a runtime bounds check, matching
+           char_at's contract. Strings have no length slot, so measure at use. */
+        int index_slot = reserve(cg, 8);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rdx\n    cmp rdx, 0\n    jl .Lidx_fail_%d\n", index_slot, fail);
+        fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    call strlen@PLT\n    cmp QWORD PTR [rbp-%d], rax\n    jae .Lidx_fail_%d\n", s->offset, index_slot, fail);
+        fprintf(cg->out, "    mov rbx, QWORD PTR [rbp-%d]\n    mov rdx, QWORD PTR [rbp-%d]\n    movzx eax, BYTE PTR [rbx + rdx]\n    jmp .Lidx_done_%d\n", s->offset, index_slot, fail);
+        fprintf(cg->out, ".Lidx_fail_%d:\n", fail);
+        emit_failure_at(cg, indices[0], "string index out of bounds");
+        fprintf(cg->out, ".Lidx_done_%d:\n", fail);
+        return;
+    }
     if (s->kind == SYM_TENSOR && count > 1) {
         int i0 = reserve(cg, 8), i1 = reserve(cg, 8);
         fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rdx\n    cmp QWORD PTR [rbp-%d], 2\n    jne .Lidx_fail_%d\n    cmp rdx, QWORD PTR [rbp-%d]\n    jae .Lidx_fail_%d\n", i0, s->rank_offset, fail, s->dim_offsets[0], fail);
@@ -2236,6 +2248,12 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
                 fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", s->offset, dict_ptr);
                 emit_expr(cg, element);
                 fprintf(cg->out, "    mov rsi, rax\n    mov rdi, QWORD PTR [rbp-%d]\n    call cobra_dict_has@PLT\n    test rax, rax\n", dict_ptr);
+                if (negated) fprintf(cg->out, "    sete al\n"); else fprintf(cg->out, "    setne al\n");
+                fprintf(cg->out, "    movzx eax, al\n");
+            } else if (s && s->type == COBRA_TYPE_STRING) {
+                /* Substring test: reuse strstr, the same helper as `contains`. */
+                emit_expr(cg, element);
+                fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n    mov rdi, QWORD PTR [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    call strstr@PLT\n    test rax, rax\n", needle, s->offset, needle);
                 if (negated) fprintf(cg->out, "    sete al\n"); else fprintf(cg->out, "    setne al\n");
                 fprintf(cg->out, "    movzx eax, al\n");
             } else {
@@ -3457,6 +3475,18 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
     }
     if (!strcmp(n->name, "concat")) { emit_string_concat(cg, n); return; }
     if (!strcmp(n->name, "string_from_bytes")) { emit_string_from_bytes(cg, n); return; }
+    if (!strcmp(n->name, "str")) {
+        /* str(value) allocates a fresh owned string via asprintf. */
+        int out = reserve(cg, 8);
+        emit_expr(cg, n->children[0]);
+        if (expression_is_float_codegen(cg, n->children[0])) {
+            fprintf(cg->out, "    lea rdi, [rbp-%d]\n    cvtss2sd xmm0, xmm0\n    lea rsi, [rip + .fmt_float_nn]\n    mov al, 1\n    call asprintf@PLT\n", out);
+        } else {
+            fprintf(cg->out, "    lea rdi, [rbp-%d]\n    lea rsi, [rip + .fmt_int_nn]\n    mov rdx, rax\n    xor eax, eax\n    call asprintf@PLT\n", out);
+        }
+        fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n", out);
+        return;
+    }
     if (!strcmp(n->name, "some") || !strcmp(n->name, "none") ||
         !strcmp(n->name, "ok") || !strcmp(n->name, "err")) {
         bool result = !strcmp(n->name, "ok") || !strcmp(n->name, "err");
@@ -5347,17 +5377,35 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
         }
         case AST_PRINT_STMT:
             if (n->child_count) {
-                emit_expr(cg, n->children[0]);
-                if (n->children[0]->value_type == COBRA_TYPE_STRING) {
-                    fprintf(cg->out, "    mov rsi, rax\n    lea rdi, [rip + .fmt_string]\n    xor eax, eax\n    call printf@PLT\n");
-                } else if (expression_is_float_codegen(cg, n->children[0])) {
-                    /* Float values arrive in xmm0 from emit_expr, not rax; printf's
-                       variadic float promotion expects a double, and SysV requires
-                       al to hold the vector-register argument count. */
-                    fprintf(cg->out, "    cvtss2sd xmm0, xmm0\n    lea rdi, [rip + .fmt_float]\n    mov al, 1\n    call printf@PLT\n");
-                } else {
-                    fprintf(cg->out, "    mov rsi, rax\n    lea rdi, [rip + .fmt_int]\n    xor eax, eax\n    call printf@PLT\n");
+                if (n->child_count == 1) {
+                    emit_expr(cg, n->children[0]);
+                    if (n->children[0]->value_type == COBRA_TYPE_STRING) {
+                        fprintf(cg->out, "    mov rsi, rax\n    lea rdi, [rip + .fmt_string]\n    xor eax, eax\n    call printf@PLT\n");
+                    } else if (expression_is_float_codegen(cg, n->children[0])) {
+                        /* Float values arrive in xmm0 from emit_expr, not rax; printf's
+                           variadic float promotion expects a double, and SysV requires
+                           al to hold the vector-register argument count. */
+                        fprintf(cg->out, "    cvtss2sd xmm0, xmm0\n    lea rdi, [rip + .fmt_float]\n    mov al, 1\n    call printf@PLT\n");
+                    } else {
+                        fprintf(cg->out, "    mov rsi, rax\n    lea rdi, [rip + .fmt_int]\n    xor eax, eax\n    call printf@PLT\n");
+                    }
+                    return;
                 }
+                /* Multiple arguments print space-separated on one line. */
+                for (size_t i = 0; i < n->child_count; i++) {
+                    emit_expr(cg, n->children[i]);
+                    if (n->children[i]->value_type == COBRA_TYPE_STRING) {
+                        fprintf(cg->out, "    mov rsi, rax\n    lea rdi, [rip + .fmt_string_nn]\n    xor eax, eax\n    call printf@PLT\n");
+                    } else if (expression_is_float_codegen(cg, n->children[i])) {
+                        fprintf(cg->out, "    cvtss2sd xmm0, xmm0\n    lea rdi, [rip + .fmt_float_nn]\n    mov al, 1\n    call printf@PLT\n");
+                    } else {
+                        fprintf(cg->out, "    mov rsi, rax\n    lea rdi, [rip + .fmt_int_nn]\n    xor eax, eax\n    call printf@PLT\n");
+                    }
+                    if (i + 1 < n->child_count) {
+                        fprintf(cg->out, "    lea rdi, [rip + .fmt_space]\n    xor eax, eax\n    call printf@PLT\n");
+                    }
+                }
+                fprintf(cg->out, "    lea rdi, [rip + .fmt_newline]\n    xor eax, eax\n    call printf@PLT\n");
             }
             return;
         case AST_MATCH_STMT: {
@@ -5538,16 +5586,23 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
     cg->out = mem;
 
     fprintf(cg->out, "    .intel_syntax noprefix\n");
+    /* A sum-returning `main` cannot use the hidden sret ABI directly: the
+       process entry point calls main(argc, argv), so the first argument is
+       not a caller-provided result buffer. Emit the body under an internal
+       name and emit a real `main:` wrapper that allocates the result buffer
+       and maps the tagged result onto a process exit status. */
+    bool main_sum_wrapper = sum_return && !strcmp(fn->name, "main");
+    const char *func_label = main_sum_wrapper ? "cobra_main_inner" : fn->name;
     /* The native test runner calls test_* functions from a separate C
        translation unit. They remain externally visible only in test mode;
        ordinary private functions keep local linkage. */
     bool test_entry = cg->test_mode && strncmp(fn->name, "test_", 5) == 0;
-    if (fn->has_visibility && !fn->is_public && !test_entry) {
-        fprintf(cg->out, "    .local %s\n", fn->name);
+    if (fn->has_visibility && !fn->is_public && !test_entry && !main_sum_wrapper) {
+        fprintf(cg->out, "    .local %s\n", func_label);
     } else {
-        fprintf(cg->out, "    .global %s\n", fn->name);
+        fprintf(cg->out, "    .global %s\n", func_label);
     }
-    fprintf(cg->out, "    .type %s, @function\n%s:\n    push rbp\n    mov rbp, rsp\n    sub rsp, %d\n    mov QWORD PTR [rbp-248], rbx\n", fn->name, fn->name, COBRA_FRAME_BYTES);
+    fprintf(cg->out, "    .type %s, @function\n%s:\n    push rbp\n    mov rbp, rsp\n    sub rsp, %d\n    mov QWORD PTR [rbp-248], rbx\n", func_label, func_label, COBRA_FRAME_BYTES);
     /* Snapshot the six incoming GPR arguments before descriptor copying can
        use rsi/rdx as metadata scratch. */
     for (int arg = 0; arg < 6; arg++)
@@ -5732,6 +5787,47 @@ static void emit_function(CodeGen *cg, ASTNode *fn) {
        never falls through into a worker prologue. */
     flush_pending_parallel(cg);
     flush_pending_fn_thunks(cg);
+
+    if (main_sum_wrapper) {
+        int payload_size = sum_component_size(cg, cg->current_return_payload_type,
+                                              cg->current_return_type_name);
+        int error_size = fn->declared_type == COBRA_TYPE_RESULT ?
+            sum_component_size(cg, cg->current_return_error_type,
+                               cg->current_return_error_type_name) : 0;
+        int total = 8 + payload_size + error_size;
+        int frame = (total + 15) & ~15;
+        int sum_label = cg->label_count++;
+        int fail_label = cg->label_count++;
+        fprintf(cg->out,
+            "    .global main\n    .type main, @function\nmain:\n"
+            "    push rbp\n    mov rbp, rsp\n    sub rsp, %d\n"
+            "    lea rdi, [rbp-8]\n"
+            "    call cobra_main_inner\n"
+            "    mov rdx, QWORD PTR [rbp-8]\n"
+            "    cmp rdx, 1\n"
+            "    jne .Lmain_sum_fail_%d\n"
+            "    xor eax, eax\n"
+            "    jmp .Lmain_sum_done_%d\n"
+            ".Lmain_sum_fail_%d:\n",
+            frame, fail_label, sum_label, fail_label);
+        /* A failing sum exits with its Result error code when present,
+           otherwise its payload, falling back to 1 for a bare `none`. */
+        int failure_slot = -1;
+        if (error_size == 8) failure_slot = 8 + payload_size + error_size;
+        else if (payload_size == 8) failure_slot = 8 + payload_size;
+        if (failure_slot > 0) {
+            fprintf(cg->out,
+                "    mov rax, QWORD PTR [rbp-%d]\n"
+                "    test rax, rax\n"
+                "    jne .Lmain_sum_done_%d\n"
+                "    mov eax, 1\n", failure_slot, sum_label);
+        } else {
+            fprintf(cg->out, "    mov eax, 1\n");
+        }
+        fprintf(cg->out,
+            ".Lmain_sum_done_%d:\n"
+            "    leave\n    ret\n", sum_label);
+    }
 }
 
 static bool codegen_is_nn_function(const ASTNode *node) {
@@ -5844,6 +5940,29 @@ static bool generate(ASTNode *root, const char *path, TargetPlatform target, boo
     fputs(".fmt_float:", f);
     fputc(10, f);
     fputs(".string \"%g", f);
+    fputc(92, f);
+    fputc('n', f);
+    fputc(34, f);
+    fputc(10, f);
+    fputs(".fmt_int_nn:", f);
+    fputc(10, f);
+    fputs(".string \"%ld\"", f);
+    fputc(10, f);
+    fputs(".fmt_string_nn:", f);
+    fputc(10, f);
+    fputs(".string \"%s\"", f);
+    fputc(10, f);
+    fputs(".fmt_float_nn:", f);
+    fputc(10, f);
+    fputs(".string \"%g\"", f);
+    fputc(10, f);
+    fputs(".fmt_space:", f);
+    fputc(10, f);
+    fputs(".string \" \"", f);
+    fputc(10, f);
+    fputs(".fmt_newline:", f);
+    fputc(10, f);
+    fputs(".string \"", f);
     fputc(92, f);
     fputc('n', f);
     fputc(34, f);

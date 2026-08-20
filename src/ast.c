@@ -80,6 +80,25 @@ void ast_free(ASTNode *node) {
     free(node);
 }
 
+ASTNode *ast_clone_node(const ASTNode *node) {
+    if (!node) return NULL;
+    ASTNode *copy = (ASTNode *)calloc(1, sizeof(ASTNode));
+    if (!copy) {
+        fprintf(stderr, "Fatal Error: Memory allocation failed during AST clone\n");
+        exit(EXIT_FAILURE);
+    }
+    memcpy(copy, node, sizeof(ASTNode));
+    /* Children are owned; canonical metadata is arena-owned elsewhere. */
+    copy->children = NULL;
+    copy->child_count = 0;
+    copy->child_capacity = 0;
+    copy->canonical_arena = NULL;
+    for (size_t i = 0; i < node->child_count; i++) {
+        ast_add_child(copy, ast_clone_node(node->children[i]));
+    }
+    return copy;
+}
+
 void ast_print(ASTNode *node, int indent) {
     if (!node) return;
     for (int i = 0; i < indent; i++) printf("  ");

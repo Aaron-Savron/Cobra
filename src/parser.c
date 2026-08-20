@@ -1270,13 +1270,33 @@ static ASTNode *make_surface_boolean_op(Parser *parser, ASTNode *left,
     return truth;
 }
 
+/* `not x` lowers to `x == 0` on the same 0/1 scalar booleans `and`/`or`
+   use. It binds looser than comparisons (`not a == b` is `not (a == b)`) but
+   tighter than `and`, matching Python precedence; the postfix `not in` form
+   is handled inside parse_comparison_expression. */
+static ASTNode *parse_not_expression(Parser *parser) {
+    if (match(parser, TOKEN_NOT)) {
+        Token op_token = parser->current_token;
+        advance_token(parser);
+        ASTNode *zero = parser_create_node_at(parser, AST_INT_LITERAL, NULL, op_token);
+        zero->literal_i64 = 0;
+        zero->literal_u64 = 0;
+        zero->int_val = 0;
+        ASTNode *cmp = parser_create_node_at(parser, AST_BINARY_OP, "==", op_token);
+        ast_add_child(cmp, parse_not_expression(parser));
+        ast_add_child(cmp, zero);
+        return cmp;
+    }
+    return parse_comparison_expression(parser);
+}
+
 static ASTNode *parse_boolean_and(Parser *parser) {
-    ASTNode *left = parse_comparison_expression(parser);
+    ASTNode *left = parse_not_expression(parser);
     while (match(parser, TOKEN_AND)) {
         Token op_token = parser->current_token;
         advance_token(parser);
         left = make_surface_boolean_op(parser, left, op_token,
-                                       parse_comparison_expression(parser));
+                                       parse_not_expression(parser));
     }
     return left;
 }
@@ -1294,6 +1314,44 @@ static ASTNode *parse_expression(Parser *parser) {
 
 static ASTNode *parse_block(Parser *parser);
 static ASTNode *parse_if_chain(Parser *parser);
+
+static ASTNode *parser_make_assignment(Parser *parser, ASTNode *primary,
+                                       ASTNode *value_expr, const char *id_name,
+                                       Token target_token) {
+    if (primary->type == AST_MEMBER_ACCESS) {
+        ASTNode *member_assign = parser_create_node_at(parser, AST_MEMBER_ASSIGN, primary->name, target_token);
+        snprintf(member_assign->secondary_name, sizeof(member_assign->secondary_name), "%s", primary->secondary_name);
+        if (primary->child_count > 0) {
+            ast_add_child(member_assign, primary->children[0]);
+            primary->children[0] = NULL;
+        }
+        ast_add_child(member_assign, value_expr);
+        ast_free(primary);
+        return member_assign;
+    }
+    if (primary->type == AST_ARRAY_INDEX) {
+        ASTNode *assign_node = parser_create_node_at(parser, AST_INDEX_ASSIGN, primary->name, target_token);
+        snprintf(assign_node->secondary_name, sizeof(assign_node->secondary_name),
+                 "%.63s", primary->secondary_name);
+        /* Transfer every index before appending the assigned value.
+           Multi-axis tensor stores must not silently drop axes. */
+        for (size_t i = 0; i < primary->child_count; i++) {
+            ast_add_child(assign_node, primary->children[i]);
+            primary->children[i] = NULL;
+        }
+        ast_add_child(assign_node, value_expr);
+        free(primary->children);
+        primary->children = NULL;
+        primary->child_count = 0;
+        primary->child_capacity = 0;
+        ast_free(primary);
+        return assign_node;
+    }
+    ASTNode *assign_node = parser_create_node_at(parser, AST_ASSIGN, id_name, target_token);
+    ast_add_child(assign_node, value_expr);
+    ast_free(primary);
+    return assign_node;
+}
 
 static ASTNode *parse_statement(Parser *parser) {
     /* The lexer reports malformed indentation as TOKEN_UNKNOWN with a
@@ -1584,8 +1642,11 @@ static ASTNode *parse_statement(Parser *parser) {
         if (has_paren) advance_token(parser);
 
         ASTNode *print_node = parser_create_node(parser, AST_PRINT_STMT, NULL);
-        ASTNode *expr = parse_expression(parser);
-        ast_add_child(print_node, expr);
+        ast_add_child(print_node, parse_expression(parser));
+        while (match(parser, TOKEN_COMMA)) {
+            advance_token(parser);
+            ast_add_child(print_node, parse_expression(parser));
+        }
 
         if (has_paren) expect(parser, TOKEN_RPAREN, "Expected ')' after print expression");
         return print_node;
@@ -1827,43 +1888,41 @@ static ASTNode *parse_statement(Parser *parser) {
         }
 
         ASTNode *primary = parse_primary(parser);
-        if ((primary->type == AST_VAR_REF || primary->type == AST_ARRAY_INDEX ||
-             primary->type == AST_MEMBER_ACCESS) && match(parser, TOKEN_ASSIGN)) {
-            advance_token(parser); // skip '='
-            ASTNode *value_expr = parse_expression(parser);
-            if (primary->type == AST_MEMBER_ACCESS) {
-                ASTNode *member_assign = parser_create_node_at(parser, AST_MEMBER_ASSIGN, primary->name, target_token);
-                snprintf(member_assign->secondary_name, sizeof(member_assign->secondary_name), "%s", primary->secondary_name);
-                if (primary->child_count > 0) {
-                    ast_add_child(member_assign, primary->children[0]);
-                    primary->children[0] = NULL;
-                }
-                ast_add_child(member_assign, value_expr);
-                ast_free(primary);
-                return member_assign;
+        if (primary->type == AST_VAR_REF || primary->type == AST_ARRAY_INDEX ||
+            primary->type == AST_MEMBER_ACCESS) {
+            /* `x += e` and friends lower to `x = x + e`, reusing the same
+               LHS forms as plain assignment. Probe one token past the
+               operator to tell `+=` from `+` in an expression. */
+            char compound_op = 0;
+            if (match(parser, TOKEN_PLUS) || match(parser, TOKEN_MINUS) ||
+                match(parser, TOKEN_STAR) || match(parser, TOKEN_SLASH) ||
+                match(parser, TOKEN_PERCENT)) {
+                Lexer saved_lexer = parser->lexer;
+                Token saved_token = parser->current_token;
+                char op_char = parser->current_token.text[0];
+                advance_token(parser);
+                if (match(parser, TOKEN_ASSIGN)) compound_op = op_char;
+                parser->lexer = saved_lexer;
+                parser->current_token = saved_token;
             }
-            if (primary->type == AST_ARRAY_INDEX) {
-                ASTNode *assign_node = parser_create_node_at(parser, AST_INDEX_ASSIGN, primary->name, target_token);
-                snprintf(assign_node->secondary_name, sizeof(assign_node->secondary_name),
-                         "%.63s", primary->secondary_name);
-                /* Transfer every index before appending the assigned value.
-                   Multi-axis tensor stores must not silently drop axes. */
-                for (size_t i = 0; i < primary->child_count; i++) {
-                    ast_add_child(assign_node, primary->children[i]);
-                    primary->children[i] = NULL;
-                }
-                ast_add_child(assign_node, value_expr);
-                free(primary->children);
-                primary->children = NULL;
-                primary->child_count = 0;
-                primary->child_capacity = 0;
-                ast_free(primary);
-                return assign_node;
+            if (compound_op && (match(parser, TOKEN_PLUS) || match(parser, TOKEN_MINUS) ||
+                                match(parser, TOKEN_STAR) || match(parser, TOKEN_SLASH) ||
+                                match(parser, TOKEN_PERCENT))) {
+                char op_text[2] = { compound_op, '\0' };
+                Token op_token = parser->current_token;
+                advance_token(parser);
+                expect(parser, TOKEN_ASSIGN, "Expected '=' in compound assignment");
+                ASTNode *read = ast_clone_node(primary);
+                ASTNode *binary = parser_create_node_at(parser, AST_BINARY_OP, op_text, op_token);
+                ast_add_child(binary, read);
+                ast_add_child(binary, parse_expression(parser));
+                return parser_make_assignment(parser, primary, binary, id_name, target_token);
             }
-            ASTNode *assign_node = parser_create_node_at(parser, AST_ASSIGN, id_name, target_token);
-            ast_add_child(assign_node, value_expr);
-            ast_free(primary);
-            return assign_node;
+            if (match(parser, TOKEN_ASSIGN)) {
+                advance_token(parser); // skip '='
+                return parser_make_assignment(parser, primary, parse_expression(parser),
+                                              id_name, target_token);
+            }
         }
         return primary;
     }
