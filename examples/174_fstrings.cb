@@ -1,0 +1,32 @@
+# f-string formatting: f"..." lowers to concat of str() conversions.
+def test_scalar_holes() -> i64:
+    let n: i64 = 42
+    msg: string = f"value is {n}"
+    assert msg == "value is 42"
+    return 0
+
+def test_expression_holes() -> i64:
+    let a: i64 = 3
+    let b: i64 = 4
+    msg: string = f"{a} + {b} = {a + b}"
+    assert msg == "3 + 4 = 7"
+    return 0
+
+def test_float_and_bool() -> i64:
+    let pi: f32 = 3.5
+    let ok: bool = true
+    assert f"pi is {pi}" == "pi is 3.5"
+    assert f"status: {ok}" == "status: 1"
+    return 0
+
+def test_string_hole_and_escape() -> i64:
+    let name: string = "cobra"
+    assert f"hello {name}" == "hello cobra"
+    assert f"dict {{k}} = {len(name)}" == "dict {k} = 5"
+    return 0
+
+def test_method_chain() -> i64:
+    let n: i64 = 7
+    msg: string = f"value {n}".upper()
+    assert msg == "VALUE 7"
+    return 0

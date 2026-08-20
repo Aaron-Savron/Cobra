@@ -151,6 +151,48 @@ Token lexer_next_token(Lexer *lexer) {
 
     char c = peek(lexer);
 
+    if (c == 'f' && lexer->cursor + 1 < lexer->length && lexer->source[lexer->cursor + 1] == '"') {
+        /* f"..." captures the raw text between the quotes so the parser can
+           split it into literal segments and {expr} holes. Escape pairs are
+           kept verbatim; the parser decodes them in literal segments. */
+        advance(lexer); /* 'f' */
+        advance(lexer); /* opening quote */
+        int idx = 0;
+        bool too_long = false;
+        bool terminated = false;
+        while (peek(lexer) != '"' && peek(lexer) != '\0') {
+            if (peek(lexer) == '\\') {
+                advance(lexer);
+                char esc = peek(lexer);
+                if (esc == '\0') break;
+                if (idx < COBRA_MAX_TOKEN_TEXT - 2) {
+                    token.text[idx++] = '\\';
+                    token.text[idx++] = esc;
+                } else too_long = true;
+                advance(lexer);
+                continue;
+            }
+            if (idx < COBRA_MAX_TOKEN_TEXT - 1) token.text[idx++] = advance(lexer);
+            else { too_long = true; advance(lexer); }
+        }
+        if (peek(lexer) == '"') { advance(lexer); terminated = true; }
+        token.text[idx] = '\0';
+        if (!terminated) {
+            fprintf(stderr, "Lexical Error [line %d, col %d]: unterminated f-string literal\n",
+                    token.line, token.col);
+            token.type = TOKEN_UNKNOWN;
+            return token;
+        }
+        if (too_long) {
+            fprintf(stderr, "Lexical Error [line %d, col %d]: f-string literal exceeds %d bytes\n",
+                    token.line, token.col, COBRA_MAX_TOKEN_TEXT - 1);
+            token.type = TOKEN_UNKNOWN;
+            return token;
+        }
+        token.type = TOKEN_FSTRING;
+        return token;
+    }
+
     if (isalpha(c) || c == '_') {
         int idx = 0;
         bool too_long = false;

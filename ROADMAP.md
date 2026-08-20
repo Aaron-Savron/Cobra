@@ -37,9 +37,10 @@ Cobra currently has:
   `None` aliases, chained comparisons (`0 <= x < 10`), `//` and `**`,
   compound assignment (`+=`, `//=`, `**=`), and parallel tuple assignment
   (`a, b = b, a`) alongside the existing brace syntax
-- String methods (`split`/`join`/`strip`/`upper`/`lower`/`replace`), slicing
-  `s[a:b]`, negative indexing, and substring membership
-- 146 example programs (122 with `test_` suites) and 118 negative diagnostics
+- String methods (`strip`/`upper`/`lower`/`replace`), slicing `s[a:b]`,
+  negative indexing, substring membership, and `f"..."` format strings
+  with `str()` conversions
+- 147 example programs (123 with `test_` suites) and 118 negative diagnostics
 
 The backend IR is linked into the production `cobra` binary and selectable
 with `cobra build|run <file> --backend=native` (see Phase 15 item 28 below

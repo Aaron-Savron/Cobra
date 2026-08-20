@@ -233,6 +233,13 @@ char *cobra_str_lower(const char *s) {
     return out;
 }
 
+/* Owned copy of a string, used by str(string) so the caller owns the
+   result instead of aliasing the argument. */
+char *cobra_str_copy(const char *s) {
+    if (!s) return strdup("");
+    return strdup(s);
+}
+
 static int cobra_is_space(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
 }

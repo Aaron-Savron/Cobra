@@ -2886,8 +2886,8 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                 if (node->child_count > 0) {
                     CobraTypeKind arg = infer_expr(node->children[0], ctx);
                     if (!is_integer(arg) && arg != COBRA_TYPE_F32 && arg != COBRA_TYPE_F64 &&
-                        arg != COBRA_TYPE_BOOL && arg != COBRA_TYPE_UNKNOWN) {
-                        ir_error(ctx, node, "str argument must be a scalar value");
+                        arg != COBRA_TYPE_BOOL && arg != COBRA_TYPE_STRING && arg != COBRA_TYPE_UNKNOWN) {
+                        ir_error(ctx, node, "str argument must be a scalar or string value");
                     }
                 }
                 node->value_type = COBRA_TYPE_STRING;

@@ -3510,9 +3510,14 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
     if (!strcmp(n->name, "concat")) { emit_string_concat(cg, n); return; }
     if (!strcmp(n->name, "string_from_bytes")) { emit_string_from_bytes(cg, n); return; }
     if (!strcmp(n->name, "str")) {
-        /* str(value) allocates a fresh owned string via asprintf. */
+        /* str(value) allocates a fresh owned string via asprintf; a string
+           argument is copied so the caller owns the result. */
         int out = reserve(cg, 8);
         emit_expr(cg, n->children[0]);
+        if (n->children[0]->value_type == COBRA_TYPE_STRING) {
+            fprintf(cg->out, "    mov rdi, rax\n    call cobra_str_copy@PLT\n");
+            return;
+        }
         if (expression_is_float_codegen(cg, n->children[0])) {
             fprintf(cg->out, "    lea rdi, [rbp-%d]\n    cvtss2sd xmm0, xmm0\n    lea rsi, [rip + .fmt_float_nn]\n    mov al, 1\n    call asprintf@PLT\n", out);
         } else {

@@ -849,6 +849,144 @@ static ASTNode *parse_method_chain(Parser *parser, ASTNode *receiver) {
     return receiver;
 }
 
+/* Parse the expression inside an f-string {hole}. The hole text is lexed by
+   a fresh parser so it can reference the same functions and types as the
+   enclosing source; diagnostics point at the f-string's source file. */
+static ASTNode *parse_fstring_hole(Parser *parser, const char *text, Token location) {
+    Lexer sub_lexer;
+    lexer_init(&sub_lexer, text);
+    Parser sub_parser;
+    memset(&sub_parser, 0, sizeof(sub_parser));
+    sub_parser.lexer = sub_lexer;
+    sub_parser.current_token = lexer_next_token(&sub_parser.lexer);
+    snprintf(sub_parser.source_file, sizeof(sub_parser.source_file), "%s",
+             parser->source_file[0] ? parser->source_file : "<source>");
+    sub_parser.root = parser->root;
+    sub_parser.canonical_arena = parser->canonical_arena;
+    if (sub_parser.current_token.type == TOKEN_EOF) {
+        fprintf(stderr, "%s:%d:%d: error: empty f-string expression\n",
+                parser->source_file, location.line, location.col);
+        exit(1);
+    }
+    ASTNode *expr = parse_expression(&sub_parser);
+    if (!expr) {
+        fprintf(stderr, "%s:%d:%d: error: invalid f-string expression\n",
+                parser->source_file, location.line, location.col);
+        exit(1);
+    }
+    return expr;
+}
+
+static ASTNode *append_fstring_piece(Parser *parser, ASTNode *result,
+                                     ASTNode *piece, Token location) {
+    if (!result) return piece;
+    /* Empty literal segments (adjacent holes) add nothing. */
+    if (piece->type == AST_STRING_LITERAL && piece->string_val[0] == '\0') {
+        ast_free(piece);
+        return result;
+    }
+    ASTNode *binary = parser_create_node_at(parser, AST_BINARY_OP, "+", location);
+    ast_add_child(binary, result);
+    ast_add_child(binary, piece);
+    return binary;
+}
+
+/* f"a{n}b" lowers to "a" + str(n) + "b"; string `+` already emits the
+   same concat runtime call the concat builtin uses. `{{`/`}}` escape literal
+   braces, and backslash escapes are decoded only in literal segments. */
+static ASTNode *parse_fstring(Parser *parser) {
+    Token fstring_token = parser->current_token;
+    char raw[COBRA_MAX_TOKEN_TEXT];
+    /* Copy before advancing: current_token.text is the parser's own buffer
+       and gets overwritten by the next lexed token. */
+    snprintf(raw, sizeof(raw), "%s", parser->current_token.text);
+    advance_token(parser);
+
+    ASTNode *result = NULL;
+    char literal[COBRA_MAX_TOKEN_TEXT];
+    size_t lit_len = 0;
+    size_t i = 0;
+    while (raw[i] != '\0') {
+        if (raw[i] == '{') {
+            if (raw[i + 1] == '{') {
+                if (lit_len < sizeof(literal) - 1) literal[lit_len++] = '{';
+                i += 2;
+                continue;
+            }
+            if (lit_len > 0) {
+                literal[lit_len] = '\0';
+                ASTNode *piece = parser_create_node_at(parser, AST_STRING_LITERAL, NULL, fstring_token);
+                snprintf(piece->string_val, sizeof(piece->string_val), "%s", literal);
+                result = append_fstring_piece(parser, result, piece, fstring_token);
+                lit_len = 0;
+            }
+            i++;
+            size_t start = i;
+            int depth = 0;
+            while (raw[i] != '\0') {
+                if (raw[i] == '{') depth++;
+                else if (raw[i] == '}') {
+                    if (depth == 0) break;
+                    depth--;
+                }
+                i++;
+            }
+            if (raw[i] == '\0') {
+                fprintf(stderr, "%s:%d:%d: error: unterminated f-string expression\n",
+                        parser->source_file, fstring_token.line, fstring_token.col);
+                exit(1);
+            }
+            char hole[COBRA_MAX_TOKEN_TEXT];
+            size_t hole_len = i - start;
+            if (hole_len >= sizeof(hole)) hole_len = sizeof(hole) - 1;
+            memcpy(hole, raw + start, hole_len);
+            hole[hole_len] = '\0';
+            i++; /* consume '}' */
+            if (hole_len == 0) {
+                fprintf(stderr, "%s:%d:%d: error: empty f-string expression\n",
+                        parser->source_file, fstring_token.line, fstring_token.col);
+                exit(1);
+            }
+            ASTNode *expr = parse_fstring_hole(parser, hole, fstring_token);
+            ASTNode *str_call = parser_create_node_at(parser, AST_FUNC_CALL, "str", fstring_token);
+            ast_add_child(str_call, expr);
+            result = append_fstring_piece(parser, result, str_call, fstring_token);
+            continue;
+        }
+        if (raw[i] == '}') {
+            if (raw[i + 1] == '}') {
+                if (lit_len < sizeof(literal) - 1) literal[lit_len++] = '}';
+                i += 2;
+                continue;
+            }
+            fprintf(stderr, "%s:%d:%d: error: stray '}' in f-string (use '}}' for a literal brace)\n",
+                    parser->source_file, fstring_token.line, fstring_token.col);
+            exit(1);
+        }
+        if (raw[i] == '\\') {
+            char decoded = raw[i + 1];
+            if (decoded == 'n') decoded = '\n';
+            else if (decoded == 'r') decoded = '\r';
+            else if (decoded == 't') decoded = '\t';
+            else if (decoded == '\\') decoded = '\\';
+            else if (decoded == '"') decoded = '"';
+            else decoded = '\\';
+            if (lit_len < sizeof(literal) - 1) literal[lit_len++] = decoded;
+            i += 2;
+            continue;
+        }
+        if (lit_len < sizeof(literal) - 1) literal[lit_len++] = raw[i];
+        i++;
+    }
+    if (lit_len > 0 || !result) {
+        literal[lit_len] = '\0';
+        ASTNode *piece = parser_create_node_at(parser, AST_STRING_LITERAL, NULL, fstring_token);
+        snprintf(piece->string_val, sizeof(piece->string_val), "%s", literal);
+        result = append_fstring_piece(parser, result, piece, fstring_token);
+    }
+    return result;
+}
+
 static ASTNode *parse_primary(Parser *parser) {
     if (match(parser, TOKEN_DEF)) {
         return parse_closure_literal(parser);
@@ -989,6 +1127,14 @@ static ASTNode *parse_primary(Parser *parser) {
         node->literal_f64 = atof(parser->current_token.text);
         node->float_val = (float)node->literal_f64;
         advance_token(parser);
+        return node;
+    }
+
+    if (match(parser, TOKEN_FSTRING)) {
+        ASTNode *node = parse_fstring(parser);
+        /* f-string receivers: f"x = {n}".upper() lowers like a string
+           literal receiver (the result is already a fresh owned string). */
+        if (match(parser, TOKEN_DOT)) return parse_method_chain(parser, node);
         return node;
     }
 

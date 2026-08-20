@@ -1201,7 +1201,7 @@ static bool ast_contains_collections(ASTNode *node) {
          !strcmp(node->name, "delete") || !strcmp(node->name, "pop") ||
          !strcmp(node->name, "upper") || !strcmp(node->name, "lower") ||
          !strcmp(node->name, "strip") || !strcmp(node->name, "replace") ||
-         !strcmp(node->name, "substring"))) return true;
+         !strcmp(node->name, "substring") || !strcmp(node->name, "str"))) return true;
     for (size_t i = 0; i < node->child_count; i++) if (ast_contains_collections(node->children[i])) return true;
     return false;
 }
