@@ -4442,6 +4442,14 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                 CobraTypeKind target_type = infer_expr(target, ctx);
                 if (target->type == AST_FUNC_CALL && strcmp(target->name, "range") == 0) {
                     if (target_type != COBRA_TYPE_I64) ir_error(ctx, node, "range loop source must be integer-valued");
+                } else if (target->type == AST_LEN_EXPR) {
+                    if (target->child_count != 1 || target->children[0]->type != AST_VAR_REF) {
+                        ir_error(ctx, node, "len loop source must be a named collection");
+                    }
+                } else if (target->type == AST_INT_LITERAL) {
+                    if (target->literal_u64 > (uint64_t)0x7fffffff) {
+                        ir_error(ctx, node, "integer loop bound is too large");
+                    }
                 } else if (target->type == AST_FUNC_CALL && strcmp(target->name, "enumerate") == 0) {
                     if (target->child_count != 1 || target->children[0]->type != AST_VAR_REF) {
                         ir_error(ctx, node, "enumerate loop source must be a named collection");
@@ -4485,6 +4493,8 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
                         iterator_type = COBRA_TYPE_FUNC;
                         dyn_element_trait_name = source->dyn_trait_name;
                     }
+                } else {
+                    ir_error(ctx, node, "for loop source must be a named collection or range()");
                 }
             }            if (node->secondary_name[0] != '\0' &&
                 !(target && target->type == AST_FUNC_CALL && strcmp(target->name, "enumerate") == 0) &&

@@ -1,0 +1,8 @@
+# A for loop over a literal is not a supported source: collections must be
+# named variables (or range()/len()). Iterating a literal used to read
+# uninitialized memory, so it must be rejected instead.
+def main() -> i64:
+    total = 0
+    for x in [1, 2, 3]:
+        total = total + x
+    return total
