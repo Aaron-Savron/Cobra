@@ -182,3 +182,95 @@ void cobra_dict_free(void **owner, size_t *length) {
     *owner = NULL;
     if (length) *length = 0;
 }
+
+/* String slices back s[start:end]; negative bounds count from the end and
+   out-of-range bounds clamp, so the result always fits within the source. */
+char *cobra_str_substring(const char *s, int64_t start, int64_t end) {
+    if (!s) return strdup("");
+    size_t n = strlen(s);
+    int64_t si = start, ei = end;
+    if (si < 0) si += (int64_t)n;
+    if (ei < 0) ei += (int64_t)n;
+    if (si < 0) si = 0;
+    if (ei < 0) ei = 0;
+    if (si > (int64_t)n) si = (int64_t)n;
+    if (ei > (int64_t)n) ei = (int64_t)n;
+    if (ei < si) ei = si;
+    size_t len = (size_t)(ei - si);
+    char *out = malloc(len + 1);
+    if (!out) abort();
+    memcpy(out, s + si, len);
+    out[len] = '\0';
+    return out;
+}
+
+/* String methods: the caller owns the returned malloc'd buffer. These back
+   s.upper()/s.lower()/s.strip()/s.replace(...), which codegen lowers to
+   direct calls just like the collection helpers above. */
+char *cobra_str_upper(const char *s) {
+    if (!s) return strdup("");
+    size_t n = strlen(s);
+    char *out = malloc(n + 1);
+    if (!out) abort();
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        out[i] = (c >= 'a' && c <= 'z') ? (char)(c - 32) : c;
+    }
+    out[n] = '\0';
+    return out;
+}
+
+char *cobra_str_lower(const char *s) {
+    if (!s) return strdup("");
+    size_t n = strlen(s);
+    char *out = malloc(n + 1);
+    if (!out) abort();
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        out[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
+    }
+    out[n] = '\0';
+    return out;
+}
+
+static int cobra_is_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+}
+
+char *cobra_str_strip(const char *s) {
+    if (!s) return strdup("");
+    size_t n = strlen(s);
+    size_t start = 0, end = n;
+    while (start < end && cobra_is_space(s[start])) start++;
+    while (end > start && cobra_is_space(s[end - 1])) end--;
+    char *out = malloc(end - start + 1);
+    if (!out) abort();
+    memcpy(out, s + start, end - start);
+    out[end - start] = '\0';
+    return out;
+}
+
+char *cobra_str_replace(const char *s, const char *old, const char *new) {
+    if (!s || !old || !new) return s ? strdup(s) : strdup("");
+    size_t old_len = strlen(old);
+    if (old_len == 0) return strdup(s);
+    size_t new_len = strlen(new);
+    size_t count = 0;
+    for (const char *p = s; (p = strstr(p, old)) != NULL; p += old_len) count++;
+    size_t out_len = strlen(s) + count * (new_len > old_len ? new_len - old_len : 0);
+    char *out = malloc(out_len + 1);
+    if (!out) abort();
+    char *w = out;
+    const char *scan = s;
+    const char *hit;
+    while ((hit = strstr(scan, old)) != NULL) {
+        size_t span = (size_t)(hit - scan);
+        memcpy(w, scan, span);
+        w += span;
+        memcpy(w, new, new_len);
+        w += new_len;
+        scan = hit + old_len;
+    }
+    strcpy(w, scan);
+    return out;
+}

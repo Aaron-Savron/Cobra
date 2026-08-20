@@ -1,0 +1,35 @@
+# Chained comparisons, `//` and `**`, and parallel tuple assignment.
+def divmod(a: i64, b: i64) -> (i64, i64): {
+    return (a / b, a % b)
+}
+
+def test_chained_comparison() -> i64:
+    let x: i64 = 5
+    assert(0 <= x < 10)
+    assert(x >= 5 and x <= 10)
+    return 0
+
+def test_floor_div_and_pow() -> i64:
+    let x: i64 = 2
+    x **= 10
+    assert(x == 1024)
+    x //= 7
+    assert(x == 146)
+    assert(2 ** 3 ** 2 == 512)
+    return 0
+
+def test_tuple_swap() -> i64:
+    let a: i64 = 1
+    let b: i64 = 2
+    a, b = b, a
+    assert(a == 2)
+    assert(b == 1)
+    return 0
+
+def test_tuple_from_call() -> i64:
+    let q: i64 = 0
+    let r: i64 = 0
+    q, r = divmod(17, 5)
+    assert(q == 3)
+    assert(r == 2)
+    return 0

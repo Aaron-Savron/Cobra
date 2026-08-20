@@ -773,7 +773,9 @@ static bool is_tensor_builtin(const char *name) {
 static bool is_string_builtin(const char *name) {
     return strcmp(name, "concat") == 0 || strcmp(name, "starts_with") == 0 ||
            strcmp(name, "ends_with") == 0 || strcmp(name, "contains") == 0 ||
-           strcmp(name, "char_at") == 0;
+           strcmp(name, "char_at") == 0 || strcmp(name, "upper") == 0 ||
+           strcmp(name, "lower") == 0 || strcmp(name, "strip") == 0 ||
+           strcmp(name, "replace") == 0 || strcmp(name, "substring") == 0;
 }
 
 static bool is_string_free_builtin(const char *name) {
@@ -2105,13 +2107,19 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
         case AST_BINARY_OP: {
             CobraTypeKind left = infer_expr(node->children[0], ctx);
             CobraTypeKind right = infer_expr(node->children[1], ctx);
-            if ((strcmp(node->name, "/") == 0 || strcmp(node->name, "%") == 0) &&
+            if ((strcmp(node->name, "/") == 0 || strcmp(node->name, "//") == 0 ||
+                  strcmp(node->name, "%") == 0) &&
                 expression_is_const_zero(node->children[1])) {
-                ir_error(ctx, node, strcmp(node->name, "/") == 0 ? "division by zero" : "modulo by zero");
+                ir_error(ctx, node, strcmp(node->name, "%") == 0 ? "modulo by zero" :
+                         strcmp(node->name, "//") == 0 ? "floor division by zero" :
+                         "division by zero");
             }
-            if (strcmp(node->name, "%") == 0 &&
+            if ((strcmp(node->name, "%") == 0 || strcmp(node->name, "//") == 0 ||
+                  strcmp(node->name, "**") == 0) &&
                 (left == COBRA_TYPE_F32 || right == COBRA_TYPE_F32)) {
-                ir_error(ctx, node, "'%' requires integer operands");
+                ir_error(ctx, node, strcmp(node->name, "%") == 0 ? "'%' requires integer operands" :
+                         strcmp(node->name, "//") == 0 ? "'//' requires integer operands" :
+                         "'**' requires integer operands");
             }
             if (left == COBRA_TYPE_STRING || right == COBRA_TYPE_STRING) {
                 if ((strcmp(node->name, "+") == 0 && left == COBRA_TYPE_STRING && right == COBRA_TYPE_STRING) ||
@@ -2464,6 +2472,20 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                         snprintf(node->name, sizeof(node->name), "%.63s", mangled);
                         node->qualifier[0] = '\0';
                     }
+                } else if (receiver_local && receiver_local->type == COBRA_TYPE_STRING &&
+                           is_string_builtin(node->name)) {
+                    /* msg.upper() lowers to the string builtin upper(msg):
+                       prepend the receiver so every string builtin shares the
+                       same (string, ...) argument contract. */
+                    ASTNode *receiver_ref = ast_create_node(AST_VAR_REF, node->qualifier);
+                    receiver_ref->source_line = node->source_line;
+                    receiver_ref->source_col = node->source_col;
+                    snprintf(receiver_ref->source_file, sizeof(receiver_ref->source_file), "%.127s", node->source_file);
+                    ast_add_child(node, receiver_ref);
+                    for (size_t shift = node->child_count - 1; shift > 0; shift--)
+                        node->children[shift] = node->children[shift - 1];
+                    node->children[0] = receiver_ref;
+                    node->qualifier[0] = '\0';
                 }
             }
             ASTNode *called_function = find_function(ctx, node->name);
@@ -2873,20 +2895,33 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                 return node->value_type;
             }
             if (is_string_builtin(node->name)) {
-                size_t expected = strcmp(node->name, "char_at") == 0 ? 2 : 2;
+                /* String-returning builtins (concat, upper, lower, strip,
+                   replace) allocate a fresh owned string; the predicates
+                   (starts_with/ends_with/contains) and char_at return i64. */
+                bool returns_string = strcmp(node->name, "concat") == 0 ||
+                                      strcmp(node->name, "upper") == 0 ||
+                                      strcmp(node->name, "lower") == 0 ||
+                                      strcmp(node->name, "strip") == 0 ||
+                                      strcmp(node->name, "replace") == 0 ||
+                                      strcmp(node->name, "substring") == 0;
+                size_t expected = strcmp(node->name, "replace") == 0 ? 3 :
+                                  strcmp(node->name, "substring") == 0 ? 3 :
+                                  strcmp(node->name, "char_at") == 0 ? 2 : 2;
+                if (strcmp(node->name, "upper") == 0 || strcmp(node->name, "lower") == 0 ||
+                    strcmp(node->name, "strip") == 0) expected = 1;
                 if (node->child_count != expected) {
                     ir_error(ctx, node, "string builtin received the wrong number of arguments");
                 }
                 for (size_t i = 0; i < node->child_count; i++) {
                     CobraTypeKind arg = infer_expr(node->children[i], ctx);
-                    bool valid = (i == 0 || (strcmp(node->name, "char_at") == 0 && i == 1)) ?
-                                 (arg == COBRA_TYPE_STRING || arg == COBRA_TYPE_UNKNOWN) :
-                                 (arg == COBRA_TYPE_STRING || arg == COBRA_TYPE_UNKNOWN);
-                    if (strcmp(node->name, "char_at") == 0 && i == 1) valid = is_integer(arg) || arg == COBRA_TYPE_UNKNOWN;
+                    bool valid = (arg == COBRA_TYPE_STRING || arg == COBRA_TYPE_UNKNOWN);
+                    if ((strcmp(node->name, "char_at") == 0 && i == 1) ||
+                        (strcmp(node->name, "substring") == 0 && i > 0))
+                        valid = is_integer(arg) || arg == COBRA_TYPE_UNKNOWN;
                     if (!valid) ir_error(ctx, node, "string builtin argument has the wrong type");
                 }
-                node->value_type = strcmp(node->name, "concat") == 0 ? COBRA_TYPE_STRING : COBRA_TYPE_I64;
-                node->fresh_string_result = strcmp(node->name, "concat") == 0;
+                node->value_type = returns_string ? COBRA_TYPE_STRING : COBRA_TYPE_I64;
+                node->fresh_string_result = returns_string;
                 return node->value_type;
             }
             if (strcmp(node->name, "alloc_i64") == 0 || strcmp(node->name, "alloc_f32") == 0 ||

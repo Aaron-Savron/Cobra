@@ -812,6 +812,43 @@ static int parse_int_literal(Parser *parser) {
 
 static ASTNode *parse_closure_literal(Parser *parser);
 
+/* receiver.method(args) chains lower to nested string builtin calls:
+   msg.strip().upper() becomes upper(strip(msg)). Each method consumes the
+   previous call node as its first (receiver) argument, so every chained
+   method call keeps the same (string, ...) contract as the builtins. */
+static ASTNode *parse_method_chain(Parser *parser, ASTNode *receiver) {
+    while (match(parser, TOKEN_DOT)) {
+        advance_token(parser);
+        if (!match(parser, TOKEN_IDENTIFIER)) {
+            fprintf(stderr, "%s:%d:%d: error: expected method name after '.'\n",
+                    parser->source_file, parser->current_token.line, parser->current_token.col);
+            exit(1);
+        }
+        Token method_token = parser->current_token;
+        char method_name[COBRA_MAX_IDENT_LEN];
+        copy_token_text(parser, method_name, sizeof(method_name), "method name");
+        advance_token(parser);
+        if (!match(parser, TOKEN_LPAREN)) {
+            fprintf(stderr, "%s:%d:%d: error: expected '(' after method name '%s'\n",
+                    parser->source_file, method_token.line, method_token.col, method_name);
+            exit(1);
+        }
+        advance_token(parser);
+        ASTNode *method_call = parser_create_node_at(parser, AST_FUNC_CALL, method_name, method_token);
+        ast_add_child(method_call, receiver);
+        if (!match(parser, TOKEN_RPAREN)) {
+            ast_add_child(method_call, parse_expression(parser));
+            while (match(parser, TOKEN_COMMA)) {
+                advance_token(parser);
+                ast_add_child(method_call, parse_expression(parser));
+            }
+        }
+        expect(parser, TOKEN_RPAREN, "Expected ')' after method call arguments");
+        receiver = method_call;
+    }
+    return receiver;
+}
+
 static ASTNode *parse_primary(Parser *parser) {
     if (match(parser, TOKEN_DEF)) {
         return parse_closure_literal(parser);
@@ -959,6 +996,8 @@ static ASTNode *parse_primary(Parser *parser) {
         ASTNode *node = parser_create_node(parser, AST_STRING_LITERAL, NULL);
         snprintf(node->string_val, sizeof(node->string_val), "%s", parser->current_token.text);
         advance_token(parser);
+        /* String literal receivers: "abc".upper() lowers to upper("abc"). */
+        if (match(parser, TOKEN_DOT)) return parse_method_chain(parser, node);
         return node;
     }
 
@@ -978,13 +1017,52 @@ static ASTNode *parse_primary(Parser *parser) {
         copy_token_text(parser, name, sizeof(name), "identifier");
         advance_token(parser);
 
-        // Check for array indexing: arr[index]
+        // Check for array indexing: arr[index], or a string slice arr[a:b]
         if (match(parser, TOKEN_LBRACKET)) {
             advance_token(parser);
+            /* A slice with no start: s[:end]. */
+            if (match(parser, TOKEN_COLON)) {
+                advance_token(parser);
+                ASTNode *slice_call = parser_create_node_at(parser, AST_FUNC_CALL, "substring", identifier_token);
+                ASTNode *base_ref = parser_create_node_at(parser, AST_VAR_REF, name, identifier_token);
+                ASTNode *zero = parser_create_node_at(parser, AST_INT_LITERAL, NULL, identifier_token);
+                zero->literal_i64 = 0; zero->literal_u64 = 0; zero->int_val = 0;
+                ast_add_child(slice_call, base_ref);
+                ast_add_child(slice_call, zero);
+                if (!match(parser, TOKEN_RBRACKET)) {
+                    ast_add_child(slice_call, parse_expression(parser));
+                    expect(parser, TOKEN_RBRACKET, "Expected ']' after slice end");
+                } else {
+                    advance_token(parser);
+                    ASTNode *max = parser_create_node_at(parser, AST_INT_LITERAL, NULL, identifier_token);
+                    max->literal_i64 = 9223372036854775807LL; max->literal_u64 = 9223372036854775807ULL;
+                    ast_add_child(slice_call, max);
+                }
+                return slice_call;
+            }
             ASTNode *idx_node = parser_create_node_at(parser, AST_ARRAY_INDEX, name, identifier_token);
+            ASTNode *first_index = parse_expression(parser);
+            /* A slice start: s[a:b] lowers to substring(s, a, b). */
+            if (match(parser, TOKEN_COLON)) {
+                advance_token(parser);
+                ASTNode *slice_call = parser_create_node_at(parser, AST_FUNC_CALL, "substring", identifier_token);
+                ASTNode *base_ref = parser_create_node_at(parser, AST_VAR_REF, name, identifier_token);
+                ast_add_child(slice_call, base_ref);
+                ast_add_child(slice_call, first_index);
+                if (!match(parser, TOKEN_RBRACKET)) {
+                    ast_add_child(slice_call, parse_expression(parser));
+                    expect(parser, TOKEN_RBRACKET, "Expected ']' after slice end");
+                } else {
+                    advance_token(parser);
+                    ASTNode *max = parser_create_node_at(parser, AST_INT_LITERAL, NULL, identifier_token);
+                    max->literal_i64 = 9223372036854775807LL; max->literal_u64 = 9223372036854775807ULL;
+                    ast_add_child(slice_call, max);
+                }
+                return slice_call;
+            }
             /* A tensor index may address more than one logical axis:
                x[row, col]. Ordinary arrays continue to use one index. */
-            ast_add_child(idx_node, parse_expression(parser));
+            ast_add_child(idx_node, first_index);
             while (match(parser, TOKEN_COMMA)) {
                 advance_token(parser);
                 ast_add_child(idx_node, parse_expression(parser));
@@ -1060,6 +1138,7 @@ static ASTNode *parse_primary(Parser *parser) {
                 }
             }
             expect(parser, TOKEN_RPAREN, "Expected ')' after qualified function call arguments");
+            call_node = parse_method_chain(parser, call_node);
             if (match(parser, TOKEN_QUESTION)) {
                 advance_token(parser);
                 call_node->propagate_error = true;
@@ -1126,7 +1205,8 @@ static ASTNode *parse_primary(Parser *parser) {
 }
 
 static bool is_multiplicative(Parser *parser) {
-    return match(parser, TOKEN_STAR) || match(parser, TOKEN_SLASH) || match(parser, TOKEN_PERCENT);
+    return match(parser, TOKEN_STAR) || match(parser, TOKEN_SLASH) ||
+           match(parser, TOKEN_PERCENT) || match(parser, TOKEN_FLOORDIV);
 }
 
 static bool is_additive(Parser *parser) {
@@ -1140,6 +1220,9 @@ static bool is_comparison(Parser *parser) {
 }
 
 static ASTNode *parse_cast(Parser *parser);
+static ASTNode *make_surface_boolean_op(Parser *parser, ASTNode *left,
+                                        Token op_token, ASTNode *right,
+                                        const char *op);
 
 static ASTNode *make_binary(Parser *parser, ASTNode *left) {
     char op[8];
@@ -1178,8 +1261,24 @@ static ASTNode *parse_cast(Parser *parser) {
     return left;
 }
 
-static ASTNode *parse_multiplicative(Parser *parser) {
+/* `**` binds tighter than the multiplicative operators and is
+   right-associative (2 ** 3 ** 2 is 2 ** (3 ** 2)). */
+static ASTNode *parse_power(Parser *parser) {
     ASTNode *left = parse_cast(parser);
+    if (match(parser, TOKEN_POW)) {
+        Token op_token = parser->current_token;
+        advance_token(parser);
+        ASTNode *right = parse_power(parser);
+        ASTNode *binary = parser_create_node_at(parser, AST_BINARY_OP, "**", op_token);
+        ast_add_child(binary, left);
+        ast_add_child(binary, right);
+        return binary;
+    }
+    return left;
+}
+
+static ASTNode *parse_multiplicative(Parser *parser) {
+    ASTNode *left = parse_power(parser);
     while (is_multiplicative(parser)) left = make_binary(parser, left);
     return left;
 }
@@ -1239,6 +1338,24 @@ static ASTNode *parse_comparison_expression(Parser *parser) {
         ast_add_child(binary, left);
         ast_add_child(binary, right);
         left = binary;
+        /* Chained comparisons (0 <= x < 10) reuse the middle operand and
+           conjoin with the same scalar-and lowering as `and`. */
+        while (is_comparison(parser)) {
+            Token chain_token = parser->current_token;
+            char chain_op[8];
+            strcpy(chain_op, parser->current_token.text);
+            advance_token(parser);
+            ASTNode *next = parse_additive(parser);
+            ASTNode *cmp = parser_create_node_at(parser, AST_BINARY_OP,
+                                                 chain_op, chain_token);
+            /* Clone the middle operand so each comparison owns its own tree;
+               the generated code evaluates it once per comparison, matching
+               Python's chained-comparison semantics. */
+            ast_add_child(cmp, ast_clone_node(right));
+            ast_add_child(cmp, next);
+            left = make_surface_boolean_op(parser, left, chain_token, cmp, "*");
+            right = next;
+        }
     }
     return left;
 }
@@ -1247,16 +1364,15 @@ static ASTNode *parse_comparison_expression(Parser *parser) {
    `(a as i64) + (b as i64)`, compared against zero. There is no
    short-circuiting; use `if` when operand side effects matter. */
 static ASTNode *make_surface_boolean_op(Parser *parser, ASTNode *left,
-                                        Token op_token, ASTNode *right) {
+                                        Token op_token, ASTNode *right,
+                                        const char *op) {
     ASTNode *left_cast = parser_create_node_at(parser, AST_CAST_EXPR, "as", op_token);
     left_cast->declared_type = COBRA_TYPE_I64;
     ast_add_child(left_cast, left);
     ASTNode *right_cast = parser_create_node_at(parser, AST_CAST_EXPR, "as", op_token);
     right_cast->declared_type = COBRA_TYPE_I64;
     ast_add_child(right_cast, right);
-    ASTNode *binary = parser_create_node_at(parser, AST_BINARY_OP,
-                                            op_token.type == TOKEN_AND ? "*" : "+",
-                                            op_token);
+    ASTNode *binary = parser_create_node_at(parser, AST_BINARY_OP, op, op_token);
     ast_add_child(binary, left_cast);
     ast_add_child(binary, right_cast);
 
@@ -1296,7 +1412,7 @@ static ASTNode *parse_boolean_and(Parser *parser) {
         Token op_token = parser->current_token;
         advance_token(parser);
         left = make_surface_boolean_op(parser, left, op_token,
-                                       parse_not_expression(parser));
+                                       parse_not_expression(parser), "*");
     }
     return left;
 }
@@ -1307,7 +1423,7 @@ static ASTNode *parse_expression(Parser *parser) {
         Token op_token = parser->current_token;
         advance_token(parser);
         left = make_surface_boolean_op(parser, left, op_token,
-                                       parse_boolean_and(parser));
+                                       parse_boolean_and(parser), "+");
     }
     return left;
 }
@@ -1890,30 +2006,159 @@ static ASTNode *parse_statement(Parser *parser) {
         ASTNode *primary = parse_primary(parser);
         if (primary->type == AST_VAR_REF || primary->type == AST_ARRAY_INDEX ||
             primary->type == AST_MEMBER_ACCESS) {
+            if (primary->type == AST_VAR_REF && match(parser, TOKEN_COMMA)) {
+                /* `a, b = e1, e2` - parallel tuple assignment. The RHS is
+                   evaluated into fresh temporaries before any target is
+                   written, so `a, b = b, a` swaps like Python. The same
+                   splice marker the `let (a, b)` destructure uses turns the
+                   generated statements into siblings. */
+                Token tuple_token = parser->current_token;
+                char names[8][COBRA_MAX_IDENT_LEN];
+                size_t name_count = 0;
+                strcpy(names[name_count++], primary->name);
+                ast_free(primary);
+                while (match(parser, TOKEN_COMMA)) {
+                    advance_token(parser);
+                    if (name_count >= 8 || !match(parser, TOKEN_IDENTIFIER)) {
+                        fprintf(stderr, "%s:%d:%d: error: expected a name in tuple assignment\n",
+                                parser->source_file, parser->current_token.line, parser->current_token.col);
+                        exit(1);
+                    }
+                    copy_token_text(parser, names[name_count++], COBRA_MAX_IDENT_LEN, "tuple assignment name");
+                    advance_token(parser);
+                }
+                expect(parser, TOKEN_ASSIGN, "Expected '=' in tuple assignment");
+                ASTNode *first_rhs = parse_expression(parser);
+                ASTNode *block = parser_create_node_at(parser, AST_PROGRAM,
+                                                       TUPLE_DESTRUCTURE_SPLICE_MARKER, tuple_token);
+                size_t value_count = 0;
+                ASTNode *values[8];
+                if (first_rhs->type == AST_TUPLE && !match(parser, TOKEN_COMMA)) {
+                    /* Parenthesized tuple literal: take its elements. */
+                    if (first_rhs->child_count > 8) {
+                        fprintf(stderr, "%s:%d:%d: error: too many values in tuple assignment\n",
+                                parser->source_file, tuple_token.line, tuple_token.col);
+                        exit(1);
+                    }
+                    for (size_t i = 0; i < first_rhs->child_count; i++) {
+                        values[value_count++] = first_rhs->children[i];
+                        first_rhs->children[i] = NULL;
+                    }
+                    ast_free(first_rhs);
+                } else if (match(parser, TOKEN_COMMA)) {
+                    /* Bare tuple literal RHS. */
+                    values[value_count++] = first_rhs;
+                    while (match(parser, TOKEN_COMMA)) {
+                        advance_token(parser);
+                        if (value_count >= 8) {
+                            fprintf(stderr, "%s:%d:%d: error: too many values in tuple assignment\n",
+                                    parser->source_file, parser->current_token.line, parser->current_token.col);
+                            exit(1);
+                        }
+                        values[value_count++] = parse_expression(parser);
+                    }
+                }
+                if (value_count > 0) {
+                    /* Literal RHS: evaluate each value into a temp first so
+                       `a, b = b, a` swaps instead of clobbering, then assign
+                       the temps to the targets. */
+                    if (value_count != name_count) {
+                        fprintf(stderr, "%s:%d:%d: error: tuple assignment expects %zu values, found %zu\n",
+                                parser->source_file, tuple_token.line, tuple_token.col,
+                                name_count, value_count);
+                        exit(1);
+                    }
+                    for (size_t i = 0; i < name_count; i++) {
+                        char temp_name[64];
+                        snprintf(temp_name, sizeof(temp_name), "__tuple_assign_%d_%d_%zu",
+                                 tuple_token.line, tuple_token.col, i);
+                        ASTNode *decl = parser_create_node_at(parser, AST_VAR_DECL, temp_name, tuple_token);
+                        decl->declared_type = COBRA_TYPE_UNTYPED;
+                        ast_add_child(decl, values[i]);
+                        ast_add_child(block, decl);
+                    }
+                    for (size_t i = 0; i < name_count; i++) {
+                        char temp_name[64];
+                        snprintf(temp_name, sizeof(temp_name), "__tuple_assign_%d_%d_%zu",
+                                 tuple_token.line, tuple_token.col, i);
+                        ASTNode *assign = parser_create_node_at(parser, AST_ASSIGN, names[i], tuple_token);
+                        ast_add_child(assign, parser_create_node_at(parser, AST_VAR_REF, temp_name, tuple_token));
+                        ast_add_child(block, assign);
+                    }
+                } else if (first_rhs->type == AST_FUNC_CALL) {
+                    /* Destructuring a call result, mirroring the `let (a, b)`
+                       path: bind the call to a hidden tuple-struct temp and
+                       assign each `_i` member to its target. */
+                    ASTNode *callee = NULL;
+                    if (parser->root) {
+                        for (size_t i = 0; i < parser->root->child_count; i++) {
+                            ASTNode *cand = parser->root->children[i];
+                            if (cand->type == AST_FUNCTION && !strcmp(cand->name, first_rhs->name)) { callee = cand; break; }
+                        }
+                    }
+                    if (!callee || callee->declared_type != COBRA_TYPE_STRUCT || !callee->canonical_type) {
+                        fprintf(stderr, "%s:%d:%d: error: tuple assignment requires a tuple literal or a tuple-returning function call\n",
+                                parser->source_file, tuple_token.line, tuple_token.col);
+                        exit(1);
+                    }
+                    const char *tuple_name = cobra_type_node_name(callee);
+                    ASTNode *found_decl = NULL;
+                    for (size_t i = 0; parser->root && i < parser->root->child_count; i++) {
+                        ASTNode *cand = parser->root->children[i];
+                        if (cand->type == AST_STRUCT_DECL && !strcmp(cand->name, tuple_name)) { found_decl = cand; break; }
+                    }
+                    if (!found_decl || found_decl->child_count != name_count) {
+                        fprintf(stderr, "%s:%d:%d: error: tuple assignment expects %zu values, callee returns a different arity\n",
+                                parser->source_file, tuple_token.line, tuple_token.col, name_count);
+                        exit(1);
+                    }
+                    char temp_name[64];
+                    snprintf(temp_name, sizeof(temp_name), "__tuple_assign_%d_%d", tuple_token.line, tuple_token.col);
+                    ASTNode *temp_decl = parser_create_node_at(parser, AST_VAR_DECL, temp_name, tuple_token);
+                    temp_decl->declared_type = COBRA_TYPE_STRUCT;
+                    temp_decl->canonical_type = callee->canonical_type;
+                    ast_add_child(temp_decl, first_rhs);
+                    ast_add_child(block, temp_decl);
+                    for (size_t i = 0; i < name_count; i++) {
+                        ASTNode *access = parser_create_node_at(parser, AST_MEMBER_ACCESS, temp_name, tuple_token);
+                        snprintf(access->secondary_name, sizeof(access->secondary_name), "_%zu", i);
+                        ast_add_child(access, parser_create_node_at(parser, AST_VAR_REF, temp_name, tuple_token));
+                        ASTNode *assign = parser_create_node_at(parser, AST_ASSIGN, names[i], tuple_token);
+                        ast_add_child(assign, access);
+                        ast_add_child(block, assign);
+                    }
+                } else {
+                    fprintf(stderr, "%s:%d:%d: error: tuple assignment requires a tuple literal or a tuple-returning function call\n",
+                            parser->source_file, tuple_token.line, tuple_token.col);
+                    exit(1);
+                }
+                return block;
+            }
             /* `x += e` and friends lower to `x = x + e`, reusing the same
                LHS forms as plain assignment. Probe one token past the
                operator to tell `+=` from `+` in an expression. */
-            char compound_op = 0;
+            char compound_op[4] = "";
             if (match(parser, TOKEN_PLUS) || match(parser, TOKEN_MINUS) ||
                 match(parser, TOKEN_STAR) || match(parser, TOKEN_SLASH) ||
-                match(parser, TOKEN_PERCENT)) {
+                match(parser, TOKEN_PERCENT) || match(parser, TOKEN_FLOORDIV) ||
+                match(parser, TOKEN_POW)) {
                 Lexer saved_lexer = parser->lexer;
                 Token saved_token = parser->current_token;
-                char op_char = parser->current_token.text[0];
+                strcpy(compound_op, parser->current_token.text);
                 advance_token(parser);
-                if (match(parser, TOKEN_ASSIGN)) compound_op = op_char;
+                if (!match(parser, TOKEN_ASSIGN)) compound_op[0] = '\0';
                 parser->lexer = saved_lexer;
                 parser->current_token = saved_token;
             }
-            if (compound_op && (match(parser, TOKEN_PLUS) || match(parser, TOKEN_MINUS) ||
-                                match(parser, TOKEN_STAR) || match(parser, TOKEN_SLASH) ||
-                                match(parser, TOKEN_PERCENT))) {
-                char op_text[2] = { compound_op, '\0' };
+            if (compound_op[0] && (match(parser, TOKEN_PLUS) || match(parser, TOKEN_MINUS) ||
+                                   match(parser, TOKEN_STAR) || match(parser, TOKEN_SLASH) ||
+                                   match(parser, TOKEN_PERCENT) || match(parser, TOKEN_FLOORDIV) ||
+                                   match(parser, TOKEN_POW))) {
                 Token op_token = parser->current_token;
                 advance_token(parser);
                 expect(parser, TOKEN_ASSIGN, "Expected '=' in compound assignment");
                 ASTNode *read = ast_clone_node(primary);
-                ASTNode *binary = parser_create_node_at(parser, AST_BINARY_OP, op_text, op_token);
+                ASTNode *binary = parser_create_node_at(parser, AST_BINARY_OP, compound_op, op_token);
                 ast_add_child(binary, read);
                 ast_add_child(binary, parse_expression(parser));
                 return parser_make_assignment(parser, primary, binary, id_name, target_token);

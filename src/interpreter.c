@@ -50,12 +50,17 @@ int interpreter_eval_expr(ASTNode *node) {
         if (strcmp(node->name, "+") == 0) return left + right;
         if (strcmp(node->name, "-") == 0) return left - right;
         if (strcmp(node->name, "*") == 0) return left * right;
-        if (strcmp(node->name, "/") == 0) {
+        if (strcmp(node->name, "/") == 0 || strcmp(node->name, "//") == 0) {
             if (right == 0) {
                 fprintf(stderr, "Compile Error: division by zero in @comptime expression\n");
                 exit(1);
             }
             return left / right;
+        }
+        if (strcmp(node->name, "**") == 0) {
+            long long result = 1;
+            for (long long i = 0; i < right; i++) result *= left;
+            return result;
         }
         if (strcmp(node->name, "==") == 0) return left == right;
         if (strcmp(node->name, "!=") == 0) return left != right;
@@ -137,7 +142,12 @@ static long long eval_binary(const char *op, long long left, long long right) {
     if (strcmp(op, "+") == 0) return left + right;
     if (strcmp(op, "-") == 0) return left - right;
     if (strcmp(op, "*") == 0) return left * right;
-    if (strcmp(op, "/") == 0) return right == 0 ? 0 : left / right;
+    if (strcmp(op, "/") == 0 || strcmp(op, "//") == 0) return right == 0 ? 0 : left / right;
+    if (strcmp(op, "**") == 0) {
+        long long result = 1;
+        for (long long i = 0; i < right; i++) result *= left;
+        return result;
+    }
     if (strcmp(op, "==") == 0) return left == right;
     if (strcmp(op, "!=") == 0) return left != right;
     if (strcmp(op, "<") == 0) return left < right;

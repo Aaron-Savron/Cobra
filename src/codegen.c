@@ -1435,6 +1435,25 @@ static void emit_string_char_at(CodeGen *cg, ASTNode *n) {
     fprintf(cg->out, ".Lstr_char_done_%d:\n", fail);
 }
 
+/* s.upper()/s.lower()/s.strip()/s.replace(...) lower to the collections
+   runtime helpers, which return a freshly malloc'd owned string in rax. */
+static void emit_string_method(CodeGen *cg, ASTNode *n) {
+    int slots[3] = {0, 0, 0};
+    for (size_t i = 0; i < n->child_count && i < 3; i++) {
+        slots[i] = reserve(cg, 8);
+        emit_expr(cg, n->children[i]);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", slots[i]);
+    }
+    fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n", slots[0]);
+    if (n->child_count >= 2) fprintf(cg->out, "    mov rsi, QWORD PTR [rbp-%d]\n", slots[1]);
+    if (n->child_count >= 3) fprintf(cg->out, "    mov rdx, QWORD PTR [rbp-%d]\n", slots[2]);
+    if (!strcmp(n->name, "upper")) fprintf(cg->out, "    call cobra_str_upper@PLT\n");
+    else if (!strcmp(n->name, "lower")) fprintf(cg->out, "    call cobra_str_lower@PLT\n");
+    else if (!strcmp(n->name, "strip")) fprintf(cg->out, "    call cobra_str_strip@PLT\n");
+    else if (!strcmp(n->name, "replace")) fprintf(cg->out, "    call cobra_str_replace@PLT\n");
+    else fprintf(cg->out, "    call cobra_str_substring@PLT\n");
+}
+
 static void emit_failure(CodeGen *cg, const char *message) {
     int id = cg->string_count++;
     fprintf(cg->out, "    lea rdi, [rip + .LC%d]\n    call puts@PLT\n    mov edi, 1\n    call exit@PLT\n", id);
@@ -1837,11 +1856,14 @@ static void emit_index_read(CodeGen *cg, const char *name, ASTNode **indices, si
     int fail = cg->label_count++;
     emit_expr(cg, indices[0]); fprintf(cg->out, "    mov rdx, rax\n");
     if (s->type == COBRA_TYPE_STRING) {
-        /* String indexing reads one byte with a runtime bounds check, matching
-           char_at's contract. Strings have no length slot, so measure at use. */
-        int index_slot = reserve(cg, 8);
-        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rdx\n    cmp rdx, 0\n    jl .Lidx_fail_%d\n", index_slot, fail);
-        fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    call strlen@PLT\n    cmp QWORD PTR [rbp-%d], rax\n    jae .Lidx_fail_%d\n", s->offset, index_slot, fail);
+        /* String indexing reads one byte with a runtime bounds check. A
+           negative index counts from the end, like a Python index; strings
+           have no length slot, so the length is measured at use. */
+        int index_slot = reserve(cg, 8), len_slot = reserve(cg, 8), nonneg = cg->label_count++;
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rdx\n", index_slot);
+        fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    call strlen@PLT\n    mov QWORD PTR [rbp-%d], rax\n", s->offset, len_slot);
+        fprintf(cg->out, "    cmp QWORD PTR [rbp-%d], 0\n    jge .Lstr_idx_nonneg_%d\n    mov rax, QWORD PTR [rbp-%d]\n    add rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n.Lstr_idx_nonneg_%d:\n", index_slot, nonneg, index_slot, len_slot, index_slot, nonneg);
+        fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    cmp rax, 0\n    jl .Lidx_fail_%d\n    cmp rax, QWORD PTR [rbp-%d]\n    jae .Lidx_fail_%d\n", index_slot, fail, len_slot, fail);
         fprintf(cg->out, "    mov rbx, QWORD PTR [rbp-%d]\n    mov rdx, QWORD PTR [rbp-%d]\n    movzx eax, BYTE PTR [rbx + rdx]\n    jmp .Lidx_done_%d\n", s->offset, index_slot, fail);
         fprintf(cg->out, ".Lidx_fail_%d:\n", fail);
         emit_failure_at(cg, indices[0], "string index out of bounds");
@@ -2343,16 +2365,28 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
                 fprintf(cg->out, "    movss xmm1, DWORD PTR [rsp]\n    add rsp, 16\n");
                 if (!strcmp(node->name, "+")) fprintf(cg->out, "    addss xmm0, xmm1\n"); else if (!strcmp(node->name, "-")) fprintf(cg->out, "    subss xmm0, xmm1\n"); else if (!strcmp(node->name, "*")) fprintf(cg->out, "    mulss xmm0, xmm1\n"); else if (!strcmp(node->name, "/")) fprintf(cg->out, "    divss xmm0, xmm1\n"); else { fprintf(cg->out, "    ucomiss xmm0, xmm1\n"); const char *set = !strcmp(node->name, "==") ? "sete" : !strcmp(node->name, "!=") ? "setne" : !strcmp(node->name, "<") ? "setb" : !strcmp(node->name, ">") ? "seta" : !strcmp(node->name, "<=") ? "setbe" : "setae"; fprintf(cg->out, "    %s al\n    movzx eax, al\n", set); }            } else {
                 fprintf(cg->out, "    push rbx\n"); emit_expr(cg, node->children[1]); fprintf(cg->out, "    push rax\n"); emit_expr(cg, node->children[0]); fprintf(cg->out, "    pop rbx\n");
-                if (!strcmp(node->name, "+")) fprintf(cg->out, "    add rax, rbx\n"); else if (!strcmp(node->name, "-")) fprintf(cg->out, "    sub rax, rbx\n"); else if (!strcmp(node->name, "*")) fprintf(cg->out, "    imul rax, rbx\n"); else if (!strcmp(node->name, "/")) {
+                if (!strcmp(node->name, "+")) fprintf(cg->out, "    add rax, rbx\n"); else if (!strcmp(node->name, "-")) fprintf(cg->out, "    sub rax, rbx\n"); else if (!strcmp(node->name, "*")) fprintf(cg->out, "    imul rax, rbx\n"); else if (!strcmp(node->name, "/") || !strcmp(node->name, "//")) {
                     int fail = cg->label_count++;
                     fprintf(cg->out, "    cmp rbx, 0\n    je .Ldiv_zero_%d\n    cqo\n    idiv rbx\n    jmp .Ldiv_done_%d\n.Ldiv_zero_%d:\n", fail, fail, fail);
-                    emit_failure_at(cg, node, "division by zero");
+                    emit_failure_at(cg, node, !strcmp(node->name, "//") ? "floor division by zero" : "division by zero");
                     fprintf(cg->out, ".Ldiv_done_%d:\n", fail);
                 } else if (!strcmp(node->name, "%")) {
                     int fail = cg->label_count++;
                     fprintf(cg->out, "    cmp rbx, 0\n    je .Lmod_zero_%d\n    cqo\n    idiv rbx\n    mov rax, rdx\n    jmp .Lmod_done_%d\n.Lmod_zero_%d:\n", fail, fail, fail);
                     emit_failure_at(cg, node, "modulo by zero");
                     fprintf(cg->out, ".Lmod_done_%d:\n", fail);
+                } else if (!strcmp(node->name, "**")) {
+                    /* Integer exponentiation: left ** right. The base is
+                       parked in a frame slot while rax accumulates the
+                       product; negative exponents fail at runtime. */
+                    int pow = cg->label_count++;
+                    int tmp = reserve(cg, 8);
+                    int neg = cg->label_count++;
+                    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", tmp);
+                    fprintf(cg->out, "    cmp rbx, 0\n    jl .Lpow_neg_%d\n", neg);
+                    fprintf(cg->out, "    mov rax, 1\n    jmp .Lpow_test_%d\n.Lpow_loop_%d:\n    imul rax, QWORD PTR [rbp-%d]\n.Lpow_test_%d:\n    test rbx, rbx\n    je .Lpow_done_%d\n    dec rbx\n    jmp .Lpow_loop_%d\n.Lpow_neg_%d:\n", pow, pow, tmp, pow, pow, pow, neg);
+                    emit_failure_at(cg, node, "negative exponent");
+                    fprintf(cg->out, ".Lpow_done_%d:\n", pow);
                 } else { fprintf(cg->out, "    cmp rax, rbx\n"); const char *set = !strcmp(node->name, "==") ? "sete" : !strcmp(node->name, "!=") ? "setne" : !strcmp(node->name, "<") ? "setl" : !strcmp(node->name, ">") ? "setg" : !strcmp(node->name, "<=") ? "setle" : "setge"; fprintf(cg->out, "    %s al\n    movzx eax, al\n", set); }
                 fprintf(cg->out, "    pop rbx\n");
             }
@@ -3669,6 +3703,9 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
     }
     if (!strcmp(n->name, "starts_with") || !strcmp(n->name, "ends_with") || !strcmp(n->name, "contains")) { emit_string_predicate(cg, n); return; }
     if (!strcmp(n->name, "char_at")) { emit_string_char_at(cg, n); return; }
+    if (!strcmp(n->name, "upper") || !strcmp(n->name, "lower") ||
+        !strcmp(n->name, "strip") || !strcmp(n->name, "replace") ||
+        !strcmp(n->name, "substring")) { emit_string_method(cg, n); return; }
     if (!strcmp(n->name, "string_free")) {
         if (n->child_count && n->children[0]->type == AST_VAR_REF) {
             VarSymbol *s = find_symbol(cg, n->children[0]->name);

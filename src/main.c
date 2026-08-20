@@ -1198,7 +1198,10 @@ static bool ast_contains_collections(ASTNode *node) {
     if (node->type == AST_FUNC_CALL &&
         (!strcmp(node->name, "append") || !strcmp(node->name, "set") ||
          !strcmp(node->name, "get") || !strcmp(node->name, "has") ||
-         !strcmp(node->name, "delete") || !strcmp(node->name, "pop"))) return true;
+         !strcmp(node->name, "delete") || !strcmp(node->name, "pop") ||
+         !strcmp(node->name, "upper") || !strcmp(node->name, "lower") ||
+         !strcmp(node->name, "strip") || !strcmp(node->name, "replace") ||
+         !strcmp(node->name, "substring"))) return true;
     for (size_t i = 0; i < node->child_count; i++) if (ast_contains_collections(node->children[i])) return true;
     return false;
 }

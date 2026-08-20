@@ -345,8 +345,24 @@ Token lexer_next_token(Lexer *lexer) {
                 token.type = TOKEN_MINUS;
             }
             break;
-        case '*': token.type = TOKEN_STAR; break;
-        case '/': token.type = TOKEN_SLASH; break;
+        case '*':
+            if (peek(lexer) == '*') {
+                advance(lexer);
+                token.type = TOKEN_POW;
+                strcpy(token.text, "**");
+            } else {
+                token.type = TOKEN_STAR;
+            }
+            break;
+        case '/':
+            if (peek(lexer) == '/') {
+                advance(lexer);
+                token.type = TOKEN_FLOORDIV;
+                strcpy(token.text, "//");
+            } else {
+                token.type = TOKEN_SLASH;
+            }
+            break;
         case '%': token.type = TOKEN_PERCENT; break;
         case '.': token.type = TOKEN_DOT; break;
         case '@':
