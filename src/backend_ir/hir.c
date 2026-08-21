@@ -6347,13 +6347,14 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                 bool is_string = element && element->kind == COBRA_TYPE_U8 &&
                                  (bir_is_borrowed_view_type(value->type) ||
                                   bir_is_owned_slice_type(value->type));
-                if (!is_string) {
+                bool is_float = !is_string && bir_types_equal(value->type, b->module->type_f32);
+                if (!is_string && !is_float) {
                     value = hir_coerce_int_const(b, value, b->module->type_i64);
                     if (!value || !hir_complete_float_expr(b, value, b->module->type_i64) ||
                         !bir_types_equal(value->type, b->module->type_i64)) {
                         hir_expr_free(value);
                         bir_fail(b, stmt->source_line, stmt->source_col,
-                                 "print requires a string or i64 argument in the backend-IR subset");
+                                 "print requires a string, i64, or f32 argument in the backend-IR subset");
                         return false;
                     }
                 }
@@ -6361,7 +6362,8 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                 memset(&print_stmt, 0, sizeof(print_stmt));
                 print_stmt.kind = HIR_STMT_PRINT;
                 print_stmt.expr = value;
-                print_stmt.local = is_string ? 1 : 0; /* reuses .local as a 0/1 string flag */
+                /* reuses .local as a 0=i64/1=string/2=f32 print-kind flag */
+                print_stmt.local = is_string ? 1 : is_float ? 2 : 0;
                 if (!hir_block_add_stmt(b, b->current, print_stmt)) {
                     hir_expr_free(value);
                     return false;

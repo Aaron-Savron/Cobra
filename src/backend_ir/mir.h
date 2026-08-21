@@ -98,6 +98,7 @@ typedef enum {
     MIR_OP_SUM_CHECK,
     MIR_OP_PRINT_I64,
     MIR_OP_PRINT_STRING,
+    MIR_OP_PRINT_F32,
     MIR_OP_ASSERT,
     MIR_OP_CALL,
     MIR_OP_JUMP,

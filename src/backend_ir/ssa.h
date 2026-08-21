@@ -266,6 +266,7 @@ typedef enum {
     SSA_OP_SUM_CHECK,       /* tag -> none, runtime failure on wrong tag      */
     SSA_OP_PRINT_I64,       /* i64/bool -> none, prints "%ld\n" to stdout     */
     SSA_OP_PRINT_STRING,    /* readonly u8 view -> none, prints "%s\n"        */
+    SSA_OP_PRINT_F32,       /* f32 -> none, prints "%f\n" to stdout           */
     SSA_OP_ASSERT,          /* i64/bool -> none, runtime failure if zero      */
     SSA_OP_CALL,
     SSA_OP_JUMP,           /* terminator                              */
@@ -783,6 +784,7 @@ SsaInstRef bir_add_sum_check(SsaArena *arena, SsaValueRef tag,
                              int check_kind, int line, int col);
 SsaInstRef bir_add_print_i64(SsaArena *arena, SsaValueRef value, int line, int col);
 SsaInstRef bir_add_print_string(SsaArena *arena, SsaValueRef view, int line, int col);
+SsaInstRef bir_add_print_f32(SsaArena *arena, SsaValueRef value, int line, int col);
 SsaInstRef bir_add_assert(SsaArena *arena, SsaValueRef cond, int line, int col);
 
 /* An owned slice argument satisfies a borrowed readonly or writable view

@@ -491,6 +491,10 @@ SsaInstRef bir_add_print_string(SsaArena *arena, SsaValueRef view, int line, int
     return bir_add_inst(arena, SSA_OP_PRINT_STRING, NULL, &view, 1, line, col);
 }
 
+SsaInstRef bir_add_print_f32(SsaArena *arena, SsaValueRef value, int line, int col) {
+    return bir_add_inst(arena, SSA_OP_PRINT_F32, NULL, &value, 1, line, col);
+}
+
 SsaInstRef bir_add_assert(SsaArena *arena, SsaValueRef cond, int line, int col) {
     return bir_add_inst(arena, SSA_OP_ASSERT, NULL, &cond, 1, line, col);
 }
@@ -1892,6 +1896,7 @@ const char *bir_opcode_name(SsaOpcode op) {
         case SSA_OP_SUM_CHECK: return "sum_check";
         case SSA_OP_PRINT_I64: return "print_i64";
         case SSA_OP_PRINT_STRING: return "print_string";
+        case SSA_OP_PRINT_F32: return "print_f32";
         case SSA_OP_ASSERT: return "assert";
         case SSA_OP_CALL: return "call";
         case SSA_OP_JUMP: return "jump";

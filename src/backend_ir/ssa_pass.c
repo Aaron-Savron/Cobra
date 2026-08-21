@@ -1906,8 +1906,10 @@ static bool emit_block(SsaPass *p, size_t block, HirBlock *hb) {
             case HIR_STMT_PRINT: {
                 SsaValueRef value = ssa_eval_expr(p, block, stmt->expr);
                 if (value == SSA_VALUE_NONE) return false;
-                SsaInstRef print = stmt->local
+                SsaInstRef print = stmt->local == 1
                     ? bir_add_print_string(arena, value, hb->source_line, hb->source_col)
+                    : stmt->local == 2
+                    ? bir_add_print_f32(arena, value, hb->source_line, hb->source_col)
                     : bir_add_print_i64(arena, value, hb->source_line, hb->source_col);
                 if (print == SSA_INST_NONE || !bir_block_add_inst(arena, p->base + block, print))
                     return false;

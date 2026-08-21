@@ -177,6 +177,7 @@ static MirOpcode mir_opcode_for_ssa(SsaOpcode op) {
         case SSA_OP_SUM_CHECK: return MIR_OP_SUM_CHECK;
         case SSA_OP_PRINT_I64: return MIR_OP_PRINT_I64;
         case SSA_OP_PRINT_STRING: return MIR_OP_PRINT_STRING;
+        case SSA_OP_PRINT_F32: return MIR_OP_PRINT_F32;
         case SSA_OP_ASSERT: return MIR_OP_ASSERT;
         case SSA_OP_CALL: return MIR_OP_CALL;
         case SSA_OP_JUMP: return MIR_OP_JUMP;
@@ -246,6 +247,7 @@ const char *mir_opcode_name(MirOpcode op) {
         case MIR_OP_SUM_CHECK: return "sum_check";
         case MIR_OP_PRINT_I64: return "print_i64";
         case MIR_OP_PRINT_STRING: return "print_string";
+        case MIR_OP_PRINT_F32: return "print_f32";
         case MIR_OP_ASSERT: return "assert";
         case MIR_OP_CALL: return "call";
         case MIR_OP_JUMP: return "jump";

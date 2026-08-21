@@ -818,6 +818,9 @@ static bool check_instruction_signature(VerifyCtx *ctx, SsaBlockRef ref,
         case SSA_OP_PRINT_STRING:
             expected_operands = 1;
             break;
+        case SSA_OP_PRINT_F32:
+            expected_operands = 1;
+            break;
         case SSA_OP_ASSERT:
             expected_operands = 1;
             break;
@@ -847,6 +850,10 @@ static bool check_instruction_signature(VerifyCtx *ctx, SsaBlockRef ref,
         for (size_t i = 0; i < expected_operands; i++) {
             if (!check_value_type(ctx, ops[i], i64, "integer opcode operand")) return false;
         }
+    }
+    if (inst->op == SSA_OP_PRINT_F32 &&
+        !check_value_type(ctx, ops[0], ctx->module->type_f32, "print_f32 operand")) {
+        return false;
     }
     if (operands_are_numeric) {
         const CobraType *numeric_type = arena->values[ops[0]].type;

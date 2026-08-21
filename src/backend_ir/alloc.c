@@ -266,7 +266,9 @@ static bool alloc_function(MirAllocation *allocation, size_t function_index,
                     inst->op == MIR_OP_DICT_POP || inst->op == MIR_OP_DICT_LEN ||
                     inst->op == MIR_OP_DICT_FREE ||
                     inst->op == MIR_OP_SUM_DROP || inst->op == MIR_OP_AGG_DROP ||
-                    inst->op == MIR_OP_DESTROY || inst->op == MIR_OP_REGION_EXIT) {
+                    inst->op == MIR_OP_DESTROY || inst->op == MIR_OP_REGION_EXIT ||
+                    inst->op == MIR_OP_PRINT_I64 || inst->op == MIR_OP_PRINT_STRING ||
+                    inst->op == MIR_OP_PRINT_F32 || inst->op == MIR_OP_ASSERT) {
                     forbidden |= alloc_class_mask(interval->register_class);
                 }
                 if ((inst->op == MIR_OP_DIV || inst->op == MIR_OP_REM) &&

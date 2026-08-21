@@ -921,6 +921,21 @@ static bool x86_emit_print_string(X86Context *ctx, const MirInst *inst) {
     return false;
 }
 
+static bool x86_emit_print_f32(X86Context *ctx, const MirInst *inst) {
+    if (inst->operand_count != 1) return false;
+    MirReg value = ctx->module->arena.operands[inst->operand_start];
+    char label[64];
+    uint32_t id = ctx->dict_key_labels++;
+    snprintf(label, sizeof(label), ".Lcobra_fmt_f32_%zu_%u", ctx->function_index, id);
+    fprintf(ctx->out, "    .section .rodata\n%s:\n    .string \"%%f\\n\"\n    .text\n", label);
+    if (!x86_emit_load_float(ctx, value, "%xmm0")) return false;
+    fprintf(ctx->out,
+            "    cvtss2sd %%xmm0, %%xmm0\n"
+            "    leaq %s(%%rip), %%rdi\n    movb $1, %%al\n    call printf@PLT\n",
+            label);
+    return true;
+}
+
 static bool x86_emit_assert(X86Context *ctx, const MirInst *inst) {
     if (inst->operand_count != 1) return false;
     MirReg cond = ctx->module->arena.operands[inst->operand_start];
@@ -1652,6 +1667,7 @@ static bool x86_emit_instruction(X86Context *ctx, const MirInst *inst) {
         case MIR_OP_SUM_CHECK: return x86_emit_sum_check(ctx, inst);
         case MIR_OP_PRINT_I64: return x86_emit_print_i64(ctx, inst);
         case MIR_OP_PRINT_STRING: return x86_emit_print_string(ctx, inst);
+        case MIR_OP_PRINT_F32: return x86_emit_print_f32(ctx, inst);
         case MIR_OP_ASSERT: return x86_emit_assert(ctx, inst);
         case MIR_OP_REGION_ENTER: return true;
         case MIR_OP_REGION_EXIT: return x86_emit_region_cleanup(ctx, inst->region_id);

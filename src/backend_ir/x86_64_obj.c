@@ -1463,6 +1463,20 @@ static bool x86obj_emit_inst(X86ObjContext *ctx, size_t function_index, const Mi
             emit_movabs(ctx, 7 /* rdi */, 10 /* '\n' */);
             return emit_call_extern(ctx, "putchar");
         }
+        case MIR_OP_PRINT_F32: {
+            /* printf's variadic float promotion expects a double in xmm0,
+               and SysV requires al to hold the vector-register argument
+               count, matching the direct backend's own AST_PRINT_STMT float
+               case in codegen.c. */
+            if (inst->operand_count != 1) return false;
+            MirReg value = ctx->module->arena.operands[inst->operand_start];
+            if (!x86obj_load_float(ctx, value, X86OBJ_XMM_SCRATCH0)) return false;
+            emit_cvt_float_width(ctx, false, 0 /* xmm0 */, X86OBJ_XMM_SCRATCH0);
+            size_t fmt_offset = x86obj_rodata_string(ctx, "%f\n");
+            emit_lea_rodata(ctx, 7 /* rdi */, fmt_offset);
+            emit_movabs(ctx, X86OBJ_RAX, 1);
+            return emit_call_extern(ctx, "printf");
+        }
         case MIR_OP_ASSERT: {
             if (inst->operand_count != 1) return false;
             MirReg cond = ctx->module->arena.operands[inst->operand_start];
