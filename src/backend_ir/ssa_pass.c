@@ -1640,7 +1640,8 @@ static bool ssa_emit_aggregate_call(SsaPass *p, size_t block, HirExpr *expr,
 }
 
 static bool ssa_store_local(SsaPass *p, size_t block, uint32_t local,
-                             SsaValueRef value, int line, int col) {
+                             SsaValueRef value, bool source_is_local_read,
+                             int line, int col) {
     SsaArena *arena = &p->module->arena;
     if (local >= p->local_count) return false;
     const CobraType *local_type = p->fn->locals[local].type;
@@ -1661,7 +1662,20 @@ static bool ssa_store_local(SsaPass *p, size_t block, uint32_t local,
             arena->values[value].type->kind != COBRA_TYPE_POINTER ||
             arena->values[value].type->generic_arg_count != 1 ||
             !cobra_type_equal(arena->values[value].type->generic_args[0], type)) return false;
-        SsaInstRef copy = bir_type_has_owned_payload(type)
+        /* A struct assignment whose source is a plain read of another named
+           local (`let b: Owner = a`) leaves `a` live and usable afterward -
+           it is a value copy, not a transfer of ownership, matching the
+           direct backend's compute_safe_autofree_structs (codegen.c), which
+           excludes any struct local that is ever copied elsewhere from its
+           automatic-free set rather than freeing it and leaving the copy
+           dangling. backend_ir has no such struct-local autofree yet (only
+           explicit free() calls emit HIR_STMT_FREE), so a plain byte copy
+           here is safe: neither copy is ever freed automatically, matching
+           the direct backend's leak-rather-than-double-free behavior. A
+           genuine move (assigning from a temporary - a call result, a
+           materialized literal, another field extraction) still zeroes the
+           source, since that source has no other live owner to corrupt. */
+        SsaInstRef copy = (bir_type_has_owned_payload(type) && !source_is_local_read)
             ? (bir_is_sum_type(type)
                ? bir_add_sum_move(arena, type, pointer, value, line, col)
                : bir_add_aggregate_move(arena, type, pointer, value, line, col))
@@ -1756,6 +1770,8 @@ static bool emit_block(SsaPass *p, size_t block, HirBlock *hb) {
                 if (value == SSA_VALUE_NONE) return false;
                 const size_t index = block * p->local_count + stmt->local;
                 if (!ssa_store_local(p, block, stmt->local, value,
+                                     stmt->expr->kind == HIR_EXPR_LOCAL &&
+                                         stmt->expr->named_source_copy,
                                      stmt->expr->source_line, stmt->expr->source_col)) {
                     return false;
                 }

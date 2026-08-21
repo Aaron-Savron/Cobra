@@ -5384,6 +5384,10 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                     stmt->children[0]->propagate_error) {
                     if (!hir_build_try_propagate(b, stmt->children[0], &value)) return false;
                 } else if (!hir_build_expr(b, stmt->children[0], &value)) return false;
+                if (value && value->kind == HIR_EXPR_LOCAL &&
+                    stmt->children[0]->type == AST_VAR_REF) {
+                    value->named_source_copy = true;
+                }
                 if (!declared ||
                     ((stmt->type == AST_VAR_DECL || stmt->type == AST_HEAP_DECL) &&
                      stmt->declared_type == COBRA_TYPE_UNTYPED &&

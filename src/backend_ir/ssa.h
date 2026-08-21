@@ -445,6 +445,15 @@ struct HirExpr {
        the SSA lowering mark the resulting view_make releasable right after
        the call that consumes it. */
     bool transient_borrow;
+    /* True only when this LOCAL expr is the entire, literal right-hand side
+       of a source-level `let b = a` / `b = a` (stmt->children[0] was an
+       AST_VAR_REF naming another local directly) - as opposed to a compiler-
+       synthesized read of a temporary (e.g. a match-arm payload binding).
+       The former leaves the source variable live and readable afterward, so
+       assigning an owned-payload aggregate through it must copy, not move;
+       the latter's source has no other owner, so it is safe, and required
+       for existing sum/struct ownership-transfer verification, to move. */
+    bool named_source_copy;
     int source_line;
     int source_col;
 };
