@@ -6618,6 +6618,11 @@ bool bir_build_function(BackendIrModule *module, ASTNode *function,
                      "internal error: parameter local ordering");
             goto fail;
         }
+        if (param_type && param_type->kind == COBRA_TYPE_STRUCT &&
+            child->canonical_type &&
+            child->canonical_type->mutability == COBRA_MUTABILITY_OUT) {
+            fn.locals[local].is_out_struct_alias = true;
+        }
         param_count++;
     }
 
@@ -6888,6 +6893,33 @@ bool bir_build_program(BackendIrModule *module, ASTNode *root) {
                                   return_type, has_return)) {
 
             return false;
+        }
+        /* bir_declare_function's generic classifier defaults every
+           pointer-kind param (which every struct param is, once substituted)
+           to read-only. Patch in real write access for `out StructType`
+           params here, using the AST's mutability, before any SSA value or
+           downstream verification consults param_pointer_contract. */
+        BirFunctionInfo *info = NULL;
+        for (size_t f = 0; f < module->function_count; f++) {
+            if (strcmp(module->functions[f].name, decl->name) == 0) {
+                info = &module->functions[f];
+                break;
+            }
+        }
+        if (info) {
+            size_t out_index = 0;
+            for (size_t p = 0; p < decl->child_count; p++) {
+                ASTNode *child = decl->children[p];
+                if (child->type != AST_PARAM) continue;
+                if (out_index < param_count && params[out_index] &&
+                    params[out_index]->kind == COBRA_TYPE_STRUCT &&
+                    child->canonical_type &&
+                    child->canonical_type->mutability == COBRA_MUTABILITY_OUT) {
+                    info->param_is_out_struct[out_index] = true;
+                    info->param_pointer_contract[out_index] = BIR_POINTER_CONTRACT_BORROW_WRITE;
+                }
+                out_index++;
+            }
         }
     }
 

@@ -518,6 +518,12 @@ typedef struct {
     char name[BIR_MAX_CALLEE_NAME];
     const CobraType *type;      /* canonical type owned by the HIR module */
     bool is_param;
+    /* An `out StructType` parameter aliases the caller's storage directly:
+       its local pointer IS the incoming pointer argument (no private frame
+       slot, no copy-in), the same pass-by-reference contract `out []T`
+       view parameters already get. Only meaningful when is_param is true
+       and type->kind == COBRA_TYPE_STRUCT. */
+    bool is_out_struct_alias;
     int source_line;
     int source_col;
 } HirLocal;
@@ -550,6 +556,10 @@ typedef struct {
     CobraAbiKind param_abi[BIR_MAX_PARAMS];
     CobraAbiKind param_value_abi[BIR_MAX_PARAMS];
     BirPointerContract param_pointer_contract[BIR_MAX_PARAMS];
+    /* Set by the HIR builder from the AST's `out` mutability before the
+       generic pointer-kind default below classifies the param as read-only;
+       see hir_build_function's post-declare pass in hir.c. */
+    bool param_is_out_struct[BIR_MAX_PARAMS];
     BirPointerContract return_pointer_contract;
     BirCallAbi call_abi;
     /* A borrowed-view return must be derived from exactly this one view

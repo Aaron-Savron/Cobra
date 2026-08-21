@@ -1700,7 +1700,9 @@ bool bir_declare_function(BackendIrModule *module, const char *name,
             : BIR_POINTER_CONTRACT_BORROW_READONLY;
     }
     for (size_t k = 0; k < param_count; k++) {
-        if (info->param_value_types[k]->kind == COBRA_TYPE_POINTER) {
+        if (info->param_is_out_struct[k]) {
+            info->param_pointer_contract[k] = BIR_POINTER_CONTRACT_BORROW_WRITE;
+        } else if (info->param_value_types[k]->kind == COBRA_TYPE_POINTER) {
             info->param_pointer_contract[k] = BIR_POINTER_CONTRACT_BORROW_READONLY;
         } else if (bir_is_owned_slice_type(info->param_value_types[k]) ||
                    bir_is_owned_dict_type(info->param_value_types[k])) {

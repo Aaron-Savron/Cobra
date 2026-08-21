@@ -265,7 +265,15 @@ static bool create_blocks_and_params(SsaPass *p) {
         arena->values[param].param_index = (uint32_t)ssa_param_index;
         if (param_type && (param_type->kind == COBRA_TYPE_POINTER ||
                            ssa_is_slice_value_type(param_type))) {
-            arena->values[param].pointer_contract = ssa_view_contract(param_type);
+            /* An `out StructType` parameter's pointer type carries no
+               mutability of its own (unlike `out []T`, a distinct writable
+               view type); consult the HirLocal flag set at signature-import
+               time instead of ssa_view_contract's slice-only classification,
+               which would otherwise default a bare struct pointer to
+               read-only and reject the callee's own field stores through it. */
+            arena->values[param].pointer_contract = fn->locals[i].is_out_struct_alias
+                ? BIR_POINTER_CONTRACT_BORROW_WRITE
+                : ssa_view_contract(param_type);
             arena->values[param].pointer_origin = BIR_POINTER_ORIGIN_CALLER;
             if (bir_is_owned_slice_type(param_type) ||
                 bir_is_owned_dict_type(param_type)) {
@@ -323,6 +331,21 @@ static bool create_blocks_and_params(SsaPass *p) {
                value. It is deliberately not spilled into raw frame bytes in
                this slice; its pointer provenance must remain attached to the
                SSA payload. */
+            continue;
+        }
+        if (fn->locals[local].is_out_struct_alias) {
+            /* An `out StructType` parameter aliases the caller's storage:
+               its local pointer IS the incoming pointer argument, with no
+               private frame slot and no copy-in, mirroring how `out []T`
+               view parameters already alias caller storage above. */
+            if (!p->param_refs || local >= fn->param_count) {
+                ssa_fail(p, fn->locals[local].source_line, fn->locals[local].source_col,
+                         "missing function parameter references");
+                return false;
+            }
+            SsaValueRef parameter_value = p->param_refs[local +
+                ((fn->return_type && ssa_is_aggregate_value_type(fn->return_type)) ? 1 : 0)];
+            p->local_ptrs[local] = parameter_value;
             continue;
         }
         size_t alignment = type ? type->alignment : 0;
