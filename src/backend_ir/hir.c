@@ -1187,6 +1187,88 @@ static bool hir_tensor_loop_close(HirBuilder *b, int line, int col,
     return true;
 }
 
+/* base ** exponent for i64 operands: repeated multiplication via the same
+   counted-loop skeleton the tensor builtins use, matching the direct
+   backend's runtime-checked semantics (negative exponents fail instead of
+   silently producing a fraction, since the result type is i64). */
+static HirExpr *hir_build_int_pow(HirBuilder *b, HirExpr *lhs, HirExpr *rhs,
+                                  int line, int col) {
+    if (!bir_types_equal(lhs->type, b->module->type_i64) ||
+        !bir_types_equal(rhs->type, b->module->type_i64)) {
+        hir_expr_free(lhs);
+        hir_expr_free(rhs);
+        bir_fail(b, line, col, "** requires two i64 operands in the backend-IR subset");
+        return NULL;
+    }
+    int base_local = hir_synthetic_local(b, "pow_base", line, col);
+    int exp_local = hir_synthetic_local(b, "pow_exp", line, col);
+    int acc_local = hir_synthetic_local(b, "pow_acc", line, col);
+    if (base_local < 0 || exp_local < 0 || acc_local < 0) {
+        hir_expr_free(lhs);
+        hir_expr_free(rhs);
+        return NULL;
+    }
+    if (!hir_emit_assign(b, (uint32_t)base_local, lhs)) {
+        hir_expr_free(rhs);
+        return NULL;
+    }
+    if (!hir_emit_assign(b, (uint32_t)exp_local, rhs)) return NULL;
+
+    HirExpr *exp_check = hir_local_ref(b, (uint32_t)exp_local, b->module->type_i64, line, col);
+    HirExpr *zero_check = hir_expr_alloc(b, line, col);
+    if (!exp_check || !zero_check) {
+        hir_expr_free(exp_check);
+        hir_expr_free(zero_check);
+        return NULL;
+    }
+    zero_check->kind = HIR_EXPR_CONST;
+    zero_check->type = b->module->type_i64;
+    zero_check->const_value = bir_scalar_i64(zero_check->type, 0);
+    HirExpr *nonneg = hir_tensor_binop(b, SSA_OP_GE, exp_check, zero_check,
+                                       b->module->type_bool, line, col);
+    if (!nonneg) return NULL;
+    HirStmt assert_stmt;
+    memset(&assert_stmt, 0, sizeof(assert_stmt));
+    assert_stmt.kind = HIR_STMT_ASSERT;
+    assert_stmt.expr = nonneg;
+    if (!hir_block_add_stmt(b, b->current, assert_stmt)) {
+        hir_expr_free(nonneg);
+        return NULL;
+    }
+
+    HirExpr *one = hir_expr_alloc(b, line, col);
+    if (!one) return NULL;
+    one->kind = HIR_EXPR_CONST;
+    one->type = b->module->type_i64;
+    one->const_value = bir_scalar_i64(one->type, 1);
+    if (!hir_emit_assign(b, (uint32_t)acc_local, one)) return NULL;
+
+    HirExpr *limit = hir_local_ref(b, (uint32_t)exp_local, b->module->type_i64, line, col);
+    if (!limit) return NULL;
+    int index_local; HirBlockRef latch_id, exit_id;
+    if (!hir_tensor_loop_open(b, line, col, limit, &index_local, &latch_id, &exit_id))
+        return NULL;
+    HirBlockRef body_id = b->current;
+    HirBlockRef header_id = b->fn->blocks[body_id].preds[0];
+
+    HirExpr *acc_ref = hir_local_ref(b, (uint32_t)acc_local, b->module->type_i64, line, col);
+    HirExpr *base_ref = hir_local_ref(b, (uint32_t)base_local, b->module->type_i64, line, col);
+    if (!acc_ref || !base_ref) {
+        hir_expr_free(acc_ref);
+        hir_expr_free(base_ref);
+        return NULL;
+    }
+    HirExpr *product = hir_tensor_binop(b, SSA_OP_MUL, acc_ref, base_ref,
+                                        b->module->type_i64, line, col);
+    if (!product) return NULL;
+    if (!hir_emit_assign(b, (uint32_t)acc_local, product)) return NULL;
+
+    if (!hir_tensor_loop_close(b, line, col, index_local, latch_id, header_id, exit_id))
+        return NULL;
+
+    return hir_local_ref(b, (uint32_t)acc_local, b->module->type_i64, line, col);
+}
+
 /* fill_f32(buf, value): buf[i] = value for every element. */
 static HirExpr *hir_build_fill_f32(HirBuilder *b, ASTNode *node) {
     int line = node->source_line, col = node->source_col;
@@ -2027,6 +2109,11 @@ static SsaOpcode hir_map_binop(const char *op) {
     if (strcmp(op, "-") == 0) return SSA_OP_SUB;
     if (strcmp(op, "*") == 0) return SSA_OP_MUL;
     if (strcmp(op, "/") == 0) return SSA_OP_DIV;
+    /* The direct backend's i64 '//' is literally the same truncating idiv
+       as '/' (see codegen.c's AST_BINARY_OP case, which branches on the two
+       names identically); match that exactly rather than implementing a
+       real floor division this language doesn't actually have yet. */
+    if (strcmp(op, "//") == 0) return SSA_OP_DIV;
     if (strcmp(op, "%") == 0) return SSA_OP_REM;
     if (strcmp(op, "==") == 0) return SSA_OP_EQ;
     if (strcmp(op, "!=") == 0) return SSA_OP_NE;
@@ -2911,6 +2998,18 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                     expr = streq;
                     break;
                 }
+            }
+            if (strcmp(node->name, "**") == 0 && node->child_count == 2) {
+                HirExpr *lhs = NULL, *rhs = NULL;
+                if (!hir_build_expr(b, node->children[0], &lhs) ||
+                    !hir_build_expr(b, node->children[1], &rhs)) {
+                    hir_expr_free(lhs);
+                    hir_expr_free(rhs);
+                    return false;
+                }
+                expr = hir_build_int_pow(b, lhs, rhs, node->source_line, node->source_col);
+                if (!expr) return false;
+                break;
             }
             SsaOpcode op = hir_map_binop(node->name);
             if (op == SSA_OP_NONE || node->child_count != 2) {
