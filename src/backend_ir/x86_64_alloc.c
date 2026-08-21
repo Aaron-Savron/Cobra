@@ -1827,6 +1827,7 @@ bool bir_x86_64_emit_allocated(const MirModule *module,
         !mir_allocation_verify(allocation, errbuf, errbuf_size)) return false;
     fprintf(out, ".text\n");
     for (size_t f = 0; f < module->function_count; f++) {
+        if (module->source->functions[f].is_extern) continue;
         X86AllocatedContext ctx;
         memset(&ctx, 0, sizeof(ctx));
         ctx.module = module;
