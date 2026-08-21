@@ -1,0 +1,11 @@
+# Struct-element lists are rejected by list methods until comparison and
+# destruction contracts are defined for them.
+struct Point: {
+    x: i64,
+    y: i64,
+}
+
+def main() -> i64:
+    let points: list[Point] = []
+    sort(points)
+    return 0

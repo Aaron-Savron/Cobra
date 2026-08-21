@@ -152,6 +152,10 @@ typedef struct {
            emit_dyn_dispatch_call exactly like a dyn-typed local does, even
            though the loop variable itself has no VarSymbol/stack slot. */
         char dyn_trait_name[COBRA_MAX_IDENT_LEN];
+        /* break jumps to break_label; continue jumps to continue_label (the
+           loop-top re-check for while, the increment point for for). */
+        int break_label;
+        int continue_label;
     } loops[16];
     int loop_depth;
     RegionInfo regions[16];
@@ -1299,6 +1303,11 @@ static int current_iter(CodeGen *cg, const char *name) {
              strcmp(cg->loops[i].secondary_name, name) == 0)) return i;
     return -1;
 }
+static int current_loop(CodeGen *cg) {
+    for (int i = cg->loop_depth - 1; i >= 0; i--)
+        if (cg->loops[i].active) return i;
+    return -1;
+}
 
 static RegionInfo *region_by_name(CodeGen *cg, const char *name) {
     if (!name || !*name) return NULL;
@@ -1746,6 +1755,208 @@ static void emit_list_pop(CodeGen *cg, VarSymbol *s, ASTNode *default_expr) {
     fprintf(cg->out, ".Llist_pop_done_%d:\n", done);
 }
 
+static bool is_list_method_name(const char *name) {
+    return !strcmp(name, "sort") || !strcmp(name, "reverse") || !strcmp(name, "clear") ||
+           !strcmp(name, "count") || !strcmp(name, "index") || !strcmp(name, "extend") ||
+           !strcmp(name, "insert") || !strcmp(name, "remove");
+}
+
+static VarSymbol *list_method_receiver(CodeGen *cg, ASTNode *n) {
+    if (n->child_count < 1 || n->children[0]->type != AST_VAR_REF) {
+        fprintf(stderr, "CodeGen Error: list method requires a named list\n");
+        exit(EXIT_FAILURE);
+    }
+    VarSymbol *s = find_symbol(cg, n->children[0]->name);
+    if (!s || s->kind != SYM_LIST) {
+        fprintf(stderr, "CodeGen Error: '%s' is not a list value\n", n->children[0]->name);
+        exit(EXIT_FAILURE);
+    }
+    return s;
+}
+
+/* xs.sort()/xs.count(v)/... lower to the collections runtime helpers. The
+   element type selects the helper family: the integer family stores 8-byte
+   slots, f32 stores 4-byte slots, and string stores owned char* slots. */
+static void emit_list_method(CodeGen *cg, ASTNode *n) {
+    VarSymbol *s = list_method_receiver(cg, n);
+    bool is_string = s->element_type == COBRA_TYPE_STRING;
+    bool is_f32 = s->element_type == COBRA_TYPE_F32;
+    if (!strcmp(n->name, "sort")) {
+        fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    call %s@PLT\n",
+                s->offset, s->length_offset,
+                is_string ? "cobra_list_sort_strings" : is_f32 ? "cobra_list_sort_f32" : "cobra_list_sort_i64");
+        return;
+    }
+    if (!strcmp(n->name, "reverse")) {
+        /* Generic byte swap over element_size-wide slots. */
+        fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    mov rdx, %d\n    call cobra_list_reverse@PLT\n",
+                s->offset, s->length_offset, is_f32 ? 4 : 8);
+        return;
+    }
+    if (!strcmp(n->name, "clear")) {
+        fprintf(cg->out, "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n    call %s@PLT\n",
+                s->offset, s->length_offset, s->capacity_offset,
+                is_string ? "cobra_list_clear_strings" : "cobra_list_clear");
+        return;
+    }
+    if (!strcmp(n->name, "count") || !strcmp(n->name, "index")) {
+        const char *base = !strcmp(n->name, "count") ? "cobra_list_count" : "cobra_list_index";
+        if (is_f32) {
+            int value_slot = reserve(cg, 8);
+            emit_expr(cg, n->children[1]);
+            if (!expression_is_float_codegen(cg, n->children[1])) fprintf(cg->out, "    cvtsi2ss xmm0, rax\n");
+            fprintf(cg->out, "    movss DWORD PTR [rbp-%d], xmm0\n", value_slot);
+            fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    movss xmm0, DWORD PTR [rbp-%d]\n    call %s_f32@PLT\n",
+                    s->offset, s->length_offset, value_slot, base);
+        } else {
+            int value_slot = reserve(cg, 8);
+            emit_expr(cg, n->children[1]);
+            fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", value_slot);
+            fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    mov rdx, QWORD PTR [rbp-%d]\n    call %s_%s@PLT\n",
+                    s->offset, s->length_offset, value_slot, base, is_string ? "strings" : "i64");
+        }
+        return;
+    }
+    if (!strcmp(n->name, "extend")) {
+        VarSymbol *src = list_method_receiver(cg, n);
+        if (n->child_count < 2 || n->children[1]->type != AST_VAR_REF) {
+            fprintf(stderr, "CodeGen Error: extend requires a named source list\n");
+            exit(EXIT_FAILURE);
+        }
+        src = find_symbol(cg, n->children[1]->name);
+        if (!src || src->kind != SYM_LIST) {
+            fprintf(stderr, "CodeGen Error: '%s' is not a list value\n", n->children[1]->name);
+            exit(EXIT_FAILURE);
+        }
+        fprintf(cg->out, "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n"
+                "    mov rcx, QWORD PTR [rbp-%d]\n    mov r8, QWORD PTR [rbp-%d]\n    call %s@PLT\n",
+                s->offset, s->length_offset, s->capacity_offset,
+                src->offset, src->length_offset,
+                is_string ? "cobra_list_extend_strings" : is_f32 ? "cobra_list_extend_f32" : "cobra_list_extend_i64");
+        return;
+    }
+    if (!strcmp(n->name, "insert")) {
+        int index_slot = reserve(cg, 8), value_slot = reserve(cg, 8);
+        emit_expr(cg, n->children[1]);
+        fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", index_slot);
+        if (is_f32) {
+            emit_expr(cg, n->children[2]);
+            if (!expression_is_float_codegen(cg, n->children[2])) fprintf(cg->out, "    cvtsi2ss xmm0, rax\n");
+            fprintf(cg->out, "    movss DWORD PTR [rbp-%d], xmm0\n", value_slot);
+        } else {
+            emit_expr(cg, n->children[2]);
+            fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", value_slot);
+        }
+        fprintf(cg->out, "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    lea rdx, [rbp-%d]\n"
+                "    mov rcx, QWORD PTR [rbp-%d]\n", s->offset, s->length_offset, s->capacity_offset, index_slot);
+        if (is_f32) fprintf(cg->out, "    movss xmm0, DWORD PTR [rbp-%d]\n    call cobra_list_insert_f32@PLT\n", value_slot);
+        else fprintf(cg->out, "    mov r8, QWORD PTR [rbp-%d]\n    call %s@PLT\n", value_slot,
+                     is_string ? "cobra_list_insert_string" : "cobra_list_insert_i64");
+        return;
+    }
+    if (!strcmp(n->name, "remove")) {
+        int value_slot = reserve(cg, 8);
+        if (is_f32) {
+            emit_expr(cg, n->children[1]);
+            if (!expression_is_float_codegen(cg, n->children[1])) fprintf(cg->out, "    cvtsi2ss xmm0, rax\n");
+            fprintf(cg->out, "    movss DWORD PTR [rbp-%d], xmm0\n", value_slot);
+            fprintf(cg->out, "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    movss xmm0, DWORD PTR [rbp-%d]\n    call cobra_list_remove_value_f32@PLT\n",
+                    s->offset, s->length_offset, value_slot);
+        } else {
+            emit_expr(cg, n->children[1]);
+            fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", value_slot);
+            fprintf(cg->out, "    lea rdi, [rbp-%d]\n    lea rsi, [rbp-%d]\n    mov rdx, QWORD PTR [rbp-%d]\n    call %s@PLT\n",
+                    s->offset, s->length_offset, value_slot,
+                    is_string ? "cobra_list_remove_value_strings" : "cobra_list_remove_value_i64");
+        }
+        return;
+    }
+    fprintf(stderr, "CodeGen Error: unknown list method '%s'\n", n->name);
+    exit(EXIT_FAILURE);
+}
+
+/* Content equality for list values: lengths must match and every element
+   must compare equal (strings by value, not by pointer). The element layout
+   is borrowed from a named receiver when present; a non-named operand
+   (slice/split/list call) is read through its sret descriptor, copied into
+   slots before the other operand runs so the shared [rbp-240] scratch never
+   aliases. */
+static void emit_list_compare(CodeGen *cg, ASTNode *n) {
+    CobraTypeKind element = COBRA_TYPE_I64;
+    for (int i = 0; i < 2 && i < (int)n->child_count; i++) {
+        if (n->children[i]->type == AST_VAR_REF) {
+            VarSymbol *ls = find_symbol(cg, n->children[i]->name);
+            if (ls && ls->kind == SYM_LIST) { element = ls->element_type; break; }
+        }
+    }
+    bool is_string = element == COBRA_TYPE_STRING;
+    bool is_f32 = element == COBRA_TYPE_F32;
+    const char *helper = is_string ? "cobra_list_equal_strings" :
+                         is_f32 ? "cobra_list_equal_f32" : "cobra_list_equal_i64";
+    int a_data = reserve(cg, 8), a_len = reserve(cg, 8);
+    int b_data = reserve(cg, 8), b_len = reserve(cg, 8);
+    for (int i = 0; i < 2; i++) {
+        ASTNode *child = n->children[i];
+        int data_slot = i == 0 ? a_data : b_data;
+        int len_slot = i == 0 ? a_len : b_len;
+        VarSymbol *ls = NULL;
+        if (child->type == AST_VAR_REF) ls = find_symbol(cg, child->name);
+        if (ls && ls->kind == SYM_LIST) {
+            fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", ls->offset, data_slot);
+            fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", ls->length_offset, len_slot);
+        } else {
+            emit_expr(cg, child);
+            fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", data_slot);
+            fprintf(cg->out, "    mov rdx, QWORD PTR [rax]\n    mov QWORD PTR [rbp-%d], rdx\n", data_slot);
+            fprintf(cg->out, "    mov rdx, QWORD PTR [rax+8]\n    mov QWORD PTR [rbp-%d], rdx\n", len_slot);
+        }
+    }
+    int skip = cg->label_count++;
+    fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n"
+            "    mov rdx, QWORD PTR [rbp-%d]\n    mov rcx, QWORD PTR [rbp-%d]\n"
+            "    xor eax, eax\n    cmp rsi, rcx\n    jne .Llist_eq_done_%d\n"
+            "    call %s@PLT\n.Llist_eq_done_%d:\n",
+            a_data, a_len, b_data, b_len, skip, helper, skip);
+    if (!strcmp(n->name, "!=")) fprintf(cg->out, "    xor eax, 1\n");
+}
+
+/* xs[a:b] and s[a:b] share the parser's slice_value desugar; the receiver
+   decides the contract: strings use cobra_str_substring (fresh owned
+   string), lists use cobra_list_slice_* filling the caller's sret descriptor
+   exactly like split so the result is an owned copy. */
+static void emit_slice_value(CodeGen *cg, ASTNode *n) {
+    if (n->child_count != 3 || n->children[0]->type != AST_VAR_REF) {
+        fprintf(stderr, "CodeGen Error: slice requires a named container and two bounds\n");
+        exit(EXIT_FAILURE);
+    }
+    VarSymbol *s = find_symbol(cg, n->children[0]->name);
+    if (!s) {
+        fprintf(stderr, "CodeGen Error: undefined slice container '%s'\n", n->children[0]->name);
+        exit(EXIT_FAILURE);
+    }
+    int start = reserve(cg, 8), end = reserve(cg, 8);
+    emit_expr(cg, n->children[1]);
+    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", start);
+    emit_expr(cg, n->children[2]);
+    fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rax\n", end);
+    if (s->type == COBRA_TYPE_STRING) {
+        fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n    mov rdx, QWORD PTR [rbp-%d]\n    call cobra_str_substring@PLT\n",
+                s->offset, start, end);
+        return;
+    }
+    if (s->kind != SYM_LIST) {
+        fprintf(stderr, "CodeGen Error: slice requires a string or list value\n");
+        exit(EXIT_FAILURE);
+    }
+    bool is_string = s->element_type == COBRA_TYPE_STRING;
+    bool is_f32 = s->element_type == COBRA_TYPE_F32;
+    fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    mov rsi, QWORD PTR [rbp-%d]\n"
+            "    mov rdx, QWORD PTR [rbp-%d]\n    mov rcx, QWORD PTR [rbp-%d]\n"
+            "    lea r8, [rbp-240]\n    call %s@PLT\n    lea rax, [rbp-240]\n",
+            s->offset, s->length_offset, start, end,
+            is_string ? "cobra_list_slice_strings" : is_f32 ? "cobra_list_slice_f32" : "cobra_list_slice_i64");
+}
+
 /* Shared tail for both dict-set entry points below once the key pointer and
    (for struct values) the new heap-owned struct pointer are already sitting
    in known stack slots: frees any struct value being overwritten at that key
@@ -1883,6 +2094,14 @@ static void emit_index_read(CodeGen *cg, const char *name, ASTNode **indices, si
         fprintf(cg->out, ".Lidx_done_%d:\n", fail);
         return;
     }
+    if (s->kind == SYM_LIST || s->kind == SYM_ARRAY) {
+        /* Python-style negative indices count from the end. */
+        int nn = cg->label_count++;
+        fprintf(cg->out, "    cmp rdx, 0\n    jge .Lidx_nn_%d\n", nn);
+        if (s->kind == SYM_ARRAY) fprintf(cg->out, "    add rdx, %d\n", s->array_len);
+        else fprintf(cg->out, "    add rdx, QWORD PTR [rbp-%d]\n", s->length_offset);
+        fprintf(cg->out, ".Lidx_nn_%d:\n", nn);
+    }
     if (s->kind == SYM_TENSOR && count > 1) {
         int i0 = reserve(cg, 8), i1 = reserve(cg, 8);
         fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rdx\n    cmp QWORD PTR [rbp-%d], 2\n    jne .Lidx_fail_%d\n    cmp rdx, QWORD PTR [rbp-%d]\n    jae .Lidx_fail_%d\n", i0, s->rank_offset, fail, s->dim_offsets[0], fail);
@@ -1950,6 +2169,14 @@ static void emit_index_store(CodeGen *cg, const char *name, ASTNode **indices, s
     int fail = cg->label_count++;
     int address = reserve(cg, 8);
     emit_expr(cg, indices[0]); fprintf(cg->out, "    mov rdx, rax\n");
+    if (s->kind == SYM_LIST || s->kind == SYM_ARRAY) {
+        /* Python-style negative indices count from the end. */
+        int nn = cg->label_count++;
+        fprintf(cg->out, "    cmp rdx, 0\n    jge .Lstore_nn_%d\n", nn);
+        if (s->kind == SYM_ARRAY) fprintf(cg->out, "    add rdx, %d\n", s->array_len);
+        else fprintf(cg->out, "    add rdx, QWORD PTR [rbp-%d]\n", s->length_offset);
+        fprintf(cg->out, ".Lstore_nn_%d:\n", nn);
+    }
     if (s->kind == SYM_TENSOR && count > 1) {
         int i0 = reserve(cg, 8), i1 = reserve(cg, 8);
         fprintf(cg->out, "    mov QWORD PTR [rbp-%d], rdx\n    cmp QWORD PTR [rbp-%d], 2\n    jne .Lstore_fail_%d\n    cmp rdx, QWORD PTR [rbp-%d]\n    jae .Lstore_fail_%d\n", i0, s->rank_offset, fail, s->dim_offsets[0], fail);
@@ -2373,6 +2600,11 @@ static void emit_expr(CodeGen *cg, ASTNode *node) {
             if (node->value_type == COBRA_TYPE_STRING && !strcmp(node->name, "+")) { emit_string_concat(cg, node); return; }
             if ((node->children[0]->value_type == COBRA_TYPE_STRING || node->children[1]->value_type == COBRA_TYPE_STRING) &&
                 expression_is_comparison(node)) { emit_string_compare(cg, node); return; }
+            if ((node->children[0]->value_type == COBRA_TYPE_LIST || node->children[1]->value_type == COBRA_TYPE_LIST) &&
+                (!strcmp(node->name, "==") || !strcmp(node->name, "!="))) {
+                emit_list_compare(cg, node);
+                return;
+            }
             bool f = expression_is_float_codegen(cg, node) ||
                      expression_is_float_codegen(cg, node->children[0]) ||
                      expression_is_float_codegen(cg, node->children[1]);
@@ -3749,6 +3981,11 @@ static void emit_call(CodeGen *cg, ASTNode *n) {
                 s_slot, sep_slot, 240, 232, 224, 240);
         return;
     }
+    if (is_list_method_name(n->name) && n->child_count > 0 && n->children[0]->type == AST_VAR_REF) {
+        VarSymbol *receiver_sym = find_symbol(cg, n->children[0]->name);
+        if (receiver_sym && receiver_sym->kind == SYM_LIST) { emit_list_method(cg, n); return; }
+    }
+    if (!strcmp(n->name, "slice_value")) { emit_slice_value(cg, n); return; }
     if (!strcmp(n->name, "join")) {
         /* join(list, sep) reads the named list's descriptor slots and returns
            a fresh owned string in rax. */
@@ -4315,6 +4552,7 @@ static void emit_vec_range(CodeGen *cg, ASTNode *n, ASTNode *body,
 
     /* Bounds-checked scalar tail for the remaining 0-7 elements. */
     fprintf(cg->out, ".Lfor_%d:\n    mov rax, QWORD PTR [rbp-%d]\n    cmp rax, QWORD PTR [rbp-%d]\n    jae .Lfor_done_%d\n", label, index, bound, label);
+    memset(&cg->loops[cg->loop_depth], 0, sizeof(cg->loops[cg->loop_depth]));
     snprintf(cg->loops[cg->loop_depth].name, sizeof(cg->loops[cg->loop_depth].name), "%s", n->name);
     cg->loops[cg->loop_depth].secondary_name[0] = 0;
     cg->loops[cg->loop_depth].source[0] = 0;
@@ -4624,11 +4862,12 @@ static void emit_for_dict(CodeGen *cg, ASTNode *n, VarSymbol *dict_sym) {
     fprintf(cg->out, "    mov rdi, QWORD PTR [rbp-%d]\n    call cobra_dict_raw_entries@PLT\n    mov QWORD PTR [rbp-%d], rax\n",
             dict_sym->offset, base);
     fprintf(cg->out, "    mov QWORD PTR [rbp-%d], 0\n.Ldict_for_%d:\n", i, label);
-    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    cmp rax, QWORD PTR [rbp-%d]\n    jge .Ldict_for_done_%d\n",
+    fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    cmp rax, QWORD PTR [rbp-%d]\n    jge .Lfor_done_%d\n",
             i, cap, label);
     fprintf(cg->out, "    mov rbx, QWORD PTR [rbp-%d]\n    imul rax, 24\n    add rbx, rax\n", base);
     fprintf(cg->out, "    cmp BYTE PTR [rbx+16], 0\n    je .Ldict_for_next_%d\n", label);
 
+    memset(&cg->loops[cg->loop_depth], 0, sizeof(cg->loops[cg->loop_depth]));
     snprintf(cg->loops[cg->loop_depth].name, sizeof(cg->loops[cg->loop_depth].name), "%s", n->name);
     snprintf(cg->loops[cg->loop_depth].secondary_name, sizeof(cg->loops[cg->loop_depth].secondary_name), "%s", n->secondary_name);
     cg->loops[cg->loop_depth].source[0] = '\0';
@@ -4638,17 +4877,20 @@ static void emit_for_dict(CodeGen *cg, ASTNode *n, VarSymbol *dict_sym) {
     cg->loops[cg->loop_depth].index_offset = i;
     cg->loops[cg->loop_depth].dict_base_offset = base;
     cg->loops[cg->loop_depth].element_type = dict_sym->element_type;
+    cg->loops[cg->loop_depth].break_label = label;
+    cg->loops[cg->loop_depth].continue_label = label;
     snprintf(cg->loops[cg->loop_depth].dict_value_type_name, sizeof(cg->loops[cg->loop_depth].dict_value_type_name),
              "%s", dict_sym->type_name);
     cg->loop_depth++;
     if (n->child_count > 1) { emit_statement(cg, n->children[1]); emit_loop_owned_cleanup(cg, n->children[1]); }
     cg->loop_depth--;
-    fprintf(cg->out, ".Ldict_for_next_%d:\n    inc QWORD PTR [rbp-%d]\n    jmp .Ldict_for_%d\n.Ldict_for_done_%d:\n",
-            label, i, label, label);
+    fprintf(cg->out, ".Ldict_for_next_%d:\n.Lfor_continue_%d:\n    inc QWORD PTR [rbp-%d]\n    jmp .Ldict_for_%d\n.Lfor_done_%d:\n",
+            label, label, i, label, label);
 }
 
 static void emit_for(CodeGen *cg, ASTNode *n) {
     int index = reserve(cg, 8), bound = reserve(cg, 8), label = cg->label_count++;
+    int continue_label = cg->label_count++;
     ASTNode *target = n->child_count ? n->children[0] : NULL;
     if (target && target->type == AST_VAR_REF) {
         VarSymbol *dict_sym = find_symbol(cg, target->name);
@@ -4730,6 +4972,7 @@ static void emit_for(CodeGen *cg, ASTNode *n) {
     } else {
         fprintf(cg->out, "    cmp rax, QWORD PTR [rbp-%d]\n    jae .Lfor_done_%d\n", bound, label);
     }
+    memset(&cg->loops[cg->loop_depth], 0, sizeof(cg->loops[cg->loop_depth]));
     snprintf(cg->loops[cg->loop_depth].name, sizeof(cg->loops[cg->loop_depth].name), "%s", n->name);
     snprintf(cg->loops[cg->loop_depth].secondary_name, sizeof(cg->loops[cg->loop_depth].secondary_name), "%s", n->secondary_name);
     if (source) snprintf(cg->loops[cg->loop_depth].source, sizeof(cg->loops[cg->loop_depth].source), "%s", source); else cg->loops[cg->loop_depth].source[0] = 0;
@@ -4744,6 +4987,8 @@ static void emit_for(CodeGen *cg, ASTNode *n) {
             cg->loops[cg->loop_depth].dyn_trait_name[0] = '\0';
     }
     cg->loops[cg->loop_depth].index_offset = index;
+    cg->loops[cg->loop_depth].break_label = label;
+    cg->loops[cg->loop_depth].continue_label = continue_label;
     VarSymbol *ss = source ? find_symbol(cg, source) : NULL;
     cg->loops[cg->loop_depth].element_type = ss &&
         ((ss->type == COBRA_TYPE_SLICE_F32) ||
@@ -4761,6 +5006,8 @@ static void emit_for(CodeGen *cg, ASTNode *n) {
     cg->loop_depth++;
     if (n->child_count > 1) { emit_statement(cg, n->children[1]); emit_loop_owned_cleanup(cg, n->children[1]); }
     cg->loop_depth--;
+    /* `continue` jumps to the increment point, then the loop re-checks. */
+    fprintf(cg->out, ".Lfor_continue_%d:\n", continue_label);
     if (is_range) fprintf(cg->out, "    mov rax, QWORD PTR [rbp-%d]\n    add rax, QWORD PTR [rbp-%d]\n    mov QWORD PTR [rbp-%d], rax\n", index, step, index);
     else fprintf(cg->out, "    inc QWORD PTR [rbp-%d]\n", index);
     fprintf(cg->out, "    jmp .Lfor_%d\n.Lfor_done_%d:\n", label, label);
@@ -5433,6 +5680,24 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             return;
         }
         case AST_FUNC_CALL: emit_call(cg, n); return;
+        case AST_BREAK: {
+            int loop = current_loop(cg);
+            if (loop < 0) {
+                fprintf(stderr, "CodeGen Error: break outside of a loop\n");
+                exit(EXIT_FAILURE);
+            }
+            fprintf(cg->out, "    jmp .Lfor_done_%d\n", cg->loops[loop].break_label);
+            return;
+        }
+        case AST_CONTINUE: {
+            int loop = current_loop(cg);
+            if (loop < 0) {
+                fprintf(stderr, "CodeGen Error: continue outside of a loop\n");
+                exit(EXIT_FAILURE);
+            }
+            fprintf(cg->out, "    jmp .Lfor_continue_%d\n", cg->loops[loop].continue_label);
+            return;
+        }
         case AST_RETURN: {
             const char *returned_name = NULL;
             bool has_result = n->child_count != 0;
@@ -5602,7 +5867,34 @@ static void emit_statement(CodeGen *cg, ASTNode *n) {
             return;
         }
         case AST_IF_STMT: { int l = cg->label_count++; emit_expr(cg, n->children[0]); fprintf(cg->out, "    cmp rax, 0\n    je .Lelse_%d\n", l); if (n->child_count > 1) emit_statement(cg, n->children[1]); fprintf(cg->out, "    jmp .Lif_done_%d\n.Lelse_%d:\n", l, l); if (n->child_count > 2) emit_statement(cg, n->children[2]); fprintf(cg->out, ".Lif_done_%d:\n", l); return; }
-        case AST_WHILE_STMT: { int l = cg->label_count++; fprintf(cg->out, ".Lwhile_%d:\n", l); emit_expr(cg, n->children[0]); fprintf(cg->out, "    cmp rax, 0\n    je .Lwhile_done_%d\n", l); if (n->child_count > 1) { emit_statement(cg, n->children[1]); emit_loop_owned_cleanup(cg, n->children[1]); } fprintf(cg->out, "    jmp .Lwhile_%d\n.Lwhile_done_%d:\n", l, l); return; }
+        case AST_WHILE_STMT: {
+            int l = cg->label_count++;
+            fprintf(cg->out, ".Lwhile_%d:\n.Lfor_continue_%d:\n", l, l);
+            emit_expr(cg, n->children[0]);
+            fprintf(cg->out, "    cmp rax, 0\n    je .Lfor_done_%d\n", l);
+            if (n->child_count > 1) {
+                /* Push a loop frame so break/continue resolve to the while
+                   re-check (continue) and exit (break) labels. */
+                if (cg->loop_depth >= 16) {
+                    fprintf(stderr, "CodeGen Error: too many nested loops\n");
+                    exit(EXIT_FAILURE);
+                }
+    /* Zero the frame so no stale name/index from a previous function's loop
+       can make current_iter resolve body variables against this loop. */
+    memset(&cg->loops[cg->loop_depth], 0, sizeof(cg->loops[cg->loop_depth]));
+    cg->loops[cg->loop_depth].active = true;
+    cg->loops[cg->loop_depth].break_label = l;
+    cg->loops[cg->loop_depth].continue_label = l;
+    cg->loops[cg->loop_depth].source[0] = '\0';
+    cg->loops[cg->loop_depth].is_dict = false;
+    cg->loop_depth++;
+                emit_statement(cg, n->children[1]);
+                emit_loop_owned_cleanup(cg, n->children[1]);
+                cg->loop_depth--;
+            }
+            fprintf(cg->out, "    jmp .Lwhile_%d\n.Lfor_done_%d:\n", l, l);
+            return;
+        }
         case AST_WITH_REGION: {
             if (n->child_count < 1) return;
             if (cg->region_depth >= 16) {

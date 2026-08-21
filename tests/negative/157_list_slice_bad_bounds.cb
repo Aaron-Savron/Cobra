@@ -1,0 +1,6 @@
+# Slice bounds are indices, not floats: a fractional slice must be rejected
+# rather than silently truncating.
+def main() -> i64:
+    let xs: list[i64] = [1, 2, 3]
+    let window: list[i64] = xs[0.5:2]
+    return len(window)

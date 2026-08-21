@@ -1,0 +1,6 @@
+# List methods validate the element type: counting an i64 list with a string
+# value must be rejected instead of silently comparing pointers.
+def main() -> i64:
+    let xs: list[i64] = [1, 2, 3]
+    let n: i64 = count(xs, "two")
+    return n

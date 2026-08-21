@@ -83,6 +83,9 @@ typedef struct IRContext {
     int region_ids[16];
     int next_region_id;
     int region_depth;
+    /* Innermost-first loop nesting, so `break`/`continue` can be rejected
+       outside any loop (Python semantics). */
+    int loop_depth;
     CobraTypeArena *canonical_arena;
     ASTNode *current_function;
     /* Set only when compiling a nested function-literal body (closures,
@@ -777,6 +780,19 @@ static bool is_string_builtin(const char *name) {
            strcmp(name, "lower") == 0 || strcmp(name, "strip") == 0 ||
            strcmp(name, "replace") == 0 || strcmp(name, "substring") == 0 ||
            strcmp(name, "split") == 0;
+}
+
+/* In-place/query list operations. slice_value is the shared slice desugar
+   (string receivers keep substring semantics) and is validated separately. */
+static bool is_list_builtin(const char *name) {
+    return strcmp(name, "sort") == 0 || strcmp(name, "reverse") == 0 ||
+           strcmp(name, "clear") == 0 || strcmp(name, "count") == 0 ||
+           strcmp(name, "index") == 0 || strcmp(name, "extend") == 0 ||
+           strcmp(name, "insert") == 0 || strcmp(name, "remove") == 0;
+}
+
+static bool is_list_slice_builtin(const char *name) {
+    return strcmp(name, "slice_value") == 0;
 }
 
 static bool is_string_free_builtin(const char *name) {
@@ -2488,10 +2504,12 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                     node->children[0] = receiver_ref;
                     node->qualifier[0] = '\0';
                 } else if (receiver_local && receiver_local->type == COBRA_TYPE_LIST &&
-                           !strcmp(node->name, "join")) {
-                    /* xs.join(sep) lowers to join(xs, sep): the receiver is
-                       prepended like the string method calls, so direct and
-                       method forms share one (list, separator) contract. */
+                           (!strcmp(node->name, "join") || is_list_builtin(node->name) ||
+                            is_list_slice_builtin(node->name))) {
+                    /* xs.join(sep)/xs.sort()/xs[1:3] lower to the direct
+                       builtin forms: the receiver is prepended exactly like
+                       the string method calls, so method and direct calls
+                       share one (list, ...) contract. */
                     ASTNode *receiver_ref = ast_create_node(AST_VAR_REF, node->qualifier);
                     receiver_ref->source_line = node->source_line;
                     receiver_ref->source_col = node->source_col;
@@ -2802,6 +2820,101 @@ static CobraTypeKind infer_expr(ASTNode *node, IRContext *ctx) {
                 }
                 node->value_type = COBRA_TYPE_I64;
                 return node->value_type;
+            }
+            if (is_list_builtin(node->name)) {
+                /* sort/reverse/clear/extend/insert/remove mutate in place;
+                   count/index query; remove reports whether anything was
+                   dropped. Every form requires a named list whose element
+                   type supports the operation (struct elements are rejected
+                   until their comparison/destruction contracts are defined).
+                   A user function (e.g. the stdlib's fs.remove) shadows the
+                   method name, so a receiver that is not a list falls
+                   through to ordinary call resolution. */
+                CobraTypeKind method_receiver = node->child_count > 0
+                    ? infer_expr(node->children[0], ctx) : COBRA_TYPE_UNKNOWN;
+                if (method_receiver != COBRA_TYPE_LIST && method_receiver != COBRA_TYPE_UNKNOWN) {
+                    /* not a list receiver: leave it to user-function lookup */
+                } else if (node->child_count < 1 || node->children[0]->type != AST_VAR_REF) {
+                    ir_error(ctx, node, "list method requires a named list receiver");
+                } else {
+                    CobraTypeKind target = infer_expr(node->children[0], ctx);
+                    if (target != COBRA_TYPE_LIST && target != COBRA_TYPE_UNKNOWN)
+                        ir_error(ctx, node, "list method target must be a list");
+                    IRLocal *list_local = find_local_entry(ctx, node->children[0]->name);
+                    CobraTypeKind element = list_local ? list_local->element_type : COBRA_TYPE_UNTYPED;
+                    if (element == COBRA_TYPE_STRUCT)
+                        ir_error(ctx, node, "this list method does not support struct elements");
+                    if (strcmp(node->name, "extend") == 0) {
+                        if (node->child_count != 2) ir_error(ctx, node, "extend requires (list, list)");
+                        if (node->child_count > 1) {
+                            CobraTypeKind other = infer_expr(node->children[1], ctx);
+                            if (other != COBRA_TYPE_LIST && other != COBRA_TYPE_UNKNOWN)
+                                ir_error(ctx, node, "extend argument must be a list");
+                            if (node->children[1]->type == AST_VAR_REF) {
+                                IRLocal *other_local = find_local_entry(ctx, node->children[1]->name);
+                                if (other_local && other_local->element_type != COBRA_TYPE_UNTYPED &&
+                                    element != COBRA_TYPE_UNTYPED && element != other_local->element_type)
+                                    ir_error(ctx, node, "extend list element type does not match");
+                            }
+                        }
+                    } else if (strcmp(node->name, "insert") == 0) {
+                        if (node->child_count != 3) ir_error(ctx, node, "insert requires (list, index, value)");
+                        if (node->child_count > 1 && !is_integer(infer_expr(node->children[1], ctx)))
+                            ir_error(ctx, node, "insert index must be an integer");
+                        if (node->child_count > 2) {
+                            CobraTypeKind value = infer_expr(node->children[2], ctx);
+                            bool ok = value == COBRA_TYPE_UNKNOWN ||
+                                (element == COBRA_TYPE_UNTYPED ? is_integer(value) || value == COBRA_TYPE_STRING || value == COBRA_TYPE_F32 :
+                                 element == COBRA_TYPE_F32 ? value == COBRA_TYPE_F32 || is_integer(value) :
+                                 element == COBRA_TYPE_STRING ? value == COBRA_TYPE_STRING : is_integer(value));
+                            if (!ok) ir_error(ctx, node, "insert value does not match the list element type");
+                        }
+                    } else {
+                        size_t expected = (strcmp(node->name, "count") == 0 || strcmp(node->name, "index") == 0 ||
+                                           strcmp(node->name, "remove") == 0) ? 2 : 1;
+                        if (node->child_count != expected)
+                            ir_error(ctx, node, "list method received the wrong number of arguments");
+                        if (expected == 2) {
+                            CobraTypeKind value = infer_expr(node->children[1], ctx);
+                            bool ok = value == COBRA_TYPE_UNKNOWN ||
+                                (element == COBRA_TYPE_UNTYPED ? is_integer(value) || value == COBRA_TYPE_STRING || value == COBRA_TYPE_F32 :
+                                 element == COBRA_TYPE_F32 ? value == COBRA_TYPE_F32 || is_integer(value) :
+                                 element == COBRA_TYPE_STRING ? value == COBRA_TYPE_STRING : is_integer(value));
+                            if (!ok) ir_error(ctx, node, "list method argument does not match the list element type");
+                        }
+                    }
+                }
+                node->value_type = (strcmp(node->name, "remove") == 0 || strcmp(node->name, "count") == 0 ||
+                                    strcmp(node->name, "index") == 0) ? COBRA_TYPE_I64 : COBRA_TYPE_VOID;
+                return node->value_type;
+            }
+            if (is_list_slice_builtin(node->name)) {
+                /* xs[a:b] and s[a:b] share one parser desugar; the receiver
+                   decides the contract: strings get substring semantics (a
+                   fresh owned string), lists get an owned copy of the window. */
+                if (node->child_count != 3) ir_error(ctx, node, "slice requires (container, start, end)");
+                for (size_t i = 1; i < node->child_count && node->child_count > 1; i++) {
+                    CobraTypeKind arg = infer_expr(node->children[i], ctx);
+                    if (!is_integer(arg) && arg != COBRA_TYPE_UNKNOWN)
+                        ir_error(ctx, node, "slice bounds must be integers");
+                }
+                CobraTypeKind container = node->child_count > 0 ? infer_expr(node->children[0], ctx) : COBRA_TYPE_UNKNOWN;
+                if (container == COBRA_TYPE_STRING) {
+                    node->value_type = COBRA_TYPE_STRING;
+                    node->fresh_string_result = true;
+                    return node->value_type;
+                }
+                if (container == COBRA_TYPE_LIST || container == COBRA_TYPE_UNKNOWN) {
+                    node->value_type = COBRA_TYPE_LIST;
+                    if (node->children[0]->type == AST_VAR_REF) {
+                        IRLocal *list_local = find_local_entry(ctx, node->children[0]->name);
+                        if (list_local && list_local->canonical_type)
+                            node->canonical_type = list_local->canonical_type;
+                    }
+                    return node->value_type;
+                }
+                ir_error(ctx, node, "slice requires a string or list container");
+                return COBRA_TYPE_UNKNOWN;
             }
             if (strcmp(node->name, "append") == 0) {
                 if (node->child_count != 2) ir_error(ctx, node, "append requires (list, value)");
@@ -4488,6 +4601,12 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
             }
             break;
         }
+        case AST_BREAK:
+        case AST_CONTINUE:
+            if (ctx->loop_depth == 0) {
+                ir_error(ctx, node, node->type == AST_BREAK ? "break outside of a loop" : "continue outside of a loop");
+            }
+            break;
         case AST_WITH_REGION: {
             /* `with region NAME(capacity): body` bumps allocations out of one
                backing store and releases it exactly once after the body. */
@@ -4511,8 +4630,7 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
             ctx->region_depth--;
             break;
         }
-        case AST_IF_STMT:
-        case AST_WHILE_STMT: {
+        case AST_IF_STMT: {
             if (node->child_count > 0) (void)infer_expr(node->children[0], ctx);
             IRLocal saved_locals[128];
             size_t saved_count = ctx->count;
@@ -4527,6 +4645,22 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
             if (node->child_count > 2) {
                 size_t branch_base = saved_count;
                 validate_block(node->children[2], ctx);
+                merge_branch_borrows(saved_locals, &saved_count, ctx->locals, ctx->count, branch_base);
+                memcpy(ctx->locals, saved_locals, sizeof(saved_locals));
+                ctx->count = saved_count;
+            }
+            break;
+        }
+        case AST_WHILE_STMT: {
+            if (node->child_count > 0) (void)infer_expr(node->children[0], ctx);
+            IRLocal saved_locals[128];
+            size_t saved_count = ctx->count;
+            memcpy(saved_locals, ctx->locals, sizeof(saved_locals));
+            if (node->child_count > 1) {
+                size_t branch_base = saved_count;
+                ctx->loop_depth++;
+                validate_block(node->children[1], ctx);
+                ctx->loop_depth--;
                 merge_branch_borrows(saved_locals, &saved_count, ctx->locals, ctx->count, branch_base);
                 memcpy(ctx->locals, saved_locals, sizeof(saved_locals));
                 ctx->count = saved_count;
@@ -4656,7 +4790,9 @@ static void validate_statement(ASTNode *node, IRContext *ctx) {
       }
             if (node->child_count > 1) {
                 size_t branch_base = ctx->count;
+                ctx->loop_depth++;
                 validate_block(node->children[1], ctx);
+                ctx->loop_depth--;
                 merge_branch_borrows(saved_locals, &saved_count, ctx->locals, ctx->count, branch_base);
             }
             memcpy(ctx->locals, saved_locals, sizeof(saved_locals));

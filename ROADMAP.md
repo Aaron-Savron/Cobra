@@ -42,7 +42,13 @@ Cobra currently has:
   `str()` conversions, and an owned `list[string]` contract with
   `split`/`join` (append copies, scope exit and return transfer own every
   element, and string-element iteration)
-- 148 example programs (124 with `test_` suites) and 118 negative diagnostics
+- Python-shaped list methods (`sort`/`reverse`/`clear`/`count`/`index`/
+  `extend`/`insert`/`remove`), list slicing `xs[a:b]` into an owned copy,
+  negative list indexing, and content-based `==`/`!=` for lists (strings
+  compare by value, not by descriptor pointer)
+- `break`/`continue` as real loop-control keywords with loop-context
+  validation (rejected outside a loop) and correct nested-loop jumps
+- 150 example programs (126 with `test_` suites) and 121 negative diagnostics
 
 The backend IR is linked into the production `cobra` binary and selectable
 with `cobra build|run <file> --backend=native` (see Phase 15 item 28 below
@@ -109,7 +115,13 @@ variable takes the element's own canonical struct type, so normal member
 access works inside the loop body. Owned `list[string]` values now work too:
 append copies strings into the list, scope exit and return transfer own every
 element, iteration types the loop variable as string, and `split`/`join`
-build and consume them.
+build and consume them. Lists also expose the everyday Python operations:
+in-place `sort`/`reverse`/`clear`, querying `count`/`index` (index returns -1
+when absent), `extend`/`insert`/`remove` (remove returns 0/1 instead of
+raising), `xs[a:b]` slicing into an owned copy with negative/clamped bounds,
+negative indexing `xs[-1]` on both read and write, and `==`/`!=` that compare
+contents (strings by value) rather than descriptor pointers. See
+`examples/176_list_methods.cb`.
 The existing native backend still emits assembly directly. The isolated lane
 now materializes a target-neutral `BirCallAbi` for every function, including
 lowered parameter locations, hidden aggregate-return storage, abstract GPR and

@@ -224,6 +224,8 @@ Token lexer_next_token(Lexer *lexer) {
         else if (strcmp(token.text, "if") == 0) token.type = TOKEN_IF;
         else if (strcmp(token.text, "else") == 0) token.type = TOKEN_ELSE;
         else if (strcmp(token.text, "elif") == 0) token.type = TOKEN_ELIF;
+        else if (strcmp(token.text, "break") == 0) token.type = TOKEN_BREAK;
+        else if (strcmp(token.text, "continue") == 0) token.type = TOKEN_CONTINUE;
         else if (strcmp(token.text, "while") == 0) token.type = TOKEN_WHILE;
         else if (strcmp(token.text, "asm") == 0) token.type = TOKEN_ASM;
         else if (strcmp(token.text, "print") == 0) token.type = TOKEN_PRINT;

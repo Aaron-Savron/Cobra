@@ -1,0 +1,50 @@
+# break and continue are real loop-control keywords now: they compile to
+# correct jumps in every loop shape (for over ranges/lists, while), work
+# nested inside if/else and inner loops, and are rejected outside a loop.
+def test_break_early_exit() -> i64:
+    var total: i64 = 0
+    for i in range(10) {
+        if i >= 3 { break }
+        total += i
+    }
+    assert total == 0 + 1 + 2
+    return 0
+
+def test_continue_skips() -> i64:
+    var total: i64 = 0
+    for i in range(6) {
+        if i % 2 == 1 { continue }
+        total += i
+    }
+    assert total == 0 + 2 + 4
+    return 0
+
+def test_while_guard_break() -> i64:
+    var i: i64 = 0
+    while true {
+        i += 1
+        if i >= 3 { break }
+    }
+    assert i == 3
+    return 0
+
+def test_nested_loops() -> i64:
+    var count: i64 = 0
+    for i in range(3) {
+        for j in range(5) {
+            if j >= 2 { break }
+            count += 1
+        }
+    }
+    assert count == 6
+    return 0
+
+def test_break_inside_if() -> i64:
+    var hits: i64 = 0
+    for x in range(10) {
+        if x > 5 { break }
+        if x < 2 { continue }
+        hits += 1
+    }
+    assert hits == 4
+    return 0

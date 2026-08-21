@@ -1202,7 +1202,12 @@ static bool ast_contains_collections(ASTNode *node) {
          !strcmp(node->name, "upper") || !strcmp(node->name, "lower") ||
          !strcmp(node->name, "strip") || !strcmp(node->name, "replace") ||
          !strcmp(node->name, "substring") || !strcmp(node->name, "str") ||
-         !strcmp(node->name, "split") || !strcmp(node->name, "join"))) return true;
+         !strcmp(node->name, "split") || !strcmp(node->name, "join") ||
+         !strcmp(node->name, "slice_value") || !strcmp(node->name, "sort") ||
+         !strcmp(node->name, "reverse") || !strcmp(node->name, "clear") ||
+         !strcmp(node->name, "count") || !strcmp(node->name, "index") ||
+         !strcmp(node->name, "extend") || !strcmp(node->name, "insert") ||
+         !strcmp(node->name, "remove"))) return true;
     for (size_t i = 0; i < node->child_count; i++) if (ast_contains_collections(node->children[i])) return true;
     return false;
 }

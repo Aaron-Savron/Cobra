@@ -1169,7 +1169,7 @@ static ASTNode *parse_primary(Parser *parser) {
             /* A slice with no start: s[:end]. */
             if (match(parser, TOKEN_COLON)) {
                 advance_token(parser);
-                ASTNode *slice_call = parser_create_node_at(parser, AST_FUNC_CALL, "substring", identifier_token);
+                ASTNode *slice_call = parser_create_node_at(parser, AST_FUNC_CALL, "slice_value", identifier_token);
                 ASTNode *base_ref = parser_create_node_at(parser, AST_VAR_REF, name, identifier_token);
                 ASTNode *zero = parser_create_node_at(parser, AST_INT_LITERAL, NULL, identifier_token);
                 zero->literal_i64 = 0; zero->literal_u64 = 0; zero->int_val = 0;
@@ -1191,7 +1191,7 @@ static ASTNode *parse_primary(Parser *parser) {
             /* A slice start: s[a:b] lowers to substring(s, a, b). */
             if (match(parser, TOKEN_COLON)) {
                 advance_token(parser);
-                ASTNode *slice_call = parser_create_node_at(parser, AST_FUNC_CALL, "substring", identifier_token);
+                ASTNode *slice_call = parser_create_node_at(parser, AST_FUNC_CALL, "slice_value", identifier_token);
                 ASTNode *base_ref = parser_create_node_at(parser, AST_VAR_REF, name, identifier_token);
                 ast_add_child(slice_call, base_ref);
                 ast_add_child(slice_call, first_index);
@@ -2316,6 +2316,17 @@ static ASTNode *parse_statement(Parser *parser) {
             }
         }
         return primary;
+    }
+
+    if (match(parser, TOKEN_BREAK)) {
+        ASTNode *brk = parser_create_node(parser, AST_BREAK, NULL);
+        advance_token(parser);
+        return brk;
+    }
+    if (match(parser, TOKEN_CONTINUE)) {
+        ASTNode *cnt = parser_create_node(parser, AST_CONTINUE, NULL);
+        advance_token(parser);
+        return cnt;
     }
 
     if (match(parser, TOKEN_RETURN)) {

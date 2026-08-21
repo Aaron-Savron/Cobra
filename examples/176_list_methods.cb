@@ -1,0 +1,84 @@
+# List methods, slicing, negative indexing, and content equality. Lists now
+# behave like Python lists for the everyday operations: sort/reverse/clear
+# mutate in place, count/index query, extend/insert/remove edit, xs[a:b]
+# slices into a fresh owned copy, xs[-1] counts from the end, and == compares
+# contents (strings by value), not descriptor pointers.
+def test_sort_and_reverse() -> i64:
+    let xs: list[i64] = [3, 1, 2]
+    xs.sort()
+    assert xs[0] == 1 and xs[1] == 2 and xs[2] == 3
+    xs.reverse()
+    assert xs[0] == 3 and xs[2] == 1
+    return 0
+
+def test_count_index_remove() -> i64:
+    let xs: list[i64] = [7, 2, 7, 9]
+    assert xs.count(7) == 2
+    assert xs.index(9) == 3
+    assert xs.index(99) == -1
+    assert xs.remove(7) == 1
+    assert xs.count(7) == 1
+    assert xs.remove(7) == 1
+    assert xs.remove(7) == 0
+    return 0
+
+def test_extend_insert_clear() -> i64:
+    let xs: list[i64] = [1, 2]
+    let ys: list[i64] = [3, 4]
+    xs.extend(ys)
+    assert len(xs) == 4 and xs[2] == 3
+    xs.insert(0, 0)
+    assert xs[0] == 0 and len(xs) == 5
+    xs.clear()
+    assert len(xs) == 0
+    return 0
+
+def test_string_lists() -> i64:
+    let words: list[string] = ["pear", "apple", "fig"]
+    words.sort()
+    assert words[0] == "apple" and words[2] == "pear"
+    assert words.count("fig") == 1
+    assert words.index("pear") == 2
+    assert words.remove("apple") == 1
+    words.clear()
+    assert len(words) == 0
+    return 0
+
+def test_slicing() -> i64:
+    let xs: list[i64] = [0, 1, 2, 3, 4]
+    let mid: list[i64] = xs[1:4]
+    assert len(mid) == 3 and mid[0] == 1 and mid[2] == 3
+    let tail: list[i64] = xs[2:]
+    assert len(tail) == 3 and tail[0] == 2
+    let head: list[i64] = xs[:2]
+    assert len(head) == 2 and head[1] == 1
+    let last: list[i64] = xs[-2:]
+    assert len(last) == 2 and last[0] == 3
+    let drop: list[i64] = xs[1:-1]
+    assert len(drop) == 3 and drop[2] == 3
+    let empty: list[i64] = xs[10:20]
+    assert len(empty) == 0
+    return 0
+
+def test_negative_indexing() -> i64:
+    let xs: list[i64] = [0, 1, 2, 3, 4]
+    assert xs[-1] == 4 and xs[-3] == 2
+    xs[-1] = 99
+    assert xs[4] == 99
+    return 0
+
+def test_content_equality() -> i64:
+    let a: list[i64] = [1, 2, 3]
+    let b: list[i64] = [1, 2, 3]
+    let c: list[i64] = [1, 2, 4]
+    assert a == b and a != c
+    let w1: list[string] = ["x", "y"]
+    let w2: list[string] = ["x", "y"]
+    assert w1 == w2
+    let f1: list[f32] = [1.5, 2.5]
+    let f2: list[f32] = [1.5, 2.5]
+    assert f1 == f2
+    let e1: list[i64] = []
+    let e2: list[i64] = []
+    assert e1 == e2
+    return 0

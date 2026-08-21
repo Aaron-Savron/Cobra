@@ -56,6 +56,282 @@ void cobra_list_free_strings(void **data, size_t *length, size_t *capacity) {
     *capacity = 0;
 }
 
+/* In-place reversal over element_size-wide slots; works for every element
+   layout (scalar, float, owned string pointers, struct block pointers). */
+void cobra_list_reverse(void *data, size_t length, size_t element_size) {
+    if (!data || element_size == 0) return;
+    unsigned char *base = (unsigned char *)data;
+    for (size_t lo = 0, hi = length - 1; lo < hi; lo++, hi--) {
+        for (size_t b = 0; b < element_size; b++) {
+            unsigned char t = base[lo * element_size + b];
+            base[lo * element_size + b] = base[hi * element_size + b];
+            base[hi * element_size + b] = t;
+        }
+    }
+}
+
+/* clear drops the logical contents but keeps the allocated block; string
+   lists free every owned element first. */
+void cobra_list_clear(void **data, size_t *length, size_t *capacity) {
+    (void)data;
+    (void)capacity;
+    *length = 0;
+}
+
+void cobra_list_clear_strings(void **data, size_t *length, size_t *capacity) {
+    for (size_t i = 0; i < *length; i++) free(((char **)*data)[i]);
+    *length = 0;
+    (void)capacity;
+}
+
+static int cobra_list_cmp_i64(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static int cobra_list_cmp_f32(const void *a, const void *b) {
+    float x = *(const float *)a, y = *(const float *)b;
+    return (x > y) - (x < y);
+}
+
+static int cobra_list_cmp_string(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+void cobra_list_sort_i64(void *data, size_t length) {
+    if (data && length > 1) qsort(data, length, sizeof(int64_t), cobra_list_cmp_i64);
+}
+
+void cobra_list_sort_f32(void *data, size_t length) {
+    if (data && length > 1) qsort(data, length, sizeof(float), cobra_list_cmp_f32);
+}
+
+void cobra_list_sort_strings(char **data, size_t length) {
+    if (data && length > 1) qsort(data, length, sizeof(char *), cobra_list_cmp_string);
+}
+
+size_t cobra_list_count_i64(void *data, size_t length, int64_t value) {
+    size_t count = 0;
+    for (size_t i = 0; i < length; i++) if (((int64_t *)data)[i] == value) count++;
+    return count;
+}
+
+size_t cobra_list_count_f32(void *data, size_t length, float value) {
+    size_t count = 0;
+    for (size_t i = 0; i < length; i++) if (((float *)data)[i] == value) count++;
+    return count;
+}
+
+size_t cobra_list_count_strings(char **data, size_t length, const char *value) {
+    size_t count = 0;
+    for (size_t i = 0; i < length; i++) if (data[i] && strcmp(data[i], value) == 0) count++;
+    return count;
+}
+
+/* index returns the first position of value, or -1 when absent (the
+   collections runtime uses the same sentinel convention as dict get/pop). */
+int64_t cobra_list_index_i64(void *data, size_t length, int64_t value) {
+    for (size_t i = 0; i < length; i++) if (((int64_t *)data)[i] == value) return (int64_t)i;
+    return -1;
+}
+
+int64_t cobra_list_index_f32(void *data, size_t length, float value) {
+    for (size_t i = 0; i < length; i++) if (((float *)data)[i] == value) return (int64_t)i;
+    return -1;
+}
+
+int64_t cobra_list_index_strings(char **data, size_t length, const char *value) {
+    for (size_t i = 0; i < length; i++) if (data[i] && strcmp(data[i], value) == 0) return (int64_t)i;
+    return -1;
+}
+
+/* extend copies every element of src into dst; string elements are copied so
+   the destination owns each one, matching append_string's contract. */
+void cobra_list_extend_i64(void **data, size_t *length, size_t *capacity,
+                           void *src, size_t src_length) {
+    for (size_t i = 0; i < src_length; i++)
+        cobra_list_append_i64(data, length, capacity, ((int64_t *)src)[i]);
+}
+
+void cobra_list_extend_f32(void **data, size_t *length, size_t *capacity,
+                           void *src, size_t src_length) {
+    for (size_t i = 0; i < src_length; i++)
+        cobra_list_append_f32(data, length, capacity, ((float *)src)[i]);
+}
+
+void cobra_list_extend_strings(void **data, size_t *length, size_t *capacity,
+                               char **src, size_t src_length) {
+    for (size_t i = 0; i < src_length; i++)
+        cobra_list_push_string(data, length, capacity, cobra_str_copy(src[i]));
+}
+
+static void cobra_list_shift_right(void **data, size_t *length, size_t *capacity,
+                                   size_t index, size_t element_size) {
+    if (*length == *capacity) cobra_list_grow(data, capacity, *length, element_size);
+    unsigned char *base = (unsigned char *)*data;
+    memmove(base + (index + 1) * element_size, base + index * element_size,
+            (*length - index) * element_size);
+    (*length)++;
+}
+
+void cobra_list_insert_i64(void **data, size_t *length, size_t *capacity,
+                           size_t index, int64_t value) {
+    if (index > *length) index = *length;
+    cobra_list_shift_right(data, length, capacity, index, sizeof(int64_t));
+    ((int64_t *)*data)[index] = value;
+}
+
+void cobra_list_insert_f32(void **data, size_t *length, size_t *capacity,
+                           size_t index, float value) {
+    if (index > *length) index = *length;
+    cobra_list_shift_right(data, length, capacity, index, sizeof(float));
+    ((float *)*data)[index] = value;
+}
+
+void cobra_list_insert_string(void **data, size_t *length, size_t *capacity,
+                              size_t index, const char *value) {
+    if (index > *length) index = *length;
+    cobra_list_shift_right(data, length, capacity, index, sizeof(char *));
+    ((char **)*data)[index] = cobra_str_copy(value);
+}
+
+static void cobra_list_shift_left(void **data, size_t *length, size_t index,
+                                  size_t element_size) {
+    unsigned char *base = (unsigned char *)*data;
+    memmove(base + index * element_size, base + (index + 1) * element_size,
+            (*length - index - 1) * element_size);
+    (*length)--;
+}
+
+/* remove_value drops the first occurrence and returns 1, or 0 when absent
+   (Python raises ValueError there; the collections runtime prefers a
+   testable sentinel like index's -1). */
+int64_t cobra_list_remove_value_i64(void **data, size_t *length, int64_t value) {
+    for (size_t i = 0; i < *length; i++) {
+        if (((int64_t *)*data)[i] == value) {
+            cobra_list_shift_left(data, length, i, sizeof(int64_t));
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int64_t cobra_list_remove_value_f32(void **data, size_t *length, float value) {
+    for (size_t i = 0; i < *length; i++) {
+        if (((float *)*data)[i] == value) {
+            cobra_list_shift_left(data, length, i, sizeof(float));
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int64_t cobra_list_remove_value_strings(void **data, size_t *length, const char *value) {
+    for (size_t i = 0; i < *length; i++) {
+        if (((char **)*data)[i] && strcmp(((char **)*data)[i], value) == 0) {
+            free(((char **)*data)[i]);
+            cobra_list_shift_left(data, length, i, sizeof(char *));
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Content equality over list descriptors: lengths must match and every
+   element must compare equal (strings by value, not by pointer). */
+int64_t cobra_list_equal_i64(void *a, size_t a_length, void *b, size_t b_length) {
+    if (a_length != b_length) return 0;
+    if (a_length == 0) return 1;
+    return !memcmp(a, b, a_length * sizeof(int64_t));
+}
+
+int64_t cobra_list_equal_f32(void *a, size_t a_length, void *b, size_t b_length) {
+    if (a_length != b_length) return 0;
+    for (size_t i = 0; i < a_length; i++) {
+        uint32_t x, y;
+        memcpy(&x, &((float *)a)[i], sizeof(x));
+        memcpy(&y, &((float *)b)[i], sizeof(y));
+        if (x != y) return 0;
+    }
+    return 1;
+}
+
+int64_t cobra_list_equal_strings(char **a, size_t a_length, char **b, size_t b_length) {
+    if (a_length != b_length) return 0;
+    for (size_t i = 0; i < a_length; i++) {
+        if ((a[i] == NULL) != (b[i] == NULL)) return 0;
+        if (a[i] && strcmp(a[i], b[i]) != 0) return 0;
+    }
+    return 1;
+}
+
+/* Python-style slice over a list: negative bounds count from the end and
+   out-of-range bounds clamp. Returns an owned copy of the selected window
+   (string elements are duplicated) so the slice shares no element storage
+   with the source. */
+static size_t cobra_list_clamp(size_t length, int64_t bound) {
+    if (bound < 0) {
+        int64_t from_end = (int64_t)length + bound;
+        if (from_end < 0) return 0;
+        return (size_t)from_end;
+    }
+    return (size_t)bound > length ? length : (size_t)bound;
+}
+
+/* The list slice descriptor is the same {data, length, capacity} triple the
+   direct emitter's sret buffers use for split and list-returning calls. */
+typedef struct {
+    void *data;
+    size_t length;
+    size_t capacity;
+} CobraListSlice;
+
+void cobra_list_slice_i64(void *data, size_t length, int64_t start, int64_t end,
+                          CobraListSlice *out) {
+    size_t lo = cobra_list_clamp(length, start), hi = cobra_list_clamp(length, end);
+    out->data = NULL;
+    out->length = 0;
+    out->capacity = 0;
+    if (hi <= lo) return;
+    size_t n = hi - lo;
+    out->data = malloc(n * sizeof(int64_t));
+    if (!out->data) abort();
+    memcpy(out->data, (int64_t *)data + lo, n * sizeof(int64_t));
+    out->length = n;
+    out->capacity = n;
+}
+
+void cobra_list_slice_f32(void *data, size_t length, int64_t start, int64_t end,
+                          CobraListSlice *out) {
+    size_t lo = cobra_list_clamp(length, start), hi = cobra_list_clamp(length, end);
+    out->data = NULL;
+    out->length = 0;
+    out->capacity = 0;
+    if (hi <= lo) return;
+    size_t n = hi - lo;
+    out->data = malloc(n * sizeof(float));
+    if (!out->data) abort();
+    memcpy(out->data, (float *)data + lo, n * sizeof(float));
+    out->length = n;
+    out->capacity = n;
+}
+
+void cobra_list_slice_strings(char **data, size_t length, int64_t start, int64_t end,
+                              CobraListSlice *out) {
+    size_t lo = cobra_list_clamp(length, start), hi = cobra_list_clamp(length, end);
+    out->data = NULL;
+    out->length = 0;
+    out->capacity = 0;
+    if (hi <= lo) return;
+    size_t n = hi - lo;
+    char **copy = malloc(n * sizeof(char *));
+    if (!copy) abort();
+    for (size_t i = 0; i < n; i++) copy[i] = cobra_str_copy(data[lo + i]);
+    out->data = copy;
+    out->length = n;
+    out->capacity = n;
+}
+
 /* Splits s on every occurrence of sep into owned pieces. An empty separator
    yields no pieces, matching a defensive reading of the Python contract. */
 void cobra_str_split(const char *s, const char *sep, void **data, size_t *length, size_t *capacity) {
