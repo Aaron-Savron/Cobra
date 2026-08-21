@@ -2027,6 +2027,7 @@ static SsaOpcode hir_map_binop(const char *op) {
     if (strcmp(op, "-") == 0) return SSA_OP_SUB;
     if (strcmp(op, "*") == 0) return SSA_OP_MUL;
     if (strcmp(op, "/") == 0) return SSA_OP_DIV;
+    if (strcmp(op, "%") == 0) return SSA_OP_REM;
     if (strcmp(op, "==") == 0) return SSA_OP_EQ;
     if (strcmp(op, "!=") == 0) return SSA_OP_NE;
     if (strcmp(op, "<") == 0) return SSA_OP_LT;
