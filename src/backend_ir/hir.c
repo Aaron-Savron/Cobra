@@ -2524,6 +2524,77 @@ static void hir_rewrite_impl_call(HirBuilder *b, ASTNode *node) {
     node->qualifier[0] = '\0';
 }
 
+/* (a, b, ...) tuple literals: the frontend already gives AST_TUPLE the same
+   canonical struct type (positional _0.._N-1 fields) the direct backend's
+   emit_tuple_return relies on. Reusing that means a tuple literal is just
+   "make a fresh struct-typed temp and member-assign each field", exactly
+   the shape the parser's own AST_MEMBER_ACCESS lowering already produces
+   and HIR_STMT_MEMBER_ASSIGN's existing SSA lowering already handles. */
+static HirExpr *hir_build_tuple_literal(HirBuilder *b, ASTNode *node,
+                                        const CobraType *expected) {
+    /* A tuple literal in return position never gets a canonical_type from
+       the frontend (see ir.c's AST_RETURN case, which only checks arity/
+       element types against the declared return struct and sets the legacy
+       value_type field, not canonical_type) - fall back to the caller-
+       supplied expected type in that case instead of failing outright. */
+    const CobraType *type = bir_import_ast_type(b->module, b->root, node, false);
+    if ((!type || type->kind != COBRA_TYPE_STRUCT) &&
+        expected && expected->kind == COBRA_TYPE_STRUCT) {
+        type = expected;
+    }
+    if (!type || type->kind != COBRA_TYPE_STRUCT ||
+        type->field_count != node->child_count) {
+        bir_fail(b, node->source_line, node->source_col,
+                 "tuple literal type is outside the backend-IR subset");
+        return NULL;
+    }
+    char temp_name[64];
+    snprintf(temp_name, sizeof(temp_name), "@tuple_%d", b->synthetic_seq++);
+    int temp = hir_add_local(b, temp_name, false, type, node->source_line, node->source_col);
+    if (temp < 0) return NULL;
+    for (size_t i = 0; i < node->child_count; i++) {
+        HirExpr *value = NULL;
+        if (!hir_build_expr(b, node->children[i], &value)) return NULL;
+        const CobraTypeField *field = &type->fields[i];
+        value = hir_coerce_int_const(b, value, field->type);
+        if (!value || !bir_types_equal(value->type, field->type)) {
+            hir_expr_free(value);
+            bir_fail(b, node->source_line, node->source_col,
+                     "tuple element %zu has an incompatible type", i);
+            return NULL;
+        }
+        HirExpr *base = hir_local_ref(b, (uint32_t)temp, type, node->source_line, node->source_col);
+        if (!base) { hir_expr_free(value); return NULL; }
+        HirExpr *target = hir_expr_alloc(b, node->source_line, node->source_col);
+        if (!target) { hir_expr_free(base); hir_expr_free(value); return NULL; }
+        target->kind = HIR_EXPR_MEMBER;
+        target->args = calloc(1, sizeof(HirExpr *));
+        if (!target->args) {
+            hir_expr_free(base);
+            hir_expr_free(target);
+            hir_expr_free(value);
+            return NULL;
+        }
+        target->args[0] = base;
+        target->arg_count = 1;
+        target->type = field->type;
+        target->aggregate_type = type;
+        target->field_offset = field->offset;
+
+        HirStmt assign_stmt;
+        memset(&assign_stmt, 0, sizeof(assign_stmt));
+        assign_stmt.kind = HIR_STMT_MEMBER_ASSIGN;
+        assign_stmt.target = target;
+        assign_stmt.expr = value;
+        if (!hir_block_add_stmt(b, b->current, assign_stmt)) {
+            hir_expr_free(target);
+            hir_expr_free(value);
+            return NULL;
+        }
+    }
+    return hir_local_ref(b, (uint32_t)temp, type, node->source_line, node->source_col);
+}
+
 static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
     if (!node) {
         bir_fail(b, 0, 0, "missing expression in backend-IR subset");
@@ -2885,6 +2956,11 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
                          "readonly slice has no element type");
                 return false;
             }
+            break;
+        }
+        case AST_TUPLE: {
+            expr = hir_build_tuple_literal(b, node, NULL);
+            if (!expr) return false;
             break;
         }
         case AST_MEMBER_ACCESS: {
@@ -5701,7 +5777,10 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                    same as the direct backend's tail-position shortcut in
                    ir.c's AST_RETURN case. */
                 HirExpr *value = NULL;
-                if (stmt->child_count > 0 &&
+                if (stmt->child_count > 0 && stmt->children[0]->type == AST_TUPLE) {
+                    value = hir_build_tuple_literal(b, stmt->children[0], b->fn->return_type);
+                    if (!value) return false;
+                } else if (stmt->child_count > 0 &&
                     !hir_build_expr(b, stmt->children[0], &value)) {
                     return false;
                 }
