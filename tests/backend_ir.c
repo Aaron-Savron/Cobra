@@ -7645,11 +7645,11 @@ static void test_source_owned_buffers(void) {
         "  return values[2]\n"
         "}\n");
 
-    unit_rejected("owned list negative index",
+    unit_expected("owned list negative index",
         "def main() -> i64: {\n"
         "  let values: list[i64] = [1, 2]\n"
         "  return values[-1]\n"
-        "}\n");
+        "}\n", 2);
 
     unit_expected("pop from an empty owned list returns the fallback",
         "def main() -> i64: {\n"
@@ -7721,11 +7721,11 @@ static void test_source_fixed_arrays(void) {
         "  return values[2]\n"
         "}\n");
 
-    unit_rejected("fixed array negative index",
+    unit_expected("fixed array negative index",
         "def main() -> i64: {\n"
         "  let values: array[i64, 2] = [1, 2]\n"
         "  return values[-1]\n"
-        "}\n");
+        "}\n", 2);
 
     /* Malformed IR must reject a fixed-array index whose operand is not i64.
        This exercises the verifier contract independently of HIR validation. */

@@ -940,6 +940,54 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out);
 static HirExpr *hir_local_ref(HirBuilder *b, uint32_t local, const CobraType *type,
                               int line, int col);
 
+/* Python-style negative indexing (`xs[-1]`) for a compile-time-constant
+   negative index: desugars `xs[-k]` to `xs[len(xs) - k]`, computed at
+   runtime against the container's actual length, since a fixed offset from
+   the end can't be constant-folded for a dynamically sized list/slice. Only
+   applies to a literal negative i64 constant index - a negative value
+   computed at runtime would need a branch to normalize, which indexing's
+   flat (non-control-flow) expression form here can't express, so that case
+   is left to the existing bounds check the same as any other subset gap.
+   Takes ownership of `index`; returns it unchanged if it is not a negative
+   constant. Returns NULL only on allocation failure, in which case `index`
+   has already been freed. */
+static HirExpr *hir_desugar_negative_index(HirBuilder *b, HirExpr *index,
+                                           uint32_t local, const CobraType *view,
+                                           int line, int col) {
+    if (!index || index->kind != HIR_EXPR_CONST ||
+        index->const_value.kind != BIR_SCALAR_I64 ||
+        index->const_value.payload.i64 >= 0) {
+        return index;
+    }
+    HirExpr *len_arg = hir_local_ref(b, local, view, line, col);
+    if (!len_arg) { hir_expr_free(index); return NULL; }
+    HirExpr *len_expr = hir_expr_alloc(b, line, col);
+    if (!len_expr) { hir_expr_free(len_arg); hir_expr_free(index); return NULL; }
+    len_expr->kind = HIR_EXPR_LEN;
+    len_expr->type = b->module->type_i64;
+    len_expr->args = calloc(1, sizeof(HirExpr *));
+    if (!len_expr->args) {
+        hir_expr_free(len_arg); hir_expr_free(len_expr); hir_expr_free(index);
+        return NULL;
+    }
+    len_expr->args[0] = len_arg;
+    len_expr->arg_count = 1;
+    HirExpr *sum = hir_expr_alloc(b, line, col);
+    if (!sum) { hir_expr_free(len_expr); hir_expr_free(index); return NULL; }
+    sum->kind = HIR_EXPR_BINOP;
+    sum->binop = SSA_OP_ADD;
+    sum->type = b->module->type_i64;
+    sum->args = calloc(2, sizeof(HirExpr *));
+    if (!sum->args) {
+        hir_expr_free(len_expr); hir_expr_free(index); hir_expr_free(sum);
+        return NULL;
+    }
+    sum->args[0] = len_expr;
+    sum->args[1] = index;
+    sum->arg_count = 2;
+    return sum;
+}
+
 /* f32 tensor builtins (fill_f32/sum_f32/mean_f32/max_f32/matmul_f32). The
    direct backend hand-emits AVX2/FMA x86 for these; the isolated backend has
    no equivalent codegen path, and routing them through a real function call
@@ -2702,6 +2750,9 @@ static bool hir_build_expr(HirBuilder *b, ASTNode *node, HirExpr **out) {
             }
             HirExpr *index = NULL;
             if (!hir_build_expr(b, node->children[0], &index)) return false;
+            index = hir_desugar_negative_index(b, index, (uint32_t)local, view,
+                                               node->source_line, node->source_col);
+            if (!index) return false;
             if (!bir_types_equal(index->type, b->module->type_i64)) {
                 bir_fail(b, node->source_line, node->source_col,
                          "readonly slice index must be i64");
@@ -5714,6 +5765,9 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                     hir_expr_free(value);
                     return false;
                 }
+                index = hir_desugar_negative_index(b, index, (uint32_t)local, view,
+                                                   stmt->source_line, stmt->source_col);
+                if (!index) { hir_expr_free(value); return false; }
                 const CobraType *element = cobra_type_element(view);
                 if (!element || !bir_types_equal(index->type, b->module->type_i64)) {
                     hir_expr_free(index);
