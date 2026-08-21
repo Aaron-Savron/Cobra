@@ -16,6 +16,19 @@ typedef struct {
     uint32_t id;
 } BirRegionScope;
 
+#define BIR_MAX_LOOP_DEPTH 32
+
+typedef struct {
+    HirBlockRef break_target;
+    HirBlockRef continue_target;
+    /* false for loop shapes that need per-iteration bookkeeping after the
+       body (the container-iteration and array-literal for-loop write-backs)
+       that a bare jump out of the body would skip; break/continue inside
+       one of those is an honest, explicitly rejected gap rather than a
+       silently wrong jump. */
+    bool supported;
+} BirLoopScope;
+
 typedef struct {
     BackendIrModule *module;
     ASTNode *root;
@@ -25,6 +38,8 @@ typedef struct {
     bool failed;
     BirRegionScope region_stack[BIR_MAX_REGIONS];
     size_t region_depth;
+    BirLoopScope loop_stack[BIR_MAX_LOOP_DEPTH];
+    size_t loop_depth;
 } HirBuilder;
 
 static const CobraType *bir_import_source_struct(BackendIrModule *module,
@@ -4932,9 +4947,19 @@ static bool hir_build_while(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_
     }
 
     b->current = body_id;
+    if (b->loop_depth >= BIR_MAX_LOOP_DEPTH) {
+        bir_fail(b, stmt->source_line, stmt->source_col, "loop nesting is too deep");
+        return false;
+    }
+    b->loop_stack[b->loop_depth].break_target = exit_id;
+    b->loop_stack[b->loop_depth].continue_target = header_id;
+    b->loop_stack[b->loop_depth].supported = true;
+    b->loop_depth++;
     bool body_terminated = false;
-    if (!hir_build_stmt_list(b, stmt->children[1]->children,
-                             stmt->children[1]->child_count, &body_terminated)) {
+    bool body_ok = hir_build_stmt_list(b, stmt->children[1]->children,
+                                       stmt->children[1]->child_count, &body_terminated);
+    b->loop_depth--;
+    if (!body_ok) {
         return false;
     }
     if (!body_terminated) {
@@ -5073,8 +5098,16 @@ static bool hir_build_for_container(HirBuilder *b, ASTNode *stmt, ASTNode *body,
     load->arg_count = 1;
     if (!hir_emit_assign(b, loop_local, load)) return false;
 
+    if (b->loop_depth >= BIR_MAX_LOOP_DEPTH) {
+        bir_fail(b, line, col, "loop nesting is too deep");
+        return false;
+    }
+    b->loop_stack[b->loop_depth].supported = false;
+    b->loop_depth++;
     bool body_terminated = false;
-    if (!hir_build_stmt_list(b, body->children, body->child_count, &body_terminated)) {
+    bool body_ok = hir_build_stmt_list(b, body->children, body->child_count, &body_terminated);
+    b->loop_depth--;
+    if (!body_ok) {
         return false;
     }
     if (body_terminated) {
@@ -5262,26 +5295,35 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
                      BIR_MAX_ARRAY_UNROLL);
             return false;
         }
+        if (b->loop_depth >= BIR_MAX_LOOP_DEPTH) {
+            bir_fail(b, stmt->source_line, stmt->source_col, "loop nesting is too deep");
+            return false;
+        }
+        b->loop_stack[b->loop_depth].supported = false;
+        b->loop_depth++;
         for (size_t i = 0; i < target->child_count && !b->failed; i++) {
             HirExpr *element = hir_expr_alloc(b, target->source_line, target->source_col);
-            if (!element) return false;
+            if (!element) { b->loop_depth--; return false; }
             element->kind = HIR_EXPR_CONST;
             element->type = b->module->type_i64;
             element->const_value = bir_scalar_i64(element->type,
                 target->children[i]->type == AST_INT_LITERAL
                     ? target->children[i]->literal_i64 : 0);
-            if (!hir_emit_assign(b, (uint32_t)loop_local, element)) return false;
+            if (!hir_emit_assign(b, (uint32_t)loop_local, element)) { b->loop_depth--; return false; }
             bool body_terminated = false;
             if (!hir_build_stmt_list(b, body->children, body->child_count,
                                      &body_terminated)) {
+                b->loop_depth--;
                 return false;
             }
             if (body_terminated) {
+                b->loop_depth--;
                 bir_fail(b, stmt->source_line, stmt->source_col,
                          "return inside a for-loop body is outside the backend-IR subset");
                 return false;
             }
         }
+        b->loop_depth--;
         *continue_block = b->current;
         return true;
     }
@@ -5425,25 +5467,41 @@ static bool hir_build_for(HirBuilder *b, ASTNode *stmt, HirBlockRef *continue_bl
     }
 
     b->current = body_id;
-    bool body_terminated = false;
-    if (!hir_build_stmt_list(b, body->children, body->child_count,
-                             &body_terminated)) {
+    if (b->loop_depth >= BIR_MAX_LOOP_DEPTH) {
+        bir_fail(b, stmt->source_line, stmt->source_col, "loop nesting is too deep");
         return false;
     }
-    if (body_terminated) {
+    b->loop_stack[b->loop_depth].break_target = exit_id;
+    b->loop_stack[b->loop_depth].continue_target = latch_id;
+    b->loop_stack[b->loop_depth].supported = true;
+    b->loop_depth++;
+    bool body_terminated = false;
+    bool body_ok = hir_build_stmt_list(b, body->children, body->child_count,
+                                       &body_terminated);
+    b->loop_depth--;
+    if (!body_ok) {
+        return false;
+    }
+    if (body_terminated && b->fn->blocks[b->current].term.kind == HIR_TERM_RETURN) {
         bir_fail(b, stmt->source_line, stmt->source_col,
                  "return inside a for-loop body is outside the backend-IR subset");
         return false;
     }
-    HirTerm to_latch;
-    memset(&to_latch, 0, sizeof(to_latch));
-    to_latch.kind = HIR_TERM_JUMP;
-    to_latch.target = latch_id;
-    if (!hir_set_term(b, b->current, to_latch) ||
-        !hir_add_edge(b, b->current, latch_id)) return false;
+    if (!body_terminated) {
+        HirTerm to_latch;
+        memset(&to_latch, 0, sizeof(to_latch));
+        to_latch.kind = HIR_TERM_JUMP;
+        to_latch.target = latch_id;
+        if (!hir_set_term(b, b->current, to_latch) ||
+            !hir_add_edge(b, b->current, latch_id)) return false;
+    }
 
     /* latch: i = i + step; jump header (step defaults to 1 for the bare
-       scalar-bound and one/two-argument range forms). */
+       scalar-bound and one/two-argument range forms). break/continue inside
+       the body already jumped straight to exit_id/latch_id; the latch block
+       below is still built unconditionally since a `continue` target needs
+       it to exist and be wired to the header regardless of whether the
+       body's own natural fall-through ever reaches it. */
     b->current = latch_id;
     HirExpr *one = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
     HirExpr *index_again = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
@@ -5715,6 +5773,32 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                 term.kind = HIR_TERM_RETURN;
                 term.ret_expr = value;
                 if (!hir_set_term(b, b->current, term)) return false;
+                block_terminated = true;
+                break;
+            }
+            case AST_BREAK:
+            case AST_CONTINUE: {
+                if (b->loop_depth == 0) {
+                    bir_fail(b, stmt->source_line, stmt->source_col,
+                             "%s outside a loop is outside the backend-IR subset",
+                             stmt->type == AST_BREAK ? "break" : "continue");
+                    return false;
+                }
+                BirLoopScope *loop = &b->loop_stack[b->loop_depth - 1];
+                if (!loop->supported) {
+                    bir_fail(b, stmt->source_line, stmt->source_col,
+                             "%s inside this loop shape is outside the backend-IR subset",
+                             stmt->type == AST_BREAK ? "break" : "continue");
+                    return false;
+                }
+                HirBlockRef target = stmt->type == AST_BREAK
+                    ? loop->break_target : loop->continue_target;
+                HirTerm jump;
+                memset(&jump, 0, sizeof(jump));
+                jump.kind = HIR_TERM_JUMP;
+                jump.target = target;
+                if (!hir_set_term(b, b->current, jump) ||
+                    !hir_add_edge(b, b->current, target)) return false;
                 block_terminated = true;
                 break;
             }
