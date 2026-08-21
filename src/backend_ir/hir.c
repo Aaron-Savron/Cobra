@@ -4093,6 +4093,19 @@ static bool hir_build_literal_match(HirBuilder *b, ASTNode *stmt, HirExpr *targe
         HirBlockRef literal_success = arm->match_guard ? guard_blk : body_blk;
 
         HirBlockRef cur = chain;
+        if (arm->match_literal_count == 0) {
+            /* A bare wildcard arm (`_` or `_ if guard`) matches
+               unconditionally - there is no literal to compare against, so
+               the chain must jump straight into the guard/body block rather
+               than falling through with no terminator set at all. */
+            b->current = cur;
+            HirTerm jump;
+            memset(&jump, 0, sizeof(jump));
+            jump.kind = HIR_TERM_JUMP;
+            jump.target = literal_success;
+            if (!hir_set_term(b, b->current, jump) ||
+                !hir_add_edge(b, b->current, literal_success)) { ok = false; break; }
+        }
         for (int j = 0; j < arm->match_literal_count; j++) {
             bool last_lit = (j + 1 == arm->match_literal_count);
             HirBlockRef fail_target;
