@@ -1563,23 +1563,203 @@ static bool x86_alloc_call_arg_moves_ownership(const X86AllocatedContext *ctx,
            bir_is_owned_slice_type(callee->param_value_types[user_arg]);
 }
 
+/* Cobra's canonical memory model gives every u8 element an 8-byte slot (see
+   x86_alloc_emit_print_string), so a "string" or []u8 view's bytes are not
+   the packed, NUL-terminated bytes a C function expects - each element
+   occupies an 8-byte stride with the value in its low byte. Passing the raw
+   view base straight through to an extern call hands the callee a buffer it
+   will misread (open() sees a one-character path, write() sees mostly zero
+   padding, read() into a []u8 output buffer never reaches the caller's real
+   storage, and so on). Allocate a real packed buffer at runtime, copy each
+   element's low byte into it contiguously, NUL-terminate it, and stage that
+   pointer as the call argument instead; x86_alloc_writeback_extern_view_arg
+   copies it back element-by-element after the call returns, so this is safe
+   whether the callee reads the buffer, writes it, or both.
+
+   Bookkeeping lives in dedicated per-argument temps starting right after the
+   argument-staging temps (index BIR_ABI_MAX_GPR_ARGUMENT_REGISTERS), two per
+   argument (source pointer, then length); the malloc'd packed buffer pointer
+   is stashed in the argument's own staging temp, since that is exactly the
+   value the call needs. A shared loop-counter temp at the very end is safe
+   to reuse across arguments because packing and writeback both run one
+   argument at a time, never interleaved. */
+#define X86_ALLOC_PACK_BOOKKEEPING_BASE BIR_ABI_MAX_GPR_ARGUMENT_REGISTERS
+
+static bool x86_alloc_view_element_is_u8(const X86AllocatedContext *ctx, MirReg value) {
+    const CobraType *type = ctx->module->arena.regs[value].type;
+    const CobraType *element = type ? cobra_type_element(type) : NULL;
+    return element && element->kind == COBRA_TYPE_U8;
+}
+
+static bool x86_alloc_pack_extern_view_arg(X86AllocatedContext *ctx, MirReg value, size_t arg) {
+    size_t src_index = X86_ALLOC_PACK_BOOKKEEPING_BASE + arg * 2;
+    size_t len_index = src_index + 1;
+    if (arg >= X86_ALLOC_TEMP_COUNT || len_index >= X86_ALLOC_TEMP_COUNT - 1) return false;
+    int64_t src_off = ctx->temp_offsets[src_index];
+    int64_t len_off = ctx->temp_offsets[len_index];
+    int64_t idx_off = ctx->temp_offsets[X86_ALLOC_TEMP_COUNT - 1];
+
+    if (!x86_alloc_load_view_component(ctx, value, false, "%r10")) return false;
+    fprintf(ctx->out, "    movq %%r10, ");
+    x86_alloc_mem(ctx->out, src_off, "rbp");
+    fprintf(ctx->out, "\n");
+    if (!x86_alloc_load_view_component(ctx, value, true, "%r10")) return false;
+    fprintf(ctx->out, "    movq %%r10, ");
+    x86_alloc_mem(ctx->out, len_off, "rbp");
+    fprintf(ctx->out, "\n    movq ");
+    x86_alloc_mem(ctx->out, len_off, "rbp");
+    fprintf(ctx->out, ", %%rdi\n    incq %%rdi\n    call malloc@PLT\n    movq %%rax, ");
+    x86_alloc_mem(ctx->out, ctx->temp_offsets[arg], "rbp");
+    fprintf(ctx->out, "\n    movq $0, ");
+    x86_alloc_mem(ctx->out, idx_off, "rbp");
+    fprintf(ctx->out, "\n");
+
+    char top[64], done[64];
+    uint32_t id = ctx->dict_key_labels++;
+    snprintf(top, sizeof(top), ".Lcobra_alloc_pack_top_%zu_%u", ctx->function_index, id);
+    snprintf(done, sizeof(done), ".Lcobra_alloc_pack_done_%zu_%u", ctx->function_index, id);
+    fprintf(ctx->out, "%s:\n    movq ", top);
+    x86_alloc_mem(ctx->out, idx_off, "rbp");
+    fprintf(ctx->out, ", %%rax\n    cmpq ");
+    x86_alloc_mem(ctx->out, len_off, "rbp");
+    fprintf(ctx->out, ", %%rax\n    jae %s\n    movq ", done);
+    x86_alloc_mem(ctx->out, src_off, "rbp");
+    fprintf(ctx->out, ", %%r10\n    movq ");
+    x86_alloc_mem(ctx->out, idx_off, "rbp");
+    fprintf(ctx->out, ", %%r11\n    imulq $8, %%r11\n    addq %%r11, %%r10\n"
+                       "    movzbl (%%r10), %%eax\n    movq ");
+    x86_alloc_mem(ctx->out, ctx->temp_offsets[arg], "rbp");
+    fprintf(ctx->out, ", %%r11\n    addq ");
+    x86_alloc_mem(ctx->out, idx_off, "rbp");
+    fprintf(ctx->out, ", %%r11\n    movb %%al, (%%r11)\n    movq ");
+    x86_alloc_mem(ctx->out, idx_off, "rbp");
+    fprintf(ctx->out, ", %%rax\n    incq %%rax\n    movq %%rax, ");
+    x86_alloc_mem(ctx->out, idx_off, "rbp");
+    fprintf(ctx->out, "\n    jmp %s\n%s:\n    movq ", top, done);
+    x86_alloc_mem(ctx->out, ctx->temp_offsets[arg], "rbp");
+    fprintf(ctx->out, ", %%r10\n    movq ");
+    x86_alloc_mem(ctx->out, len_off, "rbp");
+    fprintf(ctx->out, ", %%r11\n    addq %%r11, %%r10\n    movb $0, (%%r10)\n");
+    return true;
+}
+
+/* Copies the packed scratch buffer staged for argument `arg` back into the
+   original strided view storage, one byte-widened element at a time. Must
+   run after the extern call so a callee that writes through the buffer
+   (read() into a []u8 destination) is observed by the caller. */
+static bool x86_alloc_writeback_extern_view_arg(X86AllocatedContext *ctx, size_t arg,
+                                                 int64_t buf_off) {
+    size_t src_index = X86_ALLOC_PACK_BOOKKEEPING_BASE + arg * 2;
+    size_t len_index = src_index + 1;
+    if (len_index >= X86_ALLOC_TEMP_COUNT - 1) return false;
+    int64_t src_off = ctx->temp_offsets[src_index];
+    int64_t len_off = ctx->temp_offsets[len_index];
+    int64_t idx_off = ctx->temp_offsets[X86_ALLOC_TEMP_COUNT - 1];
+
+    fprintf(ctx->out, "    movq $0, ");
+    x86_alloc_mem(ctx->out, idx_off, "rbp");
+    fprintf(ctx->out, "\n");
+    char top[64], done[64];
+    uint32_t id = ctx->dict_key_labels++;
+    snprintf(top, sizeof(top), ".Lcobra_alloc_unpack_top_%zu_%u", ctx->function_index, id);
+    snprintf(done, sizeof(done), ".Lcobra_alloc_unpack_done_%zu_%u", ctx->function_index, id);
+    fprintf(ctx->out, "%s:\n    movq ", top);
+    x86_alloc_mem(ctx->out, idx_off, "rbp");
+    fprintf(ctx->out, ", %%rax\n    cmpq ");
+    x86_alloc_mem(ctx->out, len_off, "rbp");
+    fprintf(ctx->out, ", %%rax\n    jae %s\n    movq ", done);
+    x86_alloc_mem(ctx->out, buf_off, "rbp");
+    fprintf(ctx->out, ", %%r10\n    addq ");
+    x86_alloc_mem(ctx->out, idx_off, "rbp");
+    fprintf(ctx->out, ", %%r10\n    movzbl (%%r10), %%eax\n    movq ");
+    x86_alloc_mem(ctx->out, src_off, "rbp");
+    fprintf(ctx->out, ", %%r10\n    movq ");
+    x86_alloc_mem(ctx->out, idx_off, "rbp");
+    fprintf(ctx->out, ", %%r11\n    imulq $8, %%r11\n    addq %%r11, %%r10\n"
+                       "    movb %%al, (%%r10)\n    movq ");
+    x86_alloc_mem(ctx->out, idx_off, "rbp");
+    fprintf(ctx->out, ", %%rax\n    incq %%rax\n    movq %%rax, ");
+    x86_alloc_mem(ctx->out, idx_off, "rbp");
+    fprintf(ctx->out, "\n    jmp %s\n%s:\n", top, done);
+    return true;
+}
+
 static bool x86_alloc_emit_extern_call(X86AllocatedContext *ctx, const MirInst *inst) {
     if (inst->operand_count > BIR_ABI_MAX_GPR_ARGUMENT_REGISTERS) return false;
+    /* Stage every argument through a stack temp before touching any ABI
+       argument register. A later argument's current physical register can
+       be the very register an earlier argument must be moved into (e.g.
+       argument 1 lives in %rdi while argument 0 is about to be written
+       there); moving arguments straight into their destination registers in
+       one forward pass silently overwrites that still-unread source and
+       hands the callee a clobbered value. Staging through memory first,
+       then loading every ABI register from the stable temps, removes the
+       ordering hazard entirely.
+
+       Scalars are staged before any view is packed: packing a view calls
+       malloc@PLT, which like any call clobbers the caller-saved registers,
+       and a later scalar argument can still be sitting unread in one of
+       those registers at that point. Reading every scalar out to its
+       stable temp first removes that hazard too. */
+    bool packed[BIR_ABI_MAX_GPR_ARGUMENT_REGISTERS] = {0};
     for (size_t arg = 0; arg < inst->operand_count; arg++) {
+        if (arg >= X86_ALLOC_TEMP_COUNT) return false;
         MirReg value = ctx->module->arena.operands[inst->operand_start + arg];
         MirMachineType type = ctx->module->arena.regs[value].machine_type;
+        if (type == MIR_TYPE_VIEW) continue;
+        if (x86_alloc_is_float(type)) return false;
+        if (!x86_alloc_load_int(ctx, value, "%r10", "%r10d")) return false;
+        fprintf(ctx->out, "    movq %%r10, ");
+        x86_alloc_mem(ctx->out, ctx->temp_offsets[arg], "rbp");
+        fprintf(ctx->out, "\n");
+    }
+    for (size_t arg = 0; arg < inst->operand_count; arg++) {
+        if (arg >= X86_ALLOC_TEMP_COUNT) return false;
+        MirReg value = ctx->module->arena.operands[inst->operand_start + arg];
+        MirMachineType type = ctx->module->arena.regs[value].machine_type;
+        if (type != MIR_TYPE_VIEW) continue;
+        if (x86_alloc_view_element_is_u8(ctx, value)) {
+            if (!x86_alloc_pack_extern_view_arg(ctx, value, arg)) return false;
+            packed[arg] = true;
+        } else {
+            /* A view over any other element type (e.g. []i64, []f32) already
+               has real element width equal to its canonical stride, so the
+               raw base pointer is already a valid packed C buffer. */
+            if (!x86_alloc_load_view_component(ctx, value, false, "%r10")) return false;
+            fprintf(ctx->out, "    movq %%r10, ");
+            x86_alloc_mem(ctx->out, ctx->temp_offsets[arg], "rbp");
+            fprintf(ctx->out, "\n");
+        }
+    }
+    for (size_t arg = 0; arg < inst->operand_count; arg++) {
         const char *gpr = NULL;
         if (!x86_alloc_gpr((uint16_t)arg, &gpr)) return false;
-        if (type == MIR_TYPE_VIEW) {
-            if (!x86_alloc_load_view_component(ctx, value, false, "%r10")) return false;
-        } else if (x86_alloc_is_float(type)) {
-            return false;
-        } else {
-            if (!x86_alloc_load_int(ctx, value, "%r10", "%r10d")) return false;
-        }
-        fprintf(ctx->out, "    movq %%r10, %s\n", gpr);
+        fprintf(ctx->out, "    movq ");
+        x86_alloc_mem(ctx->out, ctx->temp_offsets[arg], "rbp");
+        fprintf(ctx->out, ", %s\n", gpr);
     }
     fprintf(ctx->out, "    xorl %%eax, %%eax\n    call %s@PLT\n", inst->callee);
+    bool needs_writeback = false;
+    for (size_t arg = 0; arg < inst->operand_count; arg++) {
+        if (packed[arg]) needs_writeback = true;
+    }
+    if (needs_writeback) {
+        /* The writeback loops below clobber %rax as scratch; the call's
+           return value has to survive them, so stash it before running
+           any writeback and restore it just before storing the result. */
+        if (X86_ALLOC_TEMP_COUNT == 0) return false;
+        int64_t result_off = ctx->temp_offsets[X86_ALLOC_TEMP_COUNT - 2];
+        fprintf(ctx->out, "    movq %%rax, ");
+        x86_alloc_mem(ctx->out, result_off, "rbp");
+        fprintf(ctx->out, "\n");
+        for (size_t arg = 0; arg < inst->operand_count; arg++) {
+            if (!packed[arg]) continue;
+            if (!x86_alloc_writeback_extern_view_arg(ctx, arg, ctx->temp_offsets[arg])) return false;
+        }
+        fprintf(ctx->out, "    movq ");
+        x86_alloc_mem(ctx->out, result_off, "rbp");
+        fprintf(ctx->out, ", %%rax\n");
+    }
     if (inst->result != MIR_REG_NONE) {
         x86_alloc_store_int(ctx, inst->result, "%rax", "%eax");
     }
