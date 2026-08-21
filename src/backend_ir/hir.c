@@ -5900,6 +5900,92 @@ static bool hir_build_stmt_list(HirBuilder *b, ASTNode **stmts, size_t stmt_coun
                     if (!hir_block_add_stmt(b, b->current, f)) return false;
                     break;
                 }
+                /* `CALL(...)?` as a bare statement: structured status
+                   propagation on a plain scalar return (see
+                   37_structured_status.cb), distinct from
+                   hir_build_try_propagate's Option/Result unwrap - a
+                   nonzero i64 result is itself the failure status to
+                   propagate, forwarded as-is (matching the direct
+                   backend's codegen.c emit_call_import '?' handling: `test
+                   rax, rax; jne .Lpropagate`). A zero result means success
+                   and execution falls through to the next statement. */
+                if (stmt->propagate_error) {
+                    HirExpr *raw = NULL;
+                    if (!hir_build_expr(b, stmt, &raw)) return false;
+                    if (!bir_types_equal(raw->type, b->module->type_i64) ||
+                        !bir_types_equal(b->fn->return_type, b->module->type_i64)) {
+                        bir_fail(b, stmt->source_line, stmt->source_col,
+                                 "postfix '?' on a statement requires a plain i64 status "
+                                 "returned by both the callee and the current function");
+                        hir_expr_free(raw);
+                        return false;
+                    }
+                    char temp_name[64];
+                    snprintf(temp_name, sizeof(temp_name), "__status_%zu", b->fn->local_count);
+                    int temp = hir_add_local(b, temp_name, false, raw->type,
+                                             stmt->source_line, stmt->source_col);
+                    if (temp < 0) { hir_expr_free(raw); return false; }
+                    if (!hir_emit_assign(b, (uint32_t)temp, raw)) return false;
+
+                    HirExpr *cond_ref = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
+                    if (!cond_ref) return false;
+                    cond_ref->kind = HIR_EXPR_LOCAL;
+                    cond_ref->local = (uint32_t)temp;
+                    cond_ref->type = b->module->type_i64;
+                    HirExpr *zero = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
+                    if (!zero) { hir_expr_free(cond_ref); return false; }
+                    zero->kind = HIR_EXPR_CONST;
+                    zero->type = b->module->type_i64;
+                    zero->const_value = bir_scalar_i64(b->module->type_i64, 0);
+                    HirExpr *cond = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
+                    if (!cond) { hir_expr_free(cond_ref); hir_expr_free(zero); return false; }
+                    cond->kind = HIR_EXPR_BINOP;
+                    cond->binop = SSA_OP_NE;
+                    cond->type = b->module->type_bool;
+                    cond->args = calloc(2, sizeof(HirExpr *));
+                    if (!cond->args) {
+                        hir_expr_free(cond_ref); hir_expr_free(zero); hir_expr_free(cond);
+                        return false;
+                    }
+                    cond->args[0] = cond_ref;
+                    cond->args[1] = zero;
+                    cond->arg_count = 2;
+
+                    HirBlock *err_block = hir_new_block(b, "status_propagate",
+                                                        stmt->source_line, stmt->source_col);
+                    if (!err_block) return false;
+                    HirBlockRef err_id = err_block->id;
+                    HirBlock *ok_block = hir_new_block(b, "status_ok",
+                                                       stmt->source_line, stmt->source_col);
+                    if (!ok_block) return false;
+                    HirBlockRef ok_id = ok_block->id;
+
+                    HirTerm branch;
+                    memset(&branch, 0, sizeof(branch));
+                    branch.kind = HIR_TERM_BRANCH;
+                    branch.cond = cond;
+                    branch.target = err_id;
+                    branch.target2 = ok_id;
+                    if (!hir_set_term(b, b->current, branch)) return false;
+                    if (!hir_add_edge(b, b->current, err_id) ||
+                        !hir_add_edge(b, b->current, ok_id)) return false;
+
+                    HirExpr *err_ret = hir_expr_alloc(b, stmt->source_line, stmt->source_col);
+                    if (!err_ret) return false;
+                    err_ret->kind = HIR_EXPR_LOCAL;
+                    err_ret->local = (uint32_t)temp;
+                    err_ret->type = b->module->type_i64;
+                    HirTerm ret_term;
+                    memset(&ret_term, 0, sizeof(ret_term));
+                    ret_term.kind = HIR_TERM_RETURN;
+                    ret_term.ret_expr = err_ret;
+                    b->current = err_id;
+                    if (!hir_set_term(b, err_id, ret_term)) return false;
+
+                    b->current = ok_id;
+                    cur = ok_id;
+                    break;
+                }
                 /* Expression statement: evaluate the call for effect. */
                 HirExpr *value = NULL;
                 if (!hir_build_expr(b, stmt, &value)) return false;
